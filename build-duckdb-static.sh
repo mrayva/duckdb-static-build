@@ -1,5 +1,5 @@
 #!/bin/bash
-set -e  # Exit on error
+set -euo pipefail
 
 # DuckDB Static Build Script
 # Builds DuckDB with 24 statically-linked core extensions
@@ -24,14 +24,64 @@ DUCKDB_DIR="$HOME/duckdbsrc"
 SKIP_VCPKG=false
 CLEAN_BUILD=false
 
+require_cmd() {
+    local cmd="$1"
+    if ! command -v "$cmd" >/dev/null 2>&1; then
+        log_error "$cmd not found. Please install it first."
+        exit 1
+    fi
+}
+
+ensure_include_after_git_tag() {
+    local file="$1"
+    local include_line="$2"
+    if [ ! -f "$file" ]; then
+        return 0
+    fi
+    if grep -Fq "$include_line" "$file"; then
+        return 0
+    fi
+    sed -i "/GIT_TAG/a\\            $include_line" "$file"
+}
+
+sanitize_dirty_fetchcontent_deps() {
+    local removed_any=false
+    local dep_dir dep_base dep_prefix
+    shopt -s nullglob
+    for dep_dir in _deps/*_extension_fc-src _deps/*_extension-src; do
+        [ -d "$dep_dir/.git" ] || continue
+        if [ -n "$(git -C "$dep_dir" status --porcelain 2>/dev/null || true)" ]; then
+            dep_base=$(basename "$dep_dir")
+            dep_prefix="${dep_base%-src}"
+            log_warning "Dirty FetchContent repo detected: $dep_dir"
+            log_warning "Removing cached dependency checkout to avoid git stash/update conflicts"
+            rm -rf "$dep_dir" "_deps/${dep_prefix}-build" "_deps/${dep_prefix}-subbuild"
+            removed_any=true
+        fi
+    done
+    shopt -u nullglob
+
+    if [ "$removed_any" = true ]; then
+        log_success "Removed dirty FetchContent dependency checkouts"
+    fi
+}
+
 # Parse arguments
 while [[ $# -gt 0 ]]; do
   case $1 in
     --vcpkg-dir)
+      if [[ $# -lt 2 ]]; then
+        echo -e "${RED}[ERROR]${NC} --vcpkg-dir requires a value"
+        exit 1
+      fi
       VCPKG_DIR="$2"
       shift 2
       ;;
     --duckdb-dir)
+      if [[ $# -lt 2 ]]; then
+        echo -e "${RED}[ERROR]${NC} --duckdb-dir requires a value"
+        exit 1
+      fi
       DUCKDB_DIR="$2"
       shift 2
       ;;
@@ -72,11 +122,8 @@ log_error() {
 
 # Check prerequisites
 log_info "Checking prerequisites..."
-for cmd in git cmake make gcc g++; do
-    if ! command -v $cmd &> /dev/null; then
-        log_error "$cmd not found. Please install it first."
-        exit 1
-    fi
+for cmd in git cmake make gcc g++ sed awk nproc python3 cargo rustc; do
+    require_cmd "$cmd"
 done
 log_success "All prerequisites found"
 
@@ -126,7 +173,7 @@ duckdb_extension_load(json)
 duckdb_extension_load(parquet)
 duckdb_extension_load(sqlite_scanner)
 duckdb_extension_load(postgres_scanner)
-duckdb_extension_load(mysql_scanner APPLY_PATCHES)
+duckdb_extension_load(mysql_scanner)
 duckdb_extension_load(httpfs)
 duckdb_extension_load(excel)
 duckdb_extension_load(vss)
@@ -135,12 +182,9 @@ duckdb_extension_load(avro)
 duckdb_extension_load(aws)
 duckdb_extension_load(azure)
 duckdb_extension_load(iceberg)
-duckdb_extension_load(ducklake APPLY_PATCHES)
+duckdb_extension_load(ducklake)
 duckdb_extension_load(delta)
-duckdb_extension_load(unity_catalog
-    GIT_URL https://github.com/duckdb/unity_catalog
-    GIT_TAG main
-)
+duckdb_extension_load(unity_catalog)
 EOF
 log_success "Extension configuration created"
 
@@ -148,7 +192,9 @@ log_success "Extension configuration created"
 log_info "Step 4: Patching extension configs..."
 if [ -f .github/config/extensions/fts.cmake ]; then
     sed -i '/DONT_LINK/d' .github/config/extensions/fts.cmake
-    sed -i '/GIT_TAG/a\        INCLUDE_DIR extension/fts/include' .github/config/extensions/fts.cmake
+    if ! grep -Fq "INCLUDE_DIR extension/fts/include" .github/config/extensions/fts.cmake; then
+        sed -i '/GIT_TAG/a\        INCLUDE_DIR extension/fts/include' .github/config/extensions/fts.cmake
+    fi
     log_success "FTS config patched"
 fi
 if [ -f .github/config/extensions/vss.cmake ]; then
@@ -157,46 +203,14 @@ if [ -f .github/config/extensions/vss.cmake ]; then
 fi
 if [ -f .github/config/extensions/postgres_scanner.cmake ]; then
     sed -i '/DONT_LINK/d' .github/config/extensions/postgres_scanner.cmake
-    sed -i '/GIT_TAG/a\            INCLUDE_DIR src/include' .github/config/extensions/postgres_scanner.cmake
+    ensure_include_after_git_tag .github/config/extensions/postgres_scanner.cmake "INCLUDE_DIR src/include"
     log_success "postgres_scanner config patched"
 fi
 if [ -f .github/config/extensions/mysql_scanner.cmake ]; then
     sed -i '/DONT_LINK/d' .github/config/extensions/mysql_scanner.cmake
-    # Check if INCLUDE_DIR already exists
-    if ! grep -q "INCLUDE_DIR" .github/config/extensions/mysql_scanner.cmake; then
-        sed -i '/GIT_TAG/a\            INCLUDE_DIR src/include' .github/config/extensions/mysql_scanner.cmake
-    fi
+    ensure_include_after_git_tag .github/config/extensions/mysql_scanner.cmake "INCLUDE_DIR src/include"
     log_success "mysql_scanner config patched"
 fi
-
-# Step 4b: Create mysql_scanner static build patch
-log_info "Step 4b: Creating mysql_scanner static build patch..."
-mkdir -p .github/patches/extensions/mysql_scanner
-cat > .github/patches/extensions/mysql_scanner/static_build.patch << 'PATCHEOF'
-diff --git a/CMakeLists.txt b/CMakeLists.txt
---- a/CMakeLists.txt
-+++ b/CMakeLists.txt
-@@ -12,6 +12,9 @@ include_directories(${MYSQL_INCLUDE_DIR})
- 
- add_subdirectory(src)
- 
-+# Static extension build
-+build_static_extension(${TARGET_NAME} "" ${ALL_OBJECT_FILES})
-+
- set(PARAMETERS "-no-warnings")
- build_loadable_extension(${TARGET_NAME} ${PARAMETERS} ${ALL_OBJECT_FILES})
- 
-@@ -19,3 +22,8 @@ build_loadable_extension(${TARGET_NAME} ${PARAMETERS} ${ALL_OBJECT_FILES})
- target_include_directories(${TARGET_NAME}_loadable_extension
-                            PRIVATE include ${MYSQL_INCLUDE_DIR})
- target_link_libraries(${TARGET_NAME}_loadable_extension ${MYSQL_LIBRARIES})
-+
-+# Static binary
-+target_include_directories(${TARGET_NAME}_extension
-+                           PRIVATE include src/include ${MYSQL_INCLUDE_DIR})
-+target_link_libraries(${TARGET_NAME}_extension ${MYSQL_LIBRARIES})
-PATCHEOF
-log_success "mysql_scanner static build patch created"
 
 # Step 5: Install vcpkg dependencies
 if [ "$SKIP_VCPKG" = false ]; then
@@ -223,6 +237,7 @@ fi
 
 # Step 6: Configure build
 log_info "Step 6: Configuring CMake (fetches extensions)..."
+sanitize_dirty_fetchcontent_deps
 
 # Create minimal vcpkg.json to avoid manifest mode issues
 echo '{"name":"duckdb","version":"1.0.0"}' > vcpkg.json
@@ -238,57 +253,87 @@ cmake -DCMAKE_BUILD_TYPE=Release \
   .
 log_success "CMake configuration complete"
 
-# Step 6b: Patch postgres_scanner CMakeLists.txt to enable static build
-log_info "Step 6b: Patching postgres_scanner for static build..."
+# Step 6a: Patch mysql_scanner CMakeLists.txt to enable static build (if upstream changed)
+log_info "Step 6a: Patching mysql_scanner for static build (if needed)..."
+MYSQL_CMAKE="_deps/mysql_scanner_extension_fc-src/CMakeLists.txt"
+if [ -f "$MYSQL_CMAKE" ]; then
+    if ! grep -q "build_static_extension" "$MYSQL_CMAKE"; then
+        python3 << 'PYEOF'
+from pathlib import Path
+import sys
+
+path = Path("_deps/mysql_scanner_extension_fc-src/CMakeLists.txt")
+content = path.read_text()
+
+if "set(PARAMETERS \"-no-warnings\")" not in content:
+    print("ERROR: mysql_scanner marker not found")
+    sys.exit(1)
+
+content = content.replace(
+    'set(PARAMETERS "-no-warnings")',
+    '# Static extension build (added by build script)\n'
+    'build_static_extension(${TARGET_NAME} "" ${ALL_OBJECT_FILES})\n\n'
+    'set(PARAMETERS "-no-warnings")',
+    1
+)
+
+if "target_include_directories(${TARGET_NAME}_extension" not in content:
+    content += (
+        "\n# Static binary includes/libs (added by build script)\n"
+        "target_include_directories(${TARGET_NAME}_extension\n"
+        "                           PRIVATE include src/include ${MYSQL_INCLUDE_DIR})\n"
+        "target_link_libraries(${TARGET_NAME}_extension ${MYSQL_LIBRARIES})\n"
+    )
+
+path.write_text(content)
+print("Patched mysql_scanner CMakeLists.txt")
+PYEOF
+        log_success "mysql_scanner CMakeLists.txt patched for static build"
+    else
+        log_success "mysql_scanner already supports static build"
+    fi
+else
+    log_warning "mysql_scanner CMakeLists.txt not found - will be patched on next run"
+fi
+
+# Step 6b: Patch postgres_scanner CMakeLists.txt to enable static build (if upstream changed)
+log_info "Step 6b: Patching postgres_scanner for static build (if needed)..."
 PG_CMAKE="_deps/postgres_scanner_extension_fc-src/CMakeLists.txt"
 if [ -f "$PG_CMAKE" ]; then
-    # Check if already patched
     if ! grep -q "build_static_extension" "$PG_CMAKE"; then
-        # Patch using Python for reliable multi-line modifications
         python3 << 'PYEOF'
-import re
+from pathlib import Path
+import sys
 
-with open("_deps/postgres_scanner_extension_fc-src/CMakeLists.txt", "r") as f:
-    content = f.read()
+path = Path("_deps/postgres_scanner_extension_fc-src/CMakeLists.txt")
+content = path.read_text()
 
-# 1. Add build_static_extension before set(PARAMETERS)
-static_build = '''# Static extension build (added by build script)
-build_static_extension(${TARGET_NAME} "" ${ALL_OBJECT_FILES}
-                       ${LIBPG_SOURCES_FULLPATH})
+if 'set(PARAMETERS "-no-warnings")' not in content:
+    print("ERROR: postgres_scanner marker not found")
+    sys.exit(1)
 
-set(PARAMETERS "-no-warnings")'''
-content = content.replace('set(PARAMETERS "-no-warnings")', static_build)
-
-# 2. Add static extension target_include_directories after loadable one
-old_includes = '''target_include_directories(
-  ${TARGET_NAME}_loadable_extension
-  PRIVATE include postgres/src/include postgres/src/backend
-          postgres/src/interfaces/libpq ${OPENSSL_INCLUDE_DIR})'''
-
-new_includes = old_includes + '''
-
-target_include_directories(
-  ${TARGET_NAME}_extension
-  PRIVATE include src/include postgres/src/include postgres/src/backend
-          postgres/src/interfaces/libpq ${OPENSSL_INCLUDE_DIR})'''
-content = content.replace(old_includes, new_includes)
-
-# 3. Add static extension target_link_libraries
 content = content.replace(
-    'target_link_libraries(${TARGET_NAME}_loadable_extension ${OPENSSL_LIBRARIES})',
-    'target_link_libraries(${TARGET_NAME}_loadable_extension ${OPENSSL_LIBRARIES})\ntarget_link_libraries(${TARGET_NAME}_extension ${OPENSSL_LIBRARIES})'
+    'set(PARAMETERS "-no-warnings")',
+    '# Static extension build (added by build script)\n'
+    'build_static_extension(${TARGET_NAME} "" ${ALL_OBJECT_FILES}\n'
+    '                       ${LIBPG_SOURCES_FULLPATH})\n\n'
+    'set(PARAMETERS "-no-warnings")',
+    1
 )
 
-# 4. Add static extension set_property
-content = content.replace(
-    'set_property(TARGET ${TARGET_NAME}_loadable_extension PROPERTY C_STANDARD 99)',
-    'set_property(TARGET ${TARGET_NAME}_loadable_extension PROPERTY C_STANDARD 99)\nset_property(TARGET ${TARGET_NAME}_extension PROPERTY C_STANDARD 99)'
-)
+if "target_include_directories(\n  ${TARGET_NAME}_extension" not in content:
+    content += (
+        "\n# Static binary includes/libs (added by build script)\n"
+        "target_include_directories(\n"
+        "  ${TARGET_NAME}_extension\n"
+        "  PRIVATE include src/include postgres/src/include postgres/src/backend\n"
+        "          postgres/src/interfaces/libpq ${OPENSSL_INCLUDE_DIR})\n"
+        "target_link_libraries(${TARGET_NAME}_extension ${OPENSSL_LIBRARIES})\n"
+        "set_property(TARGET ${TARGET_NAME}_extension PROPERTY C_STANDARD 99)\n"
+    )
 
-with open("_deps/postgres_scanner_extension_fc-src/CMakeLists.txt", "w") as f:
-    f.write(content)
-
-print("Patched successfully")
+path.write_text(content)
+print("Patched postgres_scanner CMakeLists.txt")
 PYEOF
         log_success "postgres_scanner CMakeLists.txt patched for static build"
     else
@@ -302,10 +347,31 @@ fi
 log_info "Step 6c: Patching delta for rustls..."
 DELTA_CMAKE="_deps/delta_extension_fc-src/CMakeLists.txt"
 if [ -f "$DELTA_CMAKE" ]; then
-    # Check if already patched
     if grep -q "all-features" "$DELTA_CMAKE"; then
-        # Replace --all-features with specific rustls features to avoid OpenSSL linking issues
-        sed -i 's/--package delta_kernel_ffi --workspace --profile=\${CARGO_PROFILE} --all-features/--package delta_kernel_ffi --profile=\${CARGO_PROFILE} --no-default-features --features "default-engine-rustls,tracing,test-ffi"/' "$DELTA_CMAKE"
+        python3 << 'PYEOF'
+from pathlib import Path
+import re
+import sys
+
+path = Path("_deps/delta_extension_fc-src/CMakeLists.txt")
+content = path.read_text()
+
+pattern = re.compile(
+    r'--package delta_kernel_ffi(?:\s+--workspace)?\s+--profile=\$\{CARGO_PROFILE\}\s+--all-features'
+)
+replacement = (
+    '--package delta_kernel_ffi --profile=${CARGO_PROFILE} '
+    '--no-default-features --features "default-engine-rustls,tracing,test-ffi"'
+)
+
+new_content, count = pattern.subn(replacement, content, count=1)
+if count == 0:
+    print("ERROR: delta all-features pattern not found")
+    sys.exit(1)
+
+path.write_text(new_content)
+print("Patched delta CMakeLists.txt")
+PYEOF
         log_success "delta patched for rustls"
     else
         log_success "delta already patched"
@@ -337,13 +403,15 @@ fi
 
 # Merge extension-specific vcpkg directories
 log_info "Merging extension-specific vcpkg directories..."
-for ext_dir in _deps/*_extension_fc-src; do
+shopt -s nullglob
+for ext_dir in _deps/*_extension_fc-src _deps/*_extension-src; do
     if [ -d "$ext_dir/vcpkg_installed/x64-linux" ]; then
-        ext_name=$(basename "$ext_dir" | sed 's/_extension_fc-src//')
+        ext_name=$(basename "$ext_dir" | sed 's/_extension_fc-src//' | sed 's/_extension-src//')
         log_info "  Merging $ext_name..."
         cp -r "$ext_dir/vcpkg_installed/x64-linux"/* vcpkg_installed/x64-linux/ 2>/dev/null || true
     fi
 done
+shopt -u nullglob
 log_success "vcpkg dependencies merged"
 
 # Step 8: Build
@@ -351,7 +419,7 @@ log_info "Step 8: Building DuckDB (5-10 minutes)..."
 NUM_CORES=$(nproc)
 log_info "Building with $NUM_CORES cores..."
 START_TIME=$(date +%s)
-EXTENSION_STATIC_BUILD=1 make -j$NUM_CORES
+EXTENSION_STATIC_BUILD=1 make -j"$NUM_CORES"
 END_TIME=$(date +%s)
 BUILD_TIME=$((END_TIME - START_TIME))
 log_success "Build completed in $BUILD_TIME seconds"
@@ -378,7 +446,7 @@ if [ "$EXTENSION_COUNT" = "24" ]; then
     echo -e "${GREEN}========================================${NC}"
     echo -e "Binary location: ${BLUE}$DUCKDB_DIR/duckdb${NC}"
     echo -e "Binary size: ${BLUE}$BINARY_SIZE${NC}"
-    echo -e "Extensions: ${BLUE}23 statically linked${NC}"
+    echo -e "Extensions: ${BLUE}24 statically linked${NC}"
     echo -e "Build time: ${BLUE}$BUILD_TIME seconds${NC}"
     echo ""
     echo "Extensions loaded:"
