@@ -172,8 +172,8 @@ duckdb_extension_load(fts)
 duckdb_extension_load(json)
 duckdb_extension_load(parquet)
 duckdb_extension_load(sqlite_scanner)
-duckdb_extension_load(postgres_scanner)
-duckdb_extension_load(mysql_scanner)
+duckdb_extension_load(postgres_scanner APPLY_PATCHES)
+duckdb_extension_load(mysql_scanner APPLY_PATCHES)
 duckdb_extension_load(httpfs)
 duckdb_extension_load(excel)
 duckdb_extension_load(vss)
@@ -183,7 +183,7 @@ duckdb_extension_load(aws)
 duckdb_extension_load(azure)
 duckdb_extension_load(iceberg)
 duckdb_extension_load(ducklake)
-duckdb_extension_load(delta)
+duckdb_extension_load(delta APPLY_PATCHES)
 duckdb_extension_load(unity_catalog)
 EOF
 log_success "Extension configuration created"
@@ -212,6 +212,86 @@ if [ -f .github/config/extensions/mysql_scanner.cmake ]; then
     log_success "mysql_scanner config patched"
 fi
 
+# Step 4b: Create extension patch files
+log_info "Step 4b: Creating extension patch files..."
+
+mkdir -p .github/patches/extensions/mysql_scanner
+cat > .github/patches/extensions/mysql_scanner/static_build.patch << 'PATCH_EOF'
+diff --git a/CMakeLists.txt b/CMakeLists.txt
+index 081124a..f0a2df6 100644
+--- a/CMakeLists.txt
++++ b/CMakeLists.txt
+@@ -12,6 +12,9 @@ include_directories(${MYSQL_INCLUDE_DIR})
+ 
+ add_subdirectory(src)
+ 
++# Static extension build (added by build script)
++build_static_extension(${TARGET_NAME} "" ${ALL_OBJECT_FILES})
++
+ set(PARAMETERS "-no-warnings")
+ build_loadable_extension(${TARGET_NAME} ${PARAMETERS} ${ALL_OBJECT_FILES})
+ 
+@@ -19,3 +22,8 @@ build_loadable_extension(${TARGET_NAME} ${PARAMETERS} ${ALL_OBJECT_FILES})
+ target_include_directories(${TARGET_NAME}_loadable_extension
+                            PRIVATE include ${MYSQL_INCLUDE_DIR})
+ target_link_libraries(${TARGET_NAME}_loadable_extension ${MYSQL_LIBRARIES})
++
++# Static binary includes/libs (added by build script)
++target_include_directories(${TARGET_NAME}_extension
++                           PRIVATE include src/include ${MYSQL_INCLUDE_DIR})
++target_link_libraries(${TARGET_NAME}_extension ${MYSQL_LIBRARIES})
+PATCH_EOF
+
+mkdir -p .github/patches/extensions/postgres_scanner
+cat > .github/patches/extensions/postgres_scanner/static_build.patch << 'PATCH_EOF'
+diff --git a/CMakeLists.txt b/CMakeLists.txt
+index d0e5371..e7478aa 100644
+--- a/CMakeLists.txt
++++ b/CMakeLists.txt
+@@ -185,6 +185,10 @@ if(NOT EXISTS ${CMAKE_CURRENT_SOURCE_DIR}/postgres)
+   message(STATUS "Finished setting up PostgreSQL source code!")
+ endif()
+ 
++# Static extension build (added by build script)
++build_static_extension(${TARGET_NAME} "" ${ALL_OBJECT_FILES}
++                       ${LIBPG_SOURCES_FULLPATH})
++
+ set(PARAMETERS "-no-warnings")
+ build_loadable_extension(${TARGET_NAME} ${PARAMETERS} ${ALL_OBJECT_FILES}
+                          ${LIBPG_SOURCES_FULLPATH})
+@@ -208,3 +212,11 @@ if(WIN32)
+   target_link_libraries(${TARGET_NAME}_loadable_extension wsock32 ws2_32
+                         wldap32 secur32 crypt32)
+ endif()
++
++# Static binary includes/libs (added by build script)
++target_include_directories(
++  ${TARGET_NAME}_extension
++  PRIVATE include src/include postgres/src/include postgres/src/backend
++          postgres/src/interfaces/libpq ${OPENSSL_INCLUDE_DIR})
++target_link_libraries(${TARGET_NAME}_extension ${OPENSSL_LIBRARIES})
++set_property(TARGET ${TARGET_NAME}_extension PROPERTY C_STANDARD 99)
+PATCH_EOF
+
+mkdir -p .github/patches/extensions/delta
+cat > .github/patches/extensions/delta/rustls.patch << 'PATCH_EOF'
+diff --git a/CMakeLists.txt b/CMakeLists.txt
+index ff33ba9..b691e4f 100644
+--- a/CMakeLists.txt
++++ b/CMakeLists.txt
+@@ -162,7 +162,7 @@ ExternalProject_Add(
+   # Build debug build
+   BUILD_COMMAND
+     ${CMAKE_COMMAND} -E env ${RUST_UNSET_ENV_VARS} ${RUST_ENV_VARS} cargo build
+-    --package delta_kernel_ffi --workspace --profile=${CARGO_PROFILE} --all-features
++    --package delta_kernel_ffi --profile=${CARGO_PROFILE} --no-default-features --features "default-engine-rustls,tracing,test-ffi"
+     ${RUST_PLATFORM_PARAM}
+   # Build DATs
+   COMMAND
+PATCH_EOF
+
+log_success "Extension patch files created"
+
 # Step 5: Install vcpkg dependencies
 if [ "$SKIP_VCPKG" = false ]; then
     log_info "Step 5: Installing vcpkg dependencies (this takes 15-20 minutes)..."
@@ -237,14 +317,19 @@ fi
 
 # Step 6: Configure build
 log_info "Step 6: Configuring CMake (fetches extensions)..."
+BUILD_DIR="$DUCKDB_DIR/build/release-static"
+mkdir -p "$BUILD_DIR"
+cd "$BUILD_DIR"
 sanitize_dirty_fetchcontent_deps
+cd "$DUCKDB_DIR"
 
 # Create minimal vcpkg.json to avoid manifest mode issues
 echo '{"name":"duckdb","version":"1.0.0"}' > vcpkg.json
 
 # Note: --allow-multiple-definition is required because postgres_scanner and mysql_scanner
 # share some common helper functions (EscapeConnectionString, GetSecret, CatalogTypeIsSupported)
-cmake -DCMAKE_BUILD_TYPE=Release \
+cmake -S "$DUCKDB_DIR" -B "$BUILD_DIR" \
+  -DCMAKE_BUILD_TYPE=Release \
   -DCMAKE_TOOLCHAIN_FILE="$VCPKG_DIR/scripts/buildsystems/vcpkg.cmake" \
   -DVCPKG_MANIFEST_MODE=OFF \
   -DCMAKE_EXE_LINKER_FLAGS="-Wl,--allow-multiple-definition" \
@@ -253,143 +338,7 @@ cmake -DCMAKE_BUILD_TYPE=Release \
   .
 log_success "CMake configuration complete"
 
-# Step 6a: Patch mysql_scanner CMakeLists.txt to enable static build (if upstream changed)
-log_info "Step 6a: Patching mysql_scanner for static build (if needed)..."
-MYSQL_CMAKE="_deps/mysql_scanner_extension_fc-src/CMakeLists.txt"
-if [ -f "$MYSQL_CMAKE" ]; then
-    if ! grep -q "build_static_extension" "$MYSQL_CMAKE"; then
-        python3 << 'PYEOF'
-from pathlib import Path
-import sys
-
-path = Path("_deps/mysql_scanner_extension_fc-src/CMakeLists.txt")
-content = path.read_text()
-
-if "set(PARAMETERS \"-no-warnings\")" not in content:
-    print("ERROR: mysql_scanner marker not found")
-    sys.exit(1)
-
-content = content.replace(
-    'set(PARAMETERS "-no-warnings")',
-    '# Static extension build (added by build script)\n'
-    'build_static_extension(${TARGET_NAME} "" ${ALL_OBJECT_FILES})\n\n'
-    'set(PARAMETERS "-no-warnings")',
-    1
-)
-
-if "target_include_directories(${TARGET_NAME}_extension" not in content:
-    content += (
-        "\n# Static binary includes/libs (added by build script)\n"
-        "target_include_directories(${TARGET_NAME}_extension\n"
-        "                           PRIVATE include src/include ${MYSQL_INCLUDE_DIR})\n"
-        "target_link_libraries(${TARGET_NAME}_extension ${MYSQL_LIBRARIES})\n"
-    )
-
-path.write_text(content)
-print("Patched mysql_scanner CMakeLists.txt")
-PYEOF
-        log_success "mysql_scanner CMakeLists.txt patched for static build"
-    else
-        log_success "mysql_scanner already supports static build"
-    fi
-else
-    log_warning "mysql_scanner CMakeLists.txt not found - will be patched on next run"
-fi
-
-# Step 6b: Patch postgres_scanner CMakeLists.txt to enable static build (if upstream changed)
-log_info "Step 6b: Patching postgres_scanner for static build (if needed)..."
-PG_CMAKE="_deps/postgres_scanner_extension_fc-src/CMakeLists.txt"
-if [ -f "$PG_CMAKE" ]; then
-    if ! grep -q "build_static_extension" "$PG_CMAKE"; then
-        python3 << 'PYEOF'
-from pathlib import Path
-import sys
-
-path = Path("_deps/postgres_scanner_extension_fc-src/CMakeLists.txt")
-content = path.read_text()
-
-if 'set(PARAMETERS "-no-warnings")' not in content:
-    print("ERROR: postgres_scanner marker not found")
-    sys.exit(1)
-
-content = content.replace(
-    'set(PARAMETERS "-no-warnings")',
-    '# Static extension build (added by build script)\n'
-    'build_static_extension(${TARGET_NAME} "" ${ALL_OBJECT_FILES}\n'
-    '                       ${LIBPG_SOURCES_FULLPATH})\n\n'
-    'set(PARAMETERS "-no-warnings")',
-    1
-)
-
-if "target_include_directories(\n  ${TARGET_NAME}_extension" not in content:
-    content += (
-        "\n# Static binary includes/libs (added by build script)\n"
-        "target_include_directories(\n"
-        "  ${TARGET_NAME}_extension\n"
-        "  PRIVATE include src/include postgres/src/include postgres/src/backend\n"
-        "          postgres/src/interfaces/libpq ${OPENSSL_INCLUDE_DIR})\n"
-        "target_link_libraries(${TARGET_NAME}_extension ${OPENSSL_LIBRARIES})\n"
-        "set_property(TARGET ${TARGET_NAME}_extension PROPERTY C_STANDARD 99)\n"
-    )
-
-path.write_text(content)
-print("Patched postgres_scanner CMakeLists.txt")
-PYEOF
-        log_success "postgres_scanner CMakeLists.txt patched for static build"
-    else
-        log_success "postgres_scanner already patched"
-    fi
-else
-    log_warning "postgres_scanner CMakeLists.txt not found - will be patched on next run"
-fi
-
-# Step 6c: Patch delta CMakeLists.txt to use rustls instead of native-tls (OpenSSL)
-log_info "Step 6c: Patching delta for rustls..."
-DELTA_CMAKE="_deps/delta_extension_fc-src/CMakeLists.txt"
-if [ -f "$DELTA_CMAKE" ]; then
-    if grep -q "all-features" "$DELTA_CMAKE"; then
-        python3 << 'PYEOF'
-from pathlib import Path
-import re
-import sys
-
-path = Path("_deps/delta_extension_fc-src/CMakeLists.txt")
-content = path.read_text()
-
-pattern = re.compile(
-    r'--package delta_kernel_ffi(?:\s+--workspace)?\s+--profile=\$\{CARGO_PROFILE\}\s+--all-features'
-)
-replacement = (
-    '--package delta_kernel_ffi --profile=${CARGO_PROFILE} '
-    '--no-default-features --features "default-engine-rustls,tracing,test-ffi"'
-)
-
-new_content, count = pattern.subn(replacement, content, count=1)
-if count == 0:
-    print("ERROR: delta all-features pattern not found")
-    sys.exit(1)
-
-path.write_text(new_content)
-print("Patched delta CMakeLists.txt")
-PYEOF
-        log_success "delta patched for rustls"
-    else
-        log_success "delta already patched"
-    fi
-else
-    log_warning "delta CMakeLists.txt not found - will be patched on next run"
-fi
-
-# Reconfigure to pick up postgres_scanner CMakeLists changes
-log_info "Reconfiguring after postgres_scanner patch..."
-cmake -DCMAKE_BUILD_TYPE=Release \
-  -DCMAKE_TOOLCHAIN_FILE="$VCPKG_DIR/scripts/buildsystems/vcpkg.cmake" \
-  -DVCPKG_MANIFEST_MODE=OFF \
-  -DCMAKE_EXE_LINKER_FLAGS="-Wl,--allow-multiple-definition" \
-  -DCMAKE_SHARED_LINKER_FLAGS="-Wl,--allow-multiple-definition" \
-  -DBUILD_EXTENSIONS="autocomplete;icu;tpcds;tpch;fts;json;parquet;sqlite_scanner;postgres_scanner;mysql_scanner;httpfs;excel;vss;inet;avro;aws;azure;iceberg;ducklake;delta;unity_catalog" \
-  .
-log_success "Reconfiguration complete"
+cd "$BUILD_DIR"
 
 # Step 7: Merge vcpkg dependencies
 log_info "Step 7: Merging vcpkg dependencies..."
@@ -444,7 +393,7 @@ if [ "$EXTENSION_COUNT" = "24" ]; then
     echo -e "${GREEN}========================================${NC}"
     echo -e "${GREEN}BUILD SUCCESSFUL${NC}"
     echo -e "${GREEN}========================================${NC}"
-    echo -e "Binary location: ${BLUE}$DUCKDB_DIR/duckdb${NC}"
+    echo -e "Binary location: ${BLUE}$BUILD_DIR/duckdb${NC}"
     echo -e "Binary size: ${BLUE}$BINARY_SIZE${NC}"
     echo -e "Extensions: ${BLUE}24 statically linked${NC}"
     echo -e "Build time: ${BLUE}$BUILD_TIME seconds${NC}"
@@ -462,6 +411,6 @@ fi
 
 echo ""
 echo -e "${BLUE}To use DuckDB:${NC}"
-echo -e "  cd $DUCKDB_DIR"
+echo -e "  cd $BUILD_DIR"
 echo -e "  ./duckdb"
 echo ""

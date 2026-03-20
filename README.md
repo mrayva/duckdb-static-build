@@ -5,53 +5,55 @@ Build DuckDB with 24 statically-linked core extensions.
 ## Quick Start
 
 ```bash
-# First time setup (installs vcpkg dependencies ~20 min)
-./build-duckdb-static.sh --clean
+# First build in a clean clone (recommended)
+./build-duckdb-static.sh --duckdb-dir /tmp/duckdb-clean/duckdbsrc --clean
 
-# Subsequent builds (skip vcpkg, ~5 min)
-./build-duckdb-static.sh --skip-vcpkg
+# Subsequent builds in same tree (faster)
+./build-duckdb-static.sh --duckdb-dir /tmp/duckdb-clean/duckdbsrc --skip-vcpkg
 ```
+
+## What This Produces
+
+- Binary: `<duckdb-dir>/build/release-static/duckdb`
+- Size: typically ~149-150MB
+- 24 statically linked extensions loaded at runtime (no download/install needed)
+
+## Extensions Included (24)
+
+| Category | Extensions |
+|----------|-----------|
+| Core | autocomplete, icu, json, parquet, core_functions, jemalloc, shell |
+| Benchmarks | tpcds, tpch |
+| Search | fts, vss |
+| Database Connectors | sqlite_scanner, postgres_scanner, mysql_scanner |
+| File Formats | excel, avro |
+| Cloud Storage | httpfs, aws, azure |
+| Table Formats | iceberg, ducklake, delta |
+| Catalogs | unity_catalog |
+| Networking | inet |
+
+## Spatial Status
+
+`spatial` is intentionally not part of the default 24-extension static build in this repo.
+
+Current blocker in clean environments is dependency provisioning through vcpkg/toolchain wiring:
+- `spatial` requires packages discovered as vcpkg CMake configs (for example `unofficial-sqlite3`).
+- If you build with `--skip-vcpkg` or without the vcpkg toolchain, configure can fail even if system `sqlite3` exists.
+
+See [build-instructions.md](/home/mrayva/duckdbbld/build-instructions.md) for a dedicated spatial section.
 
 ## Files
 
 | File | Description |
 |------|-------------|
 | `build-duckdb-static.sh` | Automated build script |
-| `build-instructions.md` | Manual step-by-step instructions |
-| `README.md` | This file |
-
-## Extensions Included (24)
-
-| Category | Extensions |
-|----------|-----------|
-| **Core** | autocomplete, icu, json, parquet, core_functions, jemalloc, shell |
-| **Benchmarks** | tpcds, tpch |
-| **Search** | fts, vss |
-| **Database Connectors** | sqlite_scanner, postgres_scanner, mysql_scanner |
-| **File Formats** | excel, avro |
-| **Cloud Storage** | httpfs, aws, azure |
-| **Table Formats** | iceberg, ducklake, delta |
-| **Catalogs** | unity_catalog |
-| **Networking** | inet |
-
-## Extensions NOT Supported
-
-| Extension | Reason |
-|-----------|--------|
-| **spatial** | GDAL 3.10.x API incompatibility (needs 3.8.x) |
-| **vortex** | DuckDB API version mismatch in Rust FFI |
-| **motherduck** | Proprietary/closed-source |
+| `build-instructions.md` | Full build/runbook (clean env + troubleshooting) |
+| `README.md` | Summary |
 
 ## Requirements
 
 - Linux x64
 - Git, CMake 3.15+, GCC/G++, Make
 - Rust toolchain (for delta extension)
-- ~20GB disk space for vcpkg dependencies
-
-## Output
-
-After successful build:
-- Binary: `~/duckdbsrc/duckdb` (~150MB)
-- All 24 extensions statically linked
-- No runtime extension downloads needed
+- vcpkg
+- ~20GB free disk if doing fresh dependency setup
