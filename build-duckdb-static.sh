@@ -313,11 +313,6 @@ index ff33ba9..f2e3361 100644
    BUILD_BYPRODUCTS "${DELTA_KERNEL_FFI_HEADER_CXX}"
 PATCH_EOF
 
-if [ "$WITH_SPATIAL" = true ]; then
-    mkdir -p .github/patches/extensions/spatial
-    rm -f .github/patches/extensions/spatial/memvfs_uri.patch
-fi
-
 log_success "Extension patch files created"
 
 # Step 5: Install vcpkg dependencies
