@@ -1,6 +1,7 @@
 # DuckDB Static Build Kit
 
 Build DuckDB with 24 statically-linked core extensions.
+Optionally include `spatial` for a 25-extension build.
 
 ## Quick Start
 
@@ -10,13 +11,16 @@ Build DuckDB with 24 statically-linked core extensions.
 
 # Subsequent builds in same tree (faster)
 ./build-duckdb-static.sh --duckdb-dir /tmp/duckdb-clean/duckdbsrc --skip-vcpkg
+
+# Include spatial (requires GDAL/PROJ/GEOS/SQLite vcpkg deps)
+./build-duckdb-static.sh --duckdb-dir /tmp/duckdb-clean/duckdbsrc --with-spatial --clean
 ```
 
 ## What This Produces
 
 - Binary: `<duckdb-dir>/build/release-static/duckdb`
 - Size: typically ~149-150MB
-- 24 statically linked extensions loaded at runtime (no download/install needed)
+- 24 statically linked extensions loaded at runtime (25 with `--with-spatial`)
 
 ## Extensions Included (24)
 
@@ -34,11 +38,14 @@ Build DuckDB with 24 statically-linked core extensions.
 
 ## Spatial Status
 
-`spatial` is intentionally not part of the default 24-extension static build in this repo.
+`spatial` is available through `--with-spatial` and is intentionally not part of the default 24-extension build.
 
-Current blocker in clean environments is dependency provisioning through vcpkg/toolchain wiring:
-- `spatial` requires packages discovered as vcpkg CMake configs (for example `unofficial-sqlite3`).
-- If you build with `--skip-vcpkg` or without the vcpkg toolchain, configure can fail even if system `sqlite3` exists.
+The spatial integration does three extra things:
+- Enables DuckDB's `spatial` config by removing `DONT_LINK`.
+- Patches spatial's memvfs SQLite open flags so the embedded PROJ database can be opened as a URI.
+- Regenerates spatial's embedded `proj_db.c` from the matching vcpkg `proj.db`, avoiding PROJ database layout mismatches.
+
+If you use `--skip-vcpkg`, the spatial dependencies must already exist in `~/vcpkg`.
 
 See [build-instructions.md](/home/mrayva/duckdbbld/build-instructions.md) for a dedicated spatial section.
 

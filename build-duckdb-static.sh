@@ -3,12 +3,14 @@ set -euo pipefail
 
 # DuckDB Static Build Script
 # Builds DuckDB with 24 statically-linked core extensions
+# Optionally adds the spatial extension for a 25-extension build
 # Usage: ./build-duckdb-static.sh [options]
 #   Options:
 #     --vcpkg-dir DIR    Path to vcpkg installation (default: ~/vcpkg)
 #     --duckdb-dir DIR   Path to DuckDB source (default: ~/duckdbsrc)
 #     --skip-vcpkg       Skip vcpkg dependency installation
 #     --clean            Clean build before starting
+#     --with-spatial     Include spatial as a statically-linked extension
 #     --help             Show this help
 
 # Colors for output
@@ -23,6 +25,7 @@ VCPKG_DIR="$HOME/vcpkg"
 DUCKDB_DIR="$HOME/duckdbsrc"
 SKIP_VCPKG=false
 CLEAN_BUILD=false
+WITH_SPATIAL=false
 
 require_cmd() {
     local cmd="$1"
@@ -93,6 +96,10 @@ while [[ $# -gt 0 ]]; do
       CLEAN_BUILD=true
       shift
       ;;
+    --with-spatial)
+      WITH_SPATIAL=true
+      shift
+      ;;
     --help)
       grep '^#' "$0" | grep -v '#!/bin/bash' | sed 's/^# //'
       exit 0
@@ -125,6 +132,9 @@ log_info "Checking prerequisites..."
 for cmd in git cmake make gcc g++ sed awk nproc python3 cargo rustc; do
     require_cmd "$cmd"
 done
+if [ "$WITH_SPATIAL" = true ]; then
+    require_cmd xxd
+fi
 log_success "All prerequisites found"
 
 # Step 1: Install/check vcpkg
@@ -163,7 +173,7 @@ fi
 # Step 3: Create extension configuration
 log_info "Step 3: Creating extension configuration..."
 mkdir -p extension
-cat > extension/extension_config_local.cmake << 'EOF'
+cat > extension/extension_config_local.cmake << EOF
 duckdb_extension_load(autocomplete)
 duckdb_extension_load(icu)
 duckdb_extension_load(tpcds)
@@ -186,6 +196,9 @@ duckdb_extension_load(ducklake)
 duckdb_extension_load(delta APPLY_PATCHES)
 duckdb_extension_load(unity_catalog)
 EOF
+if [ "$WITH_SPATIAL" = true ]; then
+    echo "duckdb_extension_load(spatial APPLY_PATCHES)" >> extension/extension_config_local.cmake
+fi
 log_success "Extension configuration created"
 
 # Step 4: Remove DONT_LINK flags and add INCLUDE_DIRs
@@ -210,6 +223,10 @@ if [ -f .github/config/extensions/mysql_scanner.cmake ]; then
     sed -i '/DONT_LINK/d' .github/config/extensions/mysql_scanner.cmake
     ensure_include_after_git_tag .github/config/extensions/mysql_scanner.cmake "INCLUDE_DIR src/include"
     log_success "mysql_scanner config patched"
+fi
+if [ "$WITH_SPATIAL" = true ] && [ -f .github/config/extensions/spatial.cmake ]; then
+    sed -i '/DONT_LINK/d' .github/config/extensions/spatial.cmake
+    log_success "spatial config patched"
 fi
 
 # Step 4b: Create extension patch files
@@ -276,19 +293,30 @@ PATCH_EOF
 mkdir -p .github/patches/extensions/delta
 cat > .github/patches/extensions/delta/rustls.patch << 'PATCH_EOF'
 diff --git a/CMakeLists.txt b/CMakeLists.txt
-index ff33ba9..b691e4f 100644
+index ff33ba9..f2e3361 100644
 --- a/CMakeLists.txt
 +++ b/CMakeLists.txt
-@@ -162,7 +162,7 @@ ExternalProject_Add(
+@@ -162,13 +162,9 @@ ExternalProject_Add(
    # Build debug build
    BUILD_COMMAND
      ${CMAKE_COMMAND} -E env ${RUST_UNSET_ENV_VARS} ${RUST_ENV_VARS} cargo build
 -    --package delta_kernel_ffi --workspace --profile=${CARGO_PROFILE} --all-features
 +    --package delta_kernel_ffi --profile=${CARGO_PROFILE} --no-default-features --features "default-engine-rustls,tracing,test-ffi"
      ${RUST_PLATFORM_PARAM}
-   # Build DATs
-   COMMAND
+-  # Build DATs
+-  COMMAND
+-    ${CMAKE_COMMAND} -E env ${RUST_UNSET_ENV_VARS} ${RUST_ENV_VARS} cargo build
+-    --manifest-path=${CMAKE_BINARY_DIR}/rust/src/delta_kernel/acceptance/Cargo.toml
+   # Define the byproducts, required for building with Ninja
+   BUILD_BYPRODUCTS "${DELTA_KERNEL_LIBPATH}"
+   BUILD_BYPRODUCTS "${DELTA_KERNEL_FFI_HEADER_C}"
+   BUILD_BYPRODUCTS "${DELTA_KERNEL_FFI_HEADER_CXX}"
 PATCH_EOF
+
+if [ "$WITH_SPATIAL" = true ]; then
+    mkdir -p .github/patches/extensions/spatial
+    rm -f .github/patches/extensions/spatial/memvfs_uri.patch
+fi
 
 log_success "Extension patch files created"
 
@@ -308,6 +336,11 @@ if [ "$SKIP_VCPKG" = false ]; then
     
     log_info "Installing libmariadb (for mysql_scanner)..."
     ./vcpkg install libmariadb
+
+    if [ "$WITH_SPATIAL" = true ]; then
+        log_info "Installing spatial dependencies (GDAL/PROJ/GEOS/SQLite)..."
+        ./vcpkg install gdal[network,geos] proj geos expat sqlite3[rtree] curl openssl zlib
+    fi
     
     log_success "vcpkg dependencies installed"
     cd "$DUCKDB_DIR"
@@ -326,6 +359,13 @@ cd "$DUCKDB_DIR"
 # Create minimal vcpkg.json to avoid manifest mode issues
 echo '{"name":"duckdb","version":"1.0.0"}' > vcpkg.json
 
+BUILD_EXTENSIONS="autocomplete;icu;tpcds;tpch;fts;json;parquet;sqlite_scanner;postgres_scanner;mysql_scanner;httpfs;excel;vss;inet;avro;aws;azure;iceberg;ducklake;delta;unity_catalog"
+EXPECTED_EXTENSIONS=24
+if [ "$WITH_SPATIAL" = true ]; then
+    BUILD_EXTENSIONS="${BUILD_EXTENSIONS};spatial"
+    EXPECTED_EXTENSIONS=25
+fi
+
 # Note: --allow-multiple-definition is required because postgres_scanner and mysql_scanner
 # share some common helper functions (EscapeConnectionString, GetSecret, CatalogTypeIsSupported)
 cmake -S "$DUCKDB_DIR" -B "$BUILD_DIR" \
@@ -334,7 +374,7 @@ cmake -S "$DUCKDB_DIR" -B "$BUILD_DIR" \
   -DVCPKG_MANIFEST_MODE=OFF \
   -DCMAKE_EXE_LINKER_FLAGS="-Wl,--allow-multiple-definition" \
   -DCMAKE_SHARED_LINKER_FLAGS="-Wl,--allow-multiple-definition" \
-  -DBUILD_EXTENSIONS="autocomplete;icu;tpcds;tpch;fts;json;parquet;sqlite_scanner;postgres_scanner;mysql_scanner;httpfs;excel;vss;inet;avro;aws;azure;iceberg;ducklake;delta;unity_catalog" \
+  -DBUILD_EXTENSIONS="$BUILD_EXTENSIONS" \
   .
 log_success "CMake configuration complete"
 
@@ -363,6 +403,34 @@ done
 shopt -u nullglob
 log_success "vcpkg dependencies merged"
 
+if [ "$WITH_SPATIAL" = true ]; then
+    SPATIAL_PROJ_DB="$VCPKG_DIR/installed/x64-linux/share/proj/proj.db"
+    SPATIAL_PROJ_DIR="$BUILD_DIR/_deps/spatial_extension_fc-src/src/spatial/modules/proj"
+    SPATIAL_PROJ_MODULE="$SPATIAL_PROJ_DIR/proj_module.cpp"
+    if [ ! -f "$SPATIAL_PROJ_DB" ]; then
+        log_error "Spatial requested, but $SPATIAL_PROJ_DB was not found"
+        log_error "Install spatial dependencies first or rerun without --skip-vcpkg"
+        exit 1
+    fi
+    if [ ! -d "$SPATIAL_PROJ_DIR" ]; then
+        log_error "Spatial source directory not found at $SPATIAL_PROJ_DIR"
+        exit 1
+    fi
+    if [ ! -f "$SPATIAL_PROJ_MODULE" ]; then
+        log_error "Spatial PROJ module not found at $SPATIAL_PROJ_MODULE"
+        exit 1
+    fi
+
+    log_info "Patching spatial memvfs sqlite URI open flags..."
+    sed -i 's/SQLITE_OPEN_READONLY, "memvfs"/SQLITE_OPEN_READONLY | SQLITE_OPEN_URI, "memvfs"/' "$SPATIAL_PROJ_MODULE"
+    log_success "Spatial memvfs open flags patched"
+
+    log_info "Regenerating spatial embedded proj_db.c from vcpkg PROJ database..."
+    cp "$SPATIAL_PROJ_DB" "$SPATIAL_PROJ_DIR/proj.db"
+    (cd "$SPATIAL_PROJ_DIR" && xxd -i proj.db > proj_db.c && rm -f proj.db)
+    log_success "Spatial proj_db.c regenerated"
+fi
+
 # Step 8: Build
 log_info "Step 8: Building DuckDB (5-10 minutes)..."
 NUM_CORES=$(nproc)
@@ -386,8 +454,8 @@ log_success "Binary created: $BINARY_SIZE"
 log_info "Checking extensions..."
 EXTENSION_COUNT=$(./duckdb -c "SELECT COUNT(*) FROM duckdb_extensions() WHERE loaded=true;" 2>/dev/null | grep -o '[0-9]\+' | tail -1)
 
-if [ "$EXTENSION_COUNT" = "24" ]; then
-    log_success "All 24 extensions loaded successfully!"
+if [ "$EXTENSION_COUNT" = "$EXPECTED_EXTENSIONS" ]; then
+    log_success "All $EXPECTED_EXTENSIONS extensions loaded successfully!"
     
     echo ""
     echo -e "${GREEN}========================================${NC}"
@@ -395,7 +463,7 @@ if [ "$EXTENSION_COUNT" = "24" ]; then
     echo -e "${GREEN}========================================${NC}"
     echo -e "Binary location: ${BLUE}$BUILD_DIR/duckdb${NC}"
     echo -e "Binary size: ${BLUE}$BINARY_SIZE${NC}"
-    echo -e "Extensions: ${BLUE}24 statically linked${NC}"
+    echo -e "Extensions: ${BLUE}$EXPECTED_EXTENSIONS statically linked${NC}"
     echo -e "Build time: ${BLUE}$BUILD_TIME seconds${NC}"
     echo ""
     echo "Extensions loaded:"
@@ -403,7 +471,7 @@ if [ "$EXTENSION_COUNT" = "24" ]; then
         awk '/│/ && !/extension_name/ && !/varchar/ {gsub(/│/,""); gsub(/^ +| +$/,""); if (length($0) > 0) print "  - " $0}'
     echo ""
 else
-    log_warning "Expected 24 extensions, found $EXTENSION_COUNT"
+    log_warning "Expected $EXPECTED_EXTENSIONS extensions, found $EXTENSION_COUNT"
     echo ""
     echo "Loaded extensions:"
     ./duckdb -c "SELECT extension_name, loaded FROM duckdb_extensions() WHERE installed=true ORDER BY extension_name;"

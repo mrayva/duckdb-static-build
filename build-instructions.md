@@ -30,6 +30,16 @@ CCACHE_DISABLE=1 ./build-duckdb-static.sh \
   --clean
 ```
 
+To include spatial:
+
+```bash
+CCACHE_DISABLE=1 ./build-duckdb-static.sh \
+  --duckdb-dir /tmp/duckdb-clean/duckdbsrc \
+  --vcpkg-dir "$HOME/vcpkg" \
+  --with-spatial \
+  --clean
+```
+
 ## 3. Permissions Needed In Restricted/Sandboxed Environments
 
 You may need to allow:
@@ -64,13 +74,15 @@ The script performs these exact phases:
 - Azure SDK components
 - roaring
 - libmariadb
+- Spatial dependencies when `--with-spatial` is used: GDAL, PROJ, GEOS, SQLite with RTREE, curl, OpenSSL, zlib, expat
 9. Configures out-of-source build at `<duckdb-dir>/build/release-static` with:
 - vcpkg toolchain
 - `-DVCPKG_MANIFEST_MODE=OFF`
 - linker flag `--allow-multiple-definition`
 10. Merges global and extension-local `vcpkg_installed` trees.
-11. Builds with `EXTENSION_STATIC_BUILD=1 make -j$(nproc)`.
-12. Verifies runtime by counting loaded extensions from `duckdb_extensions()`.
+11. When `--with-spatial` is used, regenerates spatial's embedded `proj_db.c` from the matching vcpkg `proj.db`.
+12. Builds with `EXTENSION_STATIC_BUILD=1 make -j$(nproc)`.
+13. Verifies runtime by counting loaded extensions from `duckdb_extensions()`.
 
 ## 5. Output/Success Criteria
 
@@ -79,6 +91,8 @@ On success, you should see:
 - Binary at `<duckdb-dir>/build/release-static/duckdb`
 - Size around ~149-150MB
 - `All 24 extensions loaded successfully!`
+
+With `--with-spatial`, expect 25 loaded extensions and a larger binary.
 
 ## 6. Fast Rebuilds
 
@@ -93,46 +107,44 @@ If dependencies are already present:
 
 Use `--clean` whenever upstream refreshes significantly or configure/build state looks inconsistent.
 
-## 7. Spatial Extension: Current Status and Blocker
+## 7. Spatial Extension
 
-`spatial` is not included in the default 24-extension static set here.
+`spatial` is integrated behind `--with-spatial`. It is not included by default because it adds a large native geospatial dependency chain and is more sensitive to vcpkg/PROJ version drift.
 
-Important distinction:
-- Static build breakage from old refresh issues is not the primary blocker now.
-- In clean setups, the immediate blocker is dependency provisioning and discovery.
+The script handles three spatial-specific issues:
+- DuckDB still marks spatial with `DONT_LINK`; the script removes that flag only when `--with-spatial` is passed.
+- Spatial's memvfs SQLite open must include URI mode for the embedded PROJ database.
+- `duckdb-spatial` embeds `proj.db`; the script regenerates `proj_db.c` from the vcpkg `proj.db` so the database layout matches the linked PROJ library.
 
-Observed failure mode when testing spatial without proper vcpkg wiring:
+Observed failure modes:
 - CMake reports missing package config for `unofficial-sqlite3`.
 - System `SQLite3` being installed does not satisfy this specific vcpkg package lookup.
+- Runtime `LOAD spatial` can fail with `Could not open sqlite3 memvfs database` if SQLite URI mode is not used.
+- Runtime `LOAD spatial` can fail with `Could not set proj.db path` if the embedded `proj.db` does not match the linked PROJ library.
 
 Why this happens:
 - `spatial` CMake expects vcpkg-style package config discovery.
 - `--skip-vcpkg` (or missing vcpkg toolchain) means those package config files are not available on CMake search paths.
+- PROJ validates the schema layout of `proj.db` at runtime.
 
-## 8. Spatial Test Recipe (With Toolchain)
+## 8. Spatial Build Recipe
 
-If you want to test spatial in a clean tree, do not skip vcpkg/toolchain setup.
+Preferred path:
 
 ```bash
-cd /tmp/duckdb-clean/duckdbsrc
-
-# Example local config for spatial-only test
-cat > extension/extension_config_local.cmake <<'CMAKE_EOF'
-duckdb_extension_load(spatial APPLY_PATCHES)
-CMAKE_EOF
-
-cmake -S . -B build/spatial-static-test \
-  -DCMAKE_BUILD_TYPE=Release \
-  -DCMAKE_TOOLCHAIN_FILE=$HOME/vcpkg/scripts/buildsystems/vcpkg.cmake \
-  -DVCPKG_TARGET_TRIPLET=x64-linux \
-  -DDUCKDB_EXTENSION_CONFIGS=./extension/extension_config_local.cmake \
-  -DBUILD_EXTENSIONS=spatial \
-  -DBUILD_SHELL=1
-
-cmake --build build/spatial-static-test --target spatial_extension shell -j$(nproc)
+cd /home/mrayva/duckdbbld
+CCACHE_DISABLE=1 ./build-duckdb-static.sh \
+  --duckdb-dir /tmp/duckdb-clean/duckdbsrc \
+  --vcpkg-dir "$HOME/vcpkg" \
+  --with-spatial \
+  --clean
 ```
 
-If configure still reports missing packages, install required vcpkg ports first or rerun with network enabled so dependency resolution can complete.
+If you pass `--skip-vcpkg`, these vcpkg packages must already be installed:
+
+```bash
+gdal[network,geos] proj geos expat sqlite3[rtree] curl openssl zlib
+```
 
 ## 9. Troubleshooting
 
