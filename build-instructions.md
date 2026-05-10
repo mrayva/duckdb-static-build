@@ -50,6 +50,16 @@ CCACHE_DISABLE=1 ./build-duckdb-static.sh \
   --clean
 ```
 
+To include experimental aggjoin:
+
+```bash
+CCACHE_DISABLE=1 ./build-duckdb-static.sh \
+  --duckdb-dir /tmp/duckdb-clean/duckdbsrc \
+  --vcpkg-dir "$HOME/vcpkg" \
+  --with-aggjoin \
+  --clean
+```
+
 ## 3. Permissions Needed In Restricted/Sandboxed Environments
 
 You may need to allow:
@@ -80,6 +90,7 @@ The script performs these exact phases:
 - `postgres_scanner` static build target + include/link wiring
 - `delta` rustls feature selection (avoids problematic native-tls/OpenSSL path)
 - `robust` current-DuckDB compatibility when `--with-robust-rpt` is used
+- `aggjoin` current-DuckDB compatibility when `--with-aggjoin` is used
 8. Optional dependency install (unless `--skip-vcpkg`):
 - AWS SDK components
 - Azure SDK components
@@ -87,6 +98,7 @@ The script performs these exact phases:
 - libmariadb
 - Spatial dependencies when `--with-spatial` is used: GDAL, PROJ, GEOS, SQLite with RTREE, curl, OpenSSL, zlib, expat
 - OpenSSL when `--with-robust-rpt` is used
+- No extra vcpkg packages for `--with-aggjoin`
 9. Configures out-of-source build at `<duckdb-dir>/build/release-static` with:
 - vcpkg toolchain
 - `-DVCPKG_MANIFEST_MODE=OFF`
@@ -106,7 +118,7 @@ On success, you should see:
 
 With `--with-spatial`, expect 25 loaded extensions and a larger binary.
 
-With `--with-robust-rpt`, expect one additional loaded extension. Combining `--with-spatial --with-robust-rpt` should produce 26 loaded extensions.
+With `--with-robust-rpt` or `--with-aggjoin`, expect one additional loaded extension per flag. Combining `--with-spatial --with-robust-rpt --with-aggjoin` should produce 27 loaded extensions.
 
 ## 6. Fast Rebuilds
 
@@ -192,7 +204,39 @@ CCACHE_DISABLE=1 ./build-duckdb-static.sh \
   --clean
 ```
 
-## 10. Troubleshooting
+## 10. AggJoin Extension
+
+`arselzer/duckdb_aggjoin` is integrated behind `--with-aggjoin`. It is not included by default because it requires patching upstream extension code for current DuckDB APIs.
+
+The script pins aggjoin to:
+
+```text
+5f4b64ac879b13662142bd7624784a4ad709393c
+```
+
+The compatibility patch handles:
+- Protected function/expression fields replaced with `GetName()`, `GetReturnType()`, and `GetExpressionType()`.
+- `TableIndex` and `ProjectionIndex` wrapper conversions.
+- Private `JoinCondition` fields replaced with accessors/constructor use.
+- Mutable vector writes moved to `FlatVector::GetDataMutable()` / `ValidityMutable()`.
+
+Focused validation performed:
+- CMake configure loaded `aggjoin` from `arselzer/duckdb_aggjoin` at `5f4b64a`.
+- `cmake --build ... --target aggjoin_extension duckdb -j4` completed successfully against DuckDB `ae0aec232a` / `v1.6.0-dev5563`.
+- Full script validation with `--skip-vcpkg --with-aggjoin` produced a 153MB binary with 25 loaded extensions, including `aggjoin`.
+
+Preferred recipe:
+
+```bash
+cd /home/mrayva/duckdbbld
+CCACHE_DISABLE=1 ./build-duckdb-static.sh \
+  --duckdb-dir /tmp/duckdb-clean/duckdbsrc \
+  --vcpkg-dir "$HOME/vcpkg" \
+  --with-aggjoin \
+  --clean
+```
+
+## 11. Troubleshooting
 
 ### `/tmp` out of space
 

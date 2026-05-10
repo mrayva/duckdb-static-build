@@ -1,7 +1,7 @@
 # DuckDB Static Build Kit
 
 Build DuckDB with 24 statically-linked core extensions.
-Optionally include `spatial` and experimental `robust-labs/robust` RPT.
+Optionally include `spatial`, experimental `robust-labs/robust` RPT, and experimental `arselzer/duckdb_aggjoin`.
 
 ## Quick Start
 
@@ -17,6 +17,9 @@ Optionally include `spatial` and experimental `robust-labs/robust` RPT.
 
 # Include robust RPT (experimental)
 ./build-duckdb-static.sh --duckdb-dir /tmp/duckdb-clean/duckdbsrc --with-robust-rpt --clean
+
+# Include aggjoin (experimental aggregate-over-join optimizer extension)
+./build-duckdb-static.sh --duckdb-dir /tmp/duckdb-clean/duckdbsrc --with-aggjoin --clean
 ```
 
 ## What This Produces
@@ -24,8 +27,8 @@ Optionally include `spatial` and experimental `robust-labs/robust` RPT.
 - Binary: `<duckdb-dir>/build/release-static/duckdb`
 - Size: typically ~149-150MB
 - 24 statically linked extensions loaded at runtime
-- 25 with either `--with-spatial` or `--with-robust-rpt`
-- 26 with both optional extensions
+- Add 1 loaded extension for each optional flag: `--with-spatial`, `--with-robust-rpt`, `--with-aggjoin`
+- 27 loaded extensions when all three optional flags are enabled
 
 ## Extensions Included (24)
 
@@ -64,6 +67,18 @@ The integration pins `robust` to commit `5ec7800e000291e27f7433cb513ba606fc675fc
 - Uses OpenSSL from vcpkg.
 
 This path is experimental because it patches upstream extension code. Keep it separate from the default build unless you are specifically testing robust/RPT behavior.
+
+## AggJoin Status
+
+`arselzer/duckdb_aggjoin` is available through `--with-aggjoin` and is intentionally not part of the default build.
+
+The integration pins `duckdb_aggjoin` to commit `5f4b64ac879b13662142bd7624784a4ad709393c` and applies a compatibility patch for current DuckDB source:
+- Updates protected DuckDB API access to `GetName()`, `GetReturnType()`, and `GetExpressionType()`.
+- Updates binding/index construction for `TableIndex` and `ProjectionIndex`.
+- Updates `JoinCondition` handling for private fields and constructor-based ownership.
+- Uses mutable vector APIs where the extension writes output vectors.
+
+This path is experimental because it patches upstream extension code and because aggjoin is an optimizer/runtime extension, not a normal scalar/table function package.
 
 ## Files
 
