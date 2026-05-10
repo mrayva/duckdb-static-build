@@ -40,6 +40,16 @@ CCACHE_DISABLE=1 ./build-duckdb-static.sh \
   --clean
 ```
 
+To include experimental robust RPT:
+
+```bash
+CCACHE_DISABLE=1 ./build-duckdb-static.sh \
+  --duckdb-dir /tmp/duckdb-clean/duckdbsrc \
+  --vcpkg-dir "$HOME/vcpkg" \
+  --with-robust-rpt \
+  --clean
+```
+
 ## 3. Permissions Needed In Restricted/Sandboxed Environments
 
 You may need to allow:
@@ -69,12 +79,14 @@ The script performs these exact phases:
 - `mysql_scanner` static build target + include/link wiring
 - `postgres_scanner` static build target + include/link wiring
 - `delta` rustls feature selection (avoids problematic native-tls/OpenSSL path)
+- `robust` current-DuckDB compatibility when `--with-robust-rpt` is used
 8. Optional dependency install (unless `--skip-vcpkg`):
 - AWS SDK components
 - Azure SDK components
 - roaring
 - libmariadb
 - Spatial dependencies when `--with-spatial` is used: GDAL, PROJ, GEOS, SQLite with RTREE, curl, OpenSSL, zlib, expat
+- OpenSSL when `--with-robust-rpt` is used
 9. Configures out-of-source build at `<duckdb-dir>/build/release-static` with:
 - vcpkg toolchain
 - `-DVCPKG_MANIFEST_MODE=OFF`
@@ -93,6 +105,8 @@ On success, you should see:
 - `All 24 extensions loaded successfully!`
 
 With `--with-spatial`, expect 25 loaded extensions and a larger binary.
+
+With `--with-robust-rpt`, expect one additional loaded extension. Combining `--with-spatial --with-robust-rpt` should produce 26 loaded extensions.
 
 ## 6. Fast Rebuilds
 
@@ -146,7 +160,39 @@ If you pass `--skip-vcpkg`, these vcpkg packages must already be installed:
 gdal[network,geos] proj geos expat sqlite3[rtree] curl openssl zlib
 ```
 
-## 9. Troubleshooting
+## 9. Robust RPT Extension
+
+`robust-labs/robust` is integrated behind `--with-robust-rpt`. It is not included by default because it requires patching upstream extension code for current DuckDB APIs.
+
+The script pins robust to:
+
+```text
+5ec7800e000291e27f7433cb513ba606fc675fc1
+```
+
+The compatibility patch handles:
+- The missing upstream `probe_empty_registry.hpp` include.
+- `TableIndex` becoming a wrapper type instead of a raw `idx_t`.
+- `ProjectionIndex` being required for dynamic table filter pushdown.
+- Protected expression type access moving to `GetExpressionType()`.
+- `GetTableIndex()` returning `TableIndex` values.
+
+Focused validation performed:
+- CMake configure loaded `robust` from `robust-labs/robust` at `5ec7800`.
+- `cmake --build ... --target robust_extension duckdb -j4` completed successfully against DuckDB `ae0aec232a` / `v1.6.0-dev5563`.
+
+Preferred recipe:
+
+```bash
+cd /home/mrayva/duckdbbld
+CCACHE_DISABLE=1 ./build-duckdb-static.sh \
+  --duckdb-dir /tmp/duckdb-clean/duckdbsrc \
+  --vcpkg-dir "$HOME/vcpkg" \
+  --with-robust-rpt \
+  --clean
+```
+
+## 10. Troubleshooting
 
 ### `/tmp` out of space
 

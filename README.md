@@ -1,7 +1,7 @@
 # DuckDB Static Build Kit
 
 Build DuckDB with 24 statically-linked core extensions.
-Optionally include `spatial` for a 25-extension build.
+Optionally include `spatial` and experimental `robust-labs/robust` RPT.
 
 ## Quick Start
 
@@ -14,13 +14,18 @@ Optionally include `spatial` for a 25-extension build.
 
 # Include spatial (requires GDAL/PROJ/GEOS/SQLite vcpkg deps)
 ./build-duckdb-static.sh --duckdb-dir /tmp/duckdb-clean/duckdbsrc --with-spatial --clean
+
+# Include robust RPT (experimental)
+./build-duckdb-static.sh --duckdb-dir /tmp/duckdb-clean/duckdbsrc --with-robust-rpt --clean
 ```
 
 ## What This Produces
 
 - Binary: `<duckdb-dir>/build/release-static/duckdb`
 - Size: typically ~149-150MB
-- 24 statically linked extensions loaded at runtime (25 with `--with-spatial`)
+- 24 statically linked extensions loaded at runtime
+- 25 with either `--with-spatial` or `--with-robust-rpt`
+- 26 with both optional extensions
 
 ## Extensions Included (24)
 
@@ -48,6 +53,17 @@ The spatial integration does three extra things:
 If you use `--skip-vcpkg`, the spatial dependencies must already exist in `~/vcpkg`.
 
 See [build-instructions.md](/home/mrayva/duckdbbld/build-instructions.md) for a dedicated spatial section.
+
+## Robust RPT Status
+
+`robust-labs/robust` is available through `--with-robust-rpt` and is intentionally not part of the default build.
+
+The integration pins `robust` to commit `5ec7800e000291e27f7433cb513ba606fc675fc1` and applies a compatibility patch for current DuckDB source:
+- Adds the missing `probe_empty_registry.hpp` required by the upstream robust code.
+- Updates DuckDB API drift around `TableIndex`, `ProjectionIndex`, expression type access, and dynamic table filters.
+- Uses OpenSSL from vcpkg.
+
+This path is experimental because it patches upstream extension code. Keep it separate from the default build unless you are specifically testing robust/RPT behavior.
 
 ## Files
 
