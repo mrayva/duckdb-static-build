@@ -50,6 +50,16 @@ CCACHE_DISABLE=1 ./build-duckdb-static.sh \
   --clean
 ```
 
+To build and validate a COPY-safe binary that excludes robust RPT:
+
+```bash
+CCACHE_DISABLE=1 ./build-duckdb-static.sh \
+  --duckdb-dir /tmp/duckdb-clean/duckdbsrc \
+  --vcpkg-dir "$HOME/vcpkg" \
+  --copy-tests \
+  --clean
+```
+
 To include experimental aggjoin:
 
 ```bash
@@ -81,12 +91,11 @@ The script performs these exact phases:
 2. Ensures `vcpkg` exists (clones/bootstrap if missing).
 3. Ensures DuckDB source exists (clones if missing).
 4. Optional clean (`--clean`) of prior build artifacts.
-5. Writes `extension/extension_config_local.cmake` with 21 externally managed extensions.
+5. Writes `extension/extension_config_local.cmake` with the externally managed extensions that should start with DuckDB.
 6. Patches selected extension config files:
-- removes `DONT_LINK` where needed (`fts`, `vss`, `postgres_scanner`, `mysql_scanner`)
+- removes `DONT_LINK` where needed (`fts`, `vss`, `postgres_scanner`)
 - injects required `INCLUDE_DIR` entries.
 7. Writes patch files under `.github/patches/extensions/` for:
-- `mysql_scanner` static build target + include/link wiring
 - `postgres_scanner` static build target + include/link wiring
 - `delta` rustls feature selection (avoids problematic native-tls/OpenSSL path)
 - `robust` current-DuckDB compatibility when `--with-robust-rpt` is used
@@ -95,9 +104,9 @@ The script performs these exact phases:
 - AWS SDK components
 - Azure SDK components
 - roaring
-- libmariadb
 - Spatial dependencies when `--with-spatial` is used: GDAL, PROJ, GEOS, SQLite with RTREE, curl, OpenSSL, zlib, expat
 - OpenSSL when `--with-robust-rpt` is used
+- None for `--copy-tests` because `robust` is excluded entirely
 - No extra vcpkg packages for `--with-aggjoin`
 9. Configures out-of-source build at `<duckdb-dir>/build/release-static` with:
 - vcpkg toolchain
@@ -114,11 +123,11 @@ On success, you should see:
 
 - Binary at `<duckdb-dir>/build/release-static/duckdb`
 - Size around ~149-150MB
-- `All 24 extensions loaded successfully!`
+- `All 23 extensions loaded successfully!`
 
-With `--with-spatial`, expect 25 loaded extensions and a larger binary.
+With `--with-spatial`, expect 24 loaded extensions and a larger binary.
 
-With `--with-robust-rpt` or `--with-aggjoin`, expect one additional loaded extension per flag. Combining `--with-spatial --with-robust-rpt --with-aggjoin` should produce 27 loaded extensions.
+With `--with-robust-rpt` or `--with-aggjoin`, expect one additional loaded extension per flag. Combining `--with-spatial --with-robust-rpt --with-aggjoin` should produce 26 loaded extensions.
 
 ## 6. Fast Rebuilds
 
@@ -136,6 +145,8 @@ Use `--clean` whenever upstream refreshes significantly or configure/build state
 ## 7. Spatial Extension
 
 `spatial` is integrated behind `--with-spatial`. It is not included by default because it adds a large native geospatial dependency chain and is more sensitive to vcpkg/PROJ version drift.
+
+`mysql_scanner` is intentionally excluded from the static startup set for now because its MariaDB client/plugin path still breaks clean startup in this build layout.
 
 The script handles three spatial-specific issues:
 - DuckDB still marks spatial with `DONT_LINK`; the script removes that flag only when `--with-spatial` is passed.
@@ -169,12 +180,18 @@ CCACHE_DISABLE=1 ./build-duckdb-static.sh \
 If you pass `--skip-vcpkg`, these vcpkg packages must already be installed:
 
 ```bash
-gdal[network,geos] proj geos expat sqlite3[rtree] curl openssl zlib
+gdal[geos] proj geos expat sqlite3[rtree] curl openssl zlib
 ```
 
 ## 9. Robust RPT Extension
 
 `robust-labs/robust` is integrated behind `--with-robust-rpt`. It is not included by default because it requires patching upstream extension code for current DuckDB APIs.
+For COPY-related validation, use `--copy-tests` so the static build excludes `robust` entirely and then runs the COPY repro harness against the resulting binary.
+
+Observed bisect outcome:
+- The COPY crash only reproduces when `robust` is loaded into the static build.
+- The following compatibility shims were tested individually and did not by themselves reproduce the crash when reverted/restored one at a time: `probe_empty_registry`, `robust_profiling`, `robust_optimizer` cleanup/body changes, `table_manager` index access, `physical_create_filter`, `physical_probe_filter`, `logical_probe_filter`, and `dag_printer`.
+- The practical build-time mitigation is to keep `robust` out of COPY validation entirely via `--copy-tests`.
 
 The script pins robust to:
 
