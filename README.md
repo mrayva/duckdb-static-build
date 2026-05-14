@@ -1,6 +1,6 @@
 # DuckDB Static Build Kit
 
-Build DuckDB with 23 statically-linked core extensions.
+Build DuckDB with 24 statically-linked core extensions.
 Optionally include `spatial`, experimental `robust-labs/robust` RPT, and experimental `arselzer/duckdb_aggjoin`.
 
 ## Quick Start
@@ -29,18 +29,18 @@ Optionally include `spatial`, experimental `robust-labs/robust` RPT, and experim
 
 - Binary: `<duckdb-dir>/build/release-static/duckdb`
 - Size: typically ~149-150MB
-- 23 statically linked extensions loaded at runtime
+- 24 statically linked extensions loaded at runtime
 - Add 1 loaded extension for each optional flag: `--with-spatial`, `--with-robust-rpt`, `--with-aggjoin`
-- 26 loaded extensions when all three optional flags are enabled
+- 27 loaded extensions when all three optional flags are enabled
 
-## Extensions Included (23)
+## Extensions Included (24)
 
 | Category | Extensions |
 |----------|-----------|
 | Core | autocomplete, icu, json, parquet, core_functions, jemalloc, shell |
 | Benchmarks | tpcds, tpch |
 | Search | fts, vss |
-| Database Connectors | sqlite_scanner, postgres_scanner |
+| Database Connectors | sqlite_scanner, postgres_scanner, mysql_scanner |
 | File Formats | excel, avro |
 | Cloud Storage | httpfs, aws, azure |
 | Table Formats | iceberg, ducklake, delta |
@@ -50,8 +50,6 @@ Optionally include `spatial`, experimental `robust-labs/robust` RPT, and experim
 ## Spatial Status
 
 `spatial` is available through `--with-spatial` and is intentionally not part of the default build.
-
-`mysql_scanner` is not part of the static startup set yet; the current build keeps it out so DuckDB starts cleanly in a fully static configuration.
 
 The spatial integration does three extra things:
 - Enables DuckDB's `spatial` config by removing `DONT_LINK`.

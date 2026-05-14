@@ -123,11 +123,11 @@ On success, you should see:
 
 - Binary at `<duckdb-dir>/build/release-static/duckdb`
 - Size around ~149-150MB
-- `All 23 extensions loaded successfully!`
+- `All 24 extensions loaded successfully!`
 
-With `--with-spatial`, expect 24 loaded extensions and a larger binary.
+With `--with-spatial`, expect 25 loaded extensions and a larger binary.
 
-With `--with-robust-rpt` or `--with-aggjoin`, expect one additional loaded extension per flag. Combining `--with-spatial --with-robust-rpt --with-aggjoin` should produce 26 loaded extensions.
+With `--with-robust-rpt` or `--with-aggjoin`, expect one additional loaded extension per flag. Combining `--with-spatial --with-robust-rpt --with-aggjoin` should produce 27 loaded extensions.
 
 ## 6. Fast Rebuilds
 
@@ -145,8 +145,6 @@ Use `--clean` whenever upstream refreshes significantly or configure/build state
 ## 7. Spatial Extension
 
 `spatial` is integrated behind `--with-spatial`. It is not included by default because it adds a large native geospatial dependency chain and is more sensitive to vcpkg/PROJ version drift.
-
-`mysql_scanner` is intentionally excluded from the static startup set for now because its MariaDB client/plugin path still breaks clean startup in this build layout.
 
 The script handles three spatial-specific issues:
 - DuckDB still marks spatial with `DONT_LINK`; the script removes that flag only when `--with-spatial` is passed.
@@ -180,7 +178,7 @@ CCACHE_DISABLE=1 ./build-duckdb-static.sh \
 If you pass `--skip-vcpkg`, these vcpkg packages must already be installed:
 
 ```bash
-gdal[geos] proj geos expat sqlite3[rtree] curl openssl zlib
+gdal[geos] proj geos expat sqlite3[rtree] curl openssl zlib libmariadb
 ```
 
 ## 9. Robust RPT Extension

@@ -2,7 +2,7 @@
 set -euo pipefail
 
 # DuckDB Static Build Script
-# Builds DuckDB with 23 statically-linked core extensions
+# Builds DuckDB with 24 statically-linked core extensions
 # Optionally adds the spatial extension for a 25-extension build
 # Optionally adds robust-labs/robust RPT as an experimental extension
 # Optionally adds arselzer/duckdb_aggjoin as an experimental extension
@@ -482,6 +482,7 @@ duckdb_extension_load(json)
 duckdb_extension_load(parquet)
 duckdb_extension_load(sqlite_scanner)
 duckdb_extension_load(postgres_scanner APPLY_PATCHES)
+duckdb_extension_load(mysql_scanner APPLY_PATCHES)
 duckdb_extension_load(httpfs)
 duckdb_extension_load(excel)
 duckdb_extension_load(vss)
@@ -544,6 +545,11 @@ if [ -f .github/config/extensions/postgres_scanner.cmake ]; then
     sed -i '/DONT_LINK/d' .github/config/extensions/postgres_scanner.cmake
     ensure_include_after_git_tag .github/config/extensions/postgres_scanner.cmake "INCLUDE_DIR src/include"
     log_success "postgres_scanner config patched"
+fi
+if [ -f .github/config/extensions/mysql_scanner.cmake ]; then
+    sed -i '/DONT_LINK/d' .github/config/extensions/mysql_scanner.cmake
+    ensure_include_after_git_tag .github/config/extensions/mysql_scanner.cmake "INCLUDE_DIR src/include"
+    log_success "mysql_scanner config patched"
 fi
 if [ "$WITH_SPATIAL" = true ] && [ -f .github/config/extensions/spatial.cmake ]; then
     sed -i '/DONT_LINK/d' .github/config/extensions/spatial.cmake
@@ -619,6 +625,33 @@ index d0e5371..e7478aa 100644
 PATCH_EOF
 
 mkdir -p .github/patches/extensions/delta
+mkdir -p .github/patches/extensions/mysql_scanner
+cat > .github/patches/extensions/mysql_scanner/static_build.patch << 'PATCH_EOF'
+diff --git a/CMakeLists.txt b/CMakeLists.txt
+index 081124a..f0a2df6 100644
+--- a/CMakeLists.txt
++++ b/CMakeLists.txt
+@@ -12,6 +12,9 @@ include_directories(${MYSQL_INCLUDE_DIR})
+ 
+ add_subdirectory(src)
+ 
++# Static extension build (added by build script)
++build_static_extension(${TARGET_NAME} "" ${ALL_OBJECT_FILES})
++
+ set(PARAMETERS "-no-warnings")
+ build_loadable_extension(${TARGET_NAME} ${PARAMETERS} ${ALL_OBJECT_FILES})
+ 
+@@ -19,3 +22,8 @@ build_loadable_extension(${TARGET_NAME} ${PARAMETERS} ${ALL_OBJECT_FILES})
+ target_include_directories(${TARGET_NAME}_loadable_extension
+                            PRIVATE include ${MYSQL_INCLUDE_DIR})
+ target_link_libraries(${TARGET_NAME}_loadable_extension ${MYSQL_LIBRARIES})
++
++# Static binary includes/libs (added by build script)
++target_include_directories(${TARGET_NAME}_extension
++                           PRIVATE include src/include ${MYSQL_INCLUDE_DIR})
++target_link_libraries(${TARGET_NAME}_extension ${MYSQL_LIBRARIES})
+PATCH_EOF
+
 cat > .github/patches/extensions/delta/rustls.patch << 'PATCH_EOF'
 diff --git a/CMakeLists.txt b/CMakeLists.txt
 index ff33ba9..f2e3361 100644
@@ -2504,6 +2537,9 @@ if [ "$SKIP_VCPKG" = false ]; then
     log_info "Installing Roaring..."
     ./vcpkg install roaring
     
+    log_info "Installing libmariadb (for mysql_scanner)..."
+    ./vcpkg install libmariadb
+
     if [ "$WITH_SPATIAL" = true ]; then
         log_info "Installing spatial dependencies (GDAL/PROJ/GEOS/SQLite)..."
         ./vcpkg install gdal[geos] proj geos expat sqlite3[rtree] curl openssl zlib
@@ -2893,8 +2929,8 @@ if [ "$ROBUST_BISECT_MINIMAL_EXTENSIONS" = true ]; then
     BUILD_EXTENSIONS="autocomplete;icu;tpcds;tpch;json;parquet"
     EXPECTED_EXTENSIONS=6
 else
-    BUILD_EXTENSIONS="autocomplete;icu;tpcds;tpch;fts;json;parquet;sqlite_scanner;postgres_scanner;httpfs;excel;vss;inet;avro;aws;azure;iceberg;ducklake;delta;unity_catalog"
-    EXPECTED_EXTENSIONS=23
+    BUILD_EXTENSIONS="autocomplete;icu;tpcds;tpch;fts;json;parquet;sqlite_scanner;postgres_scanner;mysql_scanner;httpfs;excel;vss;inet;avro;aws;azure;iceberg;ducklake;delta;unity_catalog"
+    EXPECTED_EXTENSIONS=24
 fi
 if [ "$WITH_SPATIAL" = true ]; then
     BUILD_EXTENSIONS="${BUILD_EXTENSIONS};spatial"
