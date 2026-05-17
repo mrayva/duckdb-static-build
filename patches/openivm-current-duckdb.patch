@@ -1,0 +1,1986 @@
+diff --git a/src/core/ivm_checker.cpp b/src/core/ivm_checker.cpp
+index 76be8c6..a5b321e 100644
+--- a/src/core/ivm_checker.cpp
++++ b/src/core/ivm_checker.cpp
+@@ -32,10 +32,10 @@ static const unordered_set<string> &GetSupportedAggregates() {
+ /// SQL emission simple — function/CASE/cast expressions over base columns would need a
+ /// projection alias).
+ static string OrderByColumnName(const Expression &expr) {
+-	if (expr.type == ExpressionType::BOUND_COLUMN_REF) {
++	if (expr.GetExpressionType() == ExpressionType::BOUND_COLUMN_REF) {
+ 		auto &bcr = expr.Cast<BoundColumnRefExpression>();
+-		if (!bcr.alias.empty()) {
+-			return bcr.alias;
++		if (!bcr.HasAlias()) {
++			return bcr.GetAlias();
+ 		}
+ 		return bcr.GetName();
+ 	}
+@@ -63,7 +63,7 @@ static bool HasVolatileExpression(vector<unique_ptr<Expression>> &expressions) {
+ 	for (auto &expr : expressions) {
+ 		bool found_volatile = false;
+ 		ExpressionIterator::EnumerateExpression(expr, [&](Expression &child) {
+-			if (child.expression_class == ExpressionClass::BOUND_FUNCTION) {
++			if (child.GetExpressionClass() == ExpressionClass::BOUND_FUNCTION) {
+ 				auto &func = child.Cast<BoundFunctionExpression>();
+ 				if (func.function.name.rfind("__internal_compress", 0) == 0 ||
+ 				    func.function.name.rfind("__internal_decompress", 0) == 0 || func.function.name == "error") {
+@@ -85,7 +85,7 @@ static bool HasUnnestExpression(vector<unique_ptr<Expression>> &expressions) {
+ 	for (auto &expr : expressions) {
+ 		bool found_unnest = false;
+ 		ExpressionIterator::EnumerateExpression(expr, [&](Expression &child) {
+-			if (child.expression_class == ExpressionClass::BOUND_UNNEST) {
++			if (child.GetExpressionClass() == ExpressionClass::BOUND_UNNEST) {
+ 				found_unnest = true;
+ 			}
+ 		});
+@@ -222,7 +222,7 @@ static void AnalyzeNode(LogicalOperator *node, PlanAnalysis &result) {
+ 				result.found_grouping_sets = true;
+ 			}
+ 			for (auto &expr : agg->expressions) {
+-				if (expr->expression_class == ExpressionClass::BOUND_AGGREGATE) {
++				if (expr->GetExpressionClass() == ExpressionClass::BOUND_AGGREGATE) {
+ 					auto &bound_agg = expr->Cast<BoundAggregateExpression>();
+ 					const auto &supported = GetSupportedAggregates();
+ 					const bool scalar_subquery_first =
+@@ -277,7 +277,7 @@ static void AnalyzeNode(LogicalOperator *node, PlanAnalysis &result) {
+ 			// with an inner aggregate's binding causes find_group_cols to miss the top projection.
+ 			if (result.group_index == DConstants::INVALID_INDEX) {
+ 				result.group_count = agg->groups.size();
+-				result.group_index = agg->group_index;
++				result.group_index = agg->group_index.index;
+ 			} else {
+ 				// A second aggregate node below the outermost one → nested aggregate pattern.
+ 				// COUNT(*)/COUNT(x) in the outer aggregate counts inner-group rows, not source rows,
+@@ -295,15 +295,15 @@ static void AnalyzeNode(LogicalOperator *node, PlanAnalysis &result) {
+ 		// Different window functions may use different PARTITION BY clauses —
+ 		// collect the union of all partition columns so any change triggers recompute.
+ 		for (auto &expr : window.expressions) {
+-			if (expr->expression_class == ExpressionClass::BOUND_WINDOW) {
++			if (expr->GetExpressionClass() == ExpressionClass::BOUND_WINDOW) {
+ 				auto &win_expr = expr->Cast<BoundWindowExpression>();
+ 				for (auto &part : win_expr.partitions) {
+ 					string col_name;
+ 					idx_t col_index = DConstants::INVALID_INDEX;
+-					if (part->type == ExpressionType::BOUND_COLUMN_REF) {
++					if (part->GetExpressionType() == ExpressionType::BOUND_COLUMN_REF) {
+ 						auto &bcr = part->Cast<BoundColumnRefExpression>();
+-						col_name = bcr.alias;
+-						col_index = bcr.binding.column_index;
++						col_name = bcr.GetAlias();
++						col_index = bcr.binding.column_index.index;
+ 					}
+ 					if (col_name.empty()) {
+ 						col_name = part->GetName();
+diff --git a/src/core/ivm_plan_rewrite.cpp b/src/core/ivm_plan_rewrite.cpp
+index 433a5ec..ae543ac 100644
+--- a/src/core/ivm_plan_rewrite.cpp
++++ b/src/core/ivm_plan_rewrite.cpp
+@@ -10,6 +10,7 @@
+ #include "duckdb/planner/expression/bound_case_expression.hpp"
+ #include "duckdb/planner/expression/bound_cast_expression.hpp"
+ #include "duckdb/planner/expression/bound_constant_expression.hpp"
++#include "duckdb/planner/expression/bound_function_expression.hpp"
+ #include "duckdb/planner/expression/bound_operator_expression.hpp"
+ #include "duckdb/planner/expression_iterator.hpp"
+ #include "duckdb/optimizer/optimizer.hpp"
+@@ -67,22 +68,22 @@ static void RewriteDistinct(ClientContext &context, Binder &binder, unique_ptr<L
+ 	// COUNT(*) aggregate
+ 	auto count_star = CountStarFun::GetFunction();
+ 	vector<unique_ptr<Expression>> count_args;
+-	auto count_expr = make_uniq<BoundAggregateExpression>(std::move(count_star), std::move(count_args), nullptr,
++	auto count_expr = make_uniq<BoundAggregateExpression>(count_star, std::move(count_args), nullptr,
+ 	                                                      nullptr, AggregateType::NON_DISTINCT);
+-	count_expr->alias = ivm::DISTINCT_COUNT_COL;
++	count_expr->SetAlias(ivm::DISTINCT_COUNT_COL);
+ 
+ 	vector<unique_ptr<Expression>> aggregates;
+ 	aggregates.push_back(std::move(count_expr));
+ 
+-	idx_t group_index = binder.GenerateTableIndex();
+-	idx_t aggregate_index = binder.GenerateTableIndex();
++	TableIndex group_index = binder.GenerateTableIndex();
++	TableIndex aggregate_index = binder.GenerateTableIndex();
+ 
+ 	auto agg_node = make_uniq<LogicalAggregate>(group_index, aggregate_index, std::move(aggregates));
+ 
+ 	GroupingSet grouping_set;
+ 	for (idx_t i = 0; i < child_bindings.size(); i++) {
+ 		auto group_expr = make_uniq<BoundColumnRefExpression>(child_types[i], child_bindings[i]);
+-		grouping_set.insert(agg_node->groups.size());
++		grouping_set.insert(ProjectionIndex(agg_node->groups.size()));
+ 		agg_node->groups.push_back(std::move(group_expr));
+ 		agg_node->group_stats.push_back(make_uniq<BaseStatistics>(BaseStatistics::CreateUnknown(child_types[i])));
+ 	}
+@@ -159,7 +160,7 @@ static void InlineCteRefs(ClientContext &context, Binder &binder, unique_ptr<Log
+ 		return;
+ 	}
+ 	auto &cte = plan->Cast<LogicalMaterializedCTE>();
+-	idx_t cte_index = cte.table_index;
++	TableIndex cte_index = cte.table_index;
+ 	// Definition is now fully inlined (recursion above ran on cte.children[0] too).
+ 	// Walk the consumer (cte.children[1]) and replace every CTE_REF with this
+ 	// cte_index with a fresh deep-copied + renumbered + passthrough-projected copy
+@@ -187,7 +188,7 @@ static void InlineCteRefs(ClientContext &context, Binder &binder, unique_ptr<Log
+ 			for (idx_t i = 0; i < cols; i++) {
+ 				auto col_ref = make_uniq<BoundColumnRefExpression>(subtree_types[i], subtree_bindings[i]);
+ 				if (i < ref.bound_columns.size() && !ref.bound_columns[i].empty()) {
+-					col_ref->alias = ref.bound_columns[i];
++					col_ref->SetAlias(ref.bound_columns[i]);
+ 				}
+ 				proj_exprs.push_back(std::move(col_ref));
+ 			}
+@@ -195,7 +196,7 @@ static void InlineCteRefs(ClientContext &context, Binder &binder, unique_ptr<Log
+ 			wrapper->children.push_back(std::move(renumbered.op));
+ 			wrapper->ResolveOperatorTypes();
+ 			OPENIVM_DEBUG_PRINT("[IVMPlanRewrite] Inlined CTE_REF cte_index=%lu (table_index=%lu, %zu cols)\n",
+-			                    (unsigned long)ref.cte_index, (unsigned long)ref.table_index, (size_t)cols);
++			                    (unsigned long)ref.cte_index.index, (unsigned long)ref.table_index.index, (size_t)cols);
+ 			node = std::move(wrapper);
+ 			return;
+ 		}
+@@ -227,7 +228,7 @@ void RewriteAggregateFilters(ClientContext &context, unique_ptr<LogicalOperator>
+ 	auto &agg = plan->Cast<LogicalAggregate>();
+ 	bool any_filter = false;
+ 	for (auto &expr : agg.expressions) {
+-		if (expr->expression_class == ExpressionClass::BOUND_AGGREGATE &&
++		if (expr->GetExpressionClass() == ExpressionClass::BOUND_AGGREGATE &&
+ 		    expr->Cast<BoundAggregateExpression>().filter) {
+ 			any_filter = true;
+ 			break;
+@@ -238,7 +239,7 @@ void RewriteAggregateFilters(ClientContext &context, unique_ptr<LogicalOperator>
+ 	}
+ 	bool rewritten = false;
+ 	for (auto &expr : agg.expressions) {
+-		if (expr->expression_class != ExpressionClass::BOUND_AGGREGATE) {
++		if (expr->GetExpressionClass() != ExpressionClass::BOUND_AGGREGATE) {
+ 			continue;
+ 		}
+ 		auto &bound = expr->Cast<BoundAggregateExpression>();
+@@ -251,17 +252,17 @@ void RewriteAggregateFilters(ClientContext &context, unique_ptr<LogicalOperator>
+ 		auto filter_expr = std::move(bound.filter); // nulls bound.filter
+ 		if (bound.children.empty()) {
+ 			// COUNT(*) FILTER (WHERE p) → COUNT(CASE WHEN p THEN 1 END)
+-			string saved_alias = std::move(bound.alias);
++			string saved_alias = std::move(bound.GetAlias());
+ 			auto then_expr = make_uniq<BoundConstantExpression>(Value::BIGINT(1));
+ 			auto else_expr = make_uniq<BoundConstantExpression>(Value(LogicalType::BIGINT));
+ 			auto case_expr =
+ 			    make_uniq<BoundCaseExpression>(std::move(filter_expr), std::move(then_expr), std::move(else_expr));
+-			auto count_func = BindAggregateByName(context, "count", {LogicalType::BIGINT});
++			auto count_func = BindAggregateByName(context, "count", vector<LogicalType>{LogicalType::BIGINT});
+ 			vector<unique_ptr<Expression>> count_args;
+ 			count_args.push_back(std::move(case_expr));
+-			auto new_expr = make_uniq<BoundAggregateExpression>(std::move(count_func), std::move(count_args), nullptr,
++			auto new_expr = make_uniq<BoundAggregateExpression>(count_func, std::move(count_args), nullptr,
+ 			                                                    nullptr, AggregateType::NON_DISTINCT);
+-			new_expr->alias = std::move(saved_alias);
++			new_expr->SetAlias(std::move(saved_alias));
+ 			expr = std::move(new_expr);
+ 			rewritten = true;
+ 		} else {
+@@ -334,7 +335,7 @@ static void RewriteDerivedAggregates(ClientContext &context, unique_ptr<LogicalO
+ 	// Check if there's anything to decompose
+ 	bool has_derived = false;
+ 	for (auto &expr : agg.expressions) {
+-		if (expr->expression_class == ExpressionClass::BOUND_AGGREGATE) {
++		if (expr->GetExpressionClass() == ExpressionClass::BOUND_AGGREGATE) {
+ 			auto &name = expr->Cast<BoundAggregateExpression>().function.name;
+ 			if (name == "avg" || IsStddevOrVariance(name)) {
+ 				has_derived = true;
+@@ -371,7 +372,7 @@ static void RewriteDerivedAggregates(ClientContext &context, unique_ptr<LogicalO
+ 
+ 	for (idx_t i = 0; i < agg.expressions.size(); i++) {
+ 		auto &expr = agg.expressions[i];
+-		if (expr->expression_class != ExpressionClass::BOUND_AGGREGATE) {
++		if (expr->GetExpressionClass() != ExpressionClass::BOUND_AGGREGATE) {
+ 			nondecomposed_remap[i] = new_exprs.size();
+ 			new_exprs.push_back(std::move(expr));
+ 			continue;
+@@ -391,7 +392,7 @@ static void RewriteDerivedAggregates(ClientContext &context, unique_ptr<LogicalO
+ 			continue;
+ 		}
+ 
+-		string alias = bound.alias.empty() ? (bound.function.name + "_" + bound.children[0]->GetName()) : bound.alias;
++		string alias = !bound.HasAlias() ? (bound.function.name + "_" + bound.children[0]->GetName()) : bound.GetAlias();
+ 		// Sanitize alias for use as a SQL identifier. DuckDB auto-sets alias to the expression
+ 		// string (e.g. "avg(C_BALANCE)") for unaliased aggregates. Parens and other non-identifier
+ 		// characters break column names like _ivm_sum_avg(C_BALANCE) in SELECT * EXCLUDE (...).
+@@ -425,35 +426,35 @@ static void RewriteDerivedAggregates(ClientContext &context, unique_ptr<LogicalO
+ 		d.old_idx = i;
+ 
+ 		// SUM(x) — both AVG and STDDEV need this
+-		auto sum_func = BindAggregateByName(context, "sum", {arg_type});
++		auto sum_func = BindAggregateByName(context, "sum", vector<LogicalType>{arg_type});
+ 		vector<unique_ptr<Expression>> sum_args;
+ 		sum_args.push_back(bound.children[0]->Copy());
+-		auto sum_expr = make_uniq<BoundAggregateExpression>(std::move(sum_func), std::move(sum_args), nullptr, nullptr,
++		auto sum_expr = make_uniq<BoundAggregateExpression>(sum_func, std::move(sum_args), nullptr, nullptr,
+ 		                                                    AggregateType::NON_DISTINCT);
+-		sum_expr->alias = string(ivm::SUM_COL_PREFIX) + alias;
++		sum_expr->SetAlias(string(ivm::SUM_COL_PREFIX) + alias);
+ 		d.sum_idx = new_exprs.size();
+ 		new_exprs.push_back(std::move(sum_expr));
+ 
+ 		// SUM(x * x) — STDDEV/VARIANCE only
+ 		if (is_stddev) {
+ 			auto sq_arg = opt.BindScalarFunction("*", bound.children[0]->Copy(), bound.children[0]->Copy());
+-			auto sum_sq_func = BindAggregateByName(context, "sum", {sq_arg->return_type});
++			auto sum_sq_func = BindAggregateByName(context, "sum", vector<LogicalType>{sq_arg->return_type});
+ 			vector<unique_ptr<Expression>> sum_sq_args;
+ 			sum_sq_args.push_back(std::move(sq_arg));
+-			auto sum_sq_expr = make_uniq<BoundAggregateExpression>(std::move(sum_sq_func), std::move(sum_sq_args),
++			auto sum_sq_expr = make_uniq<BoundAggregateExpression>(sum_sq_func, std::move(sum_sq_args),
+ 			                                                       nullptr, nullptr, AggregateType::NON_DISTINCT);
+-			sum_sq_expr->alias = string(SumSqPrefix(bound.function.name)) + alias;
++			sum_sq_expr->SetAlias(string(SumSqPrefix(bound.function.name)) + alias);
+ 			d.sum_sq_idx = new_exprs.size();
+ 			new_exprs.push_back(std::move(sum_sq_expr));
+ 		}
+ 
+ 		// COUNT(x) — both AVG and STDDEV need this
+-		auto count_func = BindAggregateByName(context, "count", {arg_type});
++		auto count_func = BindAggregateByName(context, "count", vector<LogicalType>{arg_type});
+ 		vector<unique_ptr<Expression>> count_args;
+ 		count_args.push_back(bound.children[0]->Copy());
+-		auto count_expr = make_uniq<BoundAggregateExpression>(std::move(count_func), std::move(count_args), nullptr,
++		auto count_expr = make_uniq<BoundAggregateExpression>(count_func, std::move(count_args), nullptr,
+ 		                                                      nullptr, AggregateType::NON_DISTINCT);
+-		count_expr->alias = string(ivm::COUNT_COL_PREFIX) + alias;
++		count_expr->SetAlias(string(ivm::COUNT_COL_PREFIX) + alias);
+ 		d.count_idx = new_exprs.size();
+ 		new_exprs.push_back(std::move(count_expr));
+ 
+@@ -503,8 +504,7 @@ static void RewriteDerivedAggregates(ClientContext &context, unique_ptr<LogicalO
+ 		int64_t threshold = IsPopulationVariant(d.func_name) ? 0 : 1;
+ 		auto count_check = make_uniq<BoundColumnRefExpression>(count_type, count_binding);
+ 		auto when_expr =
+-		    make_uniq<BoundComparisonExpression>(ExpressionType::COMPARE_GREATERTHAN, std::move(count_check),
+-		                                         make_uniq<BoundConstantExpression>(Value::BIGINT(threshold)));
++		    make_uniq<BoundComparisonExpression>(ExpressionType::COMPARE_GREATERTHAN, std::move(count_check), make_uniq<BoundConstantExpression>(Value::BIGINT(threshold)));
+ 		auto else_expr = make_uniq<BoundConstantExpression>(Value(formula->return_type));
+ 		return make_uniq<BoundCaseExpression>(std::move(when_expr), std::move(formula), std::move(else_expr));
+ 	};
+@@ -514,15 +514,15 @@ static void RewriteDerivedAggregates(ClientContext &context, unique_ptr<LogicalO
+ 	// "avg_bal". We capture that alias and re-attach it to the formula after
+ 	// substitution so the MV column keeps the user's name.
+ 	for (auto &d : decomps) {
+-		ColumnBinding old_binding(agg.aggregate_index, d.old_idx);
++		ColumnBinding old_binding(agg.aggregate_index, ProjectionIndex(d.old_idx));
+ 		d.user_alias = d.alias; // fallback if no direct ref
+ 		for (idx_t pi = 0; pi < original_proj_size; pi++) {
+-			if (proj.expressions[pi]->type != ExpressionType::BOUND_COLUMN_REF) {
++			if (proj.expressions[pi]->GetExpressionType() != ExpressionType::BOUND_COLUMN_REF) {
+ 				continue;
+ 			}
+ 			auto &ref = proj.expressions[pi]->Cast<BoundColumnRefExpression>();
+ 			if (ref.binding == old_binding) {
+-				d.user_alias = ref.alias.empty() ? d.alias : ref.alias;
++				d.user_alias = !ref.HasAlias() ? d.alias : ref.GetAlias();
+ 				break;
+ 			}
+ 		}
+@@ -545,7 +545,7 @@ static void RewriteDerivedAggregates(ClientContext &context, unique_ptr<LogicalO
+ 	// at each BCR site guarantees each BCR is visited exactly once.
+ 	std::map<uint64_t, const Decomp *> old_binding_to_decomp;
+ 	for (auto &d : decomps) {
+-		uint64_t key = (uint64_t)agg.aggregate_index ^ ((uint64_t)d.old_idx * 0x9e3779b97f4a7c15ULL);
++		uint64_t key = (uint64_t)agg.aggregate_index.index ^ ((uint64_t)d.old_idx * 0x9e3779b97f4a7c15ULL);
+ 		old_binding_to_decomp[key] = &d;
+ 	}
+ 	// Combined single-pass walk: for each BCR in the ORIGINAL projection tree,
+@@ -560,21 +560,21 @@ static void RewriteDerivedAggregates(ClientContext &context, unique_ptr<LogicalO
+ 	// old idx 4) — we never visit the same BCR twice, and BCRs we insert are
+ 	// skipped by the return.
+ 	std::function<void(unique_ptr<Expression> &)> walk = [&](unique_ptr<Expression> &expr) {
+-		if (expr->type == ExpressionType::BOUND_COLUMN_REF) {
++		if (expr->GetExpressionType() == ExpressionType::BOUND_COLUMN_REF) {
+ 			auto &bcr = expr->Cast<BoundColumnRefExpression>();
+ 			if (bcr.binding.table_index == agg.aggregate_index) {
+ 				uint64_t key =
+-				    (uint64_t)bcr.binding.table_index ^ ((uint64_t)bcr.binding.column_index * 0x9e3779b97f4a7c15ULL);
++				    (uint64_t)bcr.binding.table_index.index ^ ((uint64_t)bcr.binding.column_index.index * 0x9e3779b97f4a7c15ULL);
+ 				auto dit = old_binding_to_decomp.find(key);
+ 				if (dit != old_binding_to_decomp.end()) {
+ 					auto replacement = build_replacement(*dit->second);
+-					replacement->alias = bcr.alias;
++					replacement->SetAlias(bcr.GetAlias());
+ 					expr = std::move(replacement);
+ 					return; // do NOT descend into the replacement
+ 				}
+-				auto rit = nondecomposed_remap.find(bcr.binding.column_index);
+-				if (rit != nondecomposed_remap.end() && rit->second != bcr.binding.column_index) {
+-					bcr.binding.column_index = rit->second;
++				auto rit = nondecomposed_remap.find(bcr.binding.column_index.index);
++				if (rit != nondecomposed_remap.end() && rit->second != bcr.binding.column_index.index) {
++					bcr.binding.column_index = ProjectionIndex(rit->second);
+ 				}
+ 			}
+ 		}
+@@ -614,19 +614,19 @@ static void RewriteDerivedAggregates(ClientContext &context, unique_ptr<LogicalO
+ 			}
+ 		}
+ 		auto sum_pt = make_uniq<BoundColumnRefExpression>(sum_type, sum_binding);
+-		sum_pt->alias = string(ivm::SUM_COL_PREFIX) + col_suffix;
++		sum_pt->SetAlias(string(ivm::SUM_COL_PREFIX) + col_suffix);
+ 		proj.expressions.push_back(std::move(sum_pt));
+ 
+ 		if (d.kind == DecompKind::STDDEV) {
+ 			ColumnBinding sum_sq_binding = agg_bindings[group_count + d.sum_sq_idx];
+ 			LogicalType sum_sq_type = agg_types[group_count + d.sum_sq_idx];
+ 			auto sum_sq_pt = make_uniq<BoundColumnRefExpression>(sum_sq_type, sum_sq_binding);
+-			sum_sq_pt->alias = string(SumSqPrefix(d.func_name)) + col_suffix;
++			sum_sq_pt->SetAlias(string(SumSqPrefix(d.func_name)) + col_suffix);
+ 			proj.expressions.push_back(std::move(sum_sq_pt));
+ 		}
+ 
+ 		auto count_pt = make_uniq<BoundColumnRefExpression>(count_type, count_binding);
+-		count_pt->alias = string(ivm::COUNT_COL_PREFIX) + col_suffix;
++		count_pt->SetAlias(string(ivm::COUNT_COL_PREFIX) + col_suffix);
+ 		proj.expressions.push_back(std::move(count_pt));
+ 	}
+ 	proj.ResolveOperatorTypes();
+@@ -671,7 +671,7 @@ static void InjectGroupCountStar(unique_ptr<LogicalOperator> &plan) {
+ 	//     pass (e.g. DISTINCT rewrite).
+ 	bool has_argminmax = false;
+ 	for (auto &expr : agg.expressions) {
+-		if (expr->expression_class != ExpressionClass::BOUND_AGGREGATE) {
++		if (expr->GetExpressionClass() != ExpressionClass::BOUND_AGGREGATE) {
+ 			continue;
+ 		}
+ 		auto &bound = expr->Cast<BoundAggregateExpression>();
+@@ -680,7 +680,7 @@ static void InjectGroupCountStar(unique_ptr<LogicalOperator> &plan) {
+ 			return;
+ 		}
+ 		// Already-injected reliable hidden count.
+-		if (bound.alias == ivm::COUNT_STAR_COL || bound.alias == ivm::DISTINCT_COUNT_COL) {
++		if (bound.GetAlias() == ivm::COUNT_STAR_COL || bound.GetAlias() == ivm::DISTINCT_COUNT_COL) {
+ 			return;
+ 		}
+ 		if (bound.function.name == "arg_min" || bound.function.name == "arg_max") {
+@@ -696,17 +696,17 @@ static void InjectGroupCountStar(unique_ptr<LogicalOperator> &plan) {
+ 	}
+ 	auto count_star_func = CountStarFun::GetFunction();
+ 	vector<unique_ptr<Expression>> count_args;
+-	auto count_expr = make_uniq<BoundAggregateExpression>(std::move(count_star_func), std::move(count_args), nullptr,
++	auto count_expr = make_uniq<BoundAggregateExpression>(count_star_func, std::move(count_args), nullptr,
+ 	                                                      nullptr, AggregateType::NON_DISTINCT);
+-	count_expr->alias = ivm::COUNT_STAR_COL;
++	count_expr->SetAlias(ivm::COUNT_STAR_COL);
+ 	auto count_type = count_expr->return_type;
+ 	idx_t new_agg_idx = agg.expressions.size();
+ 	agg.expressions.push_back(std::move(count_expr));
+ 	agg.ResolveOperatorTypes();
+ 
+-	ColumnBinding count_binding(agg.aggregate_index, new_agg_idx);
++	ColumnBinding count_binding(agg.aggregate_index, ProjectionIndex(new_agg_idx));
+ 	auto count_pt = make_uniq<BoundColumnRefExpression>(count_type, count_binding);
+-	count_pt->alias = ivm::COUNT_STAR_COL;
++	count_pt->SetAlias(ivm::COUNT_STAR_COL);
+ 	auto &proj = plan->Cast<LogicalProjection>();
+ 	proj.expressions.push_back(std::move(count_pt));
+ 	proj.ResolveOperatorTypes();
+@@ -748,8 +748,8 @@ static void PropagateHiddenAggregateColumns(unique_ptr<LogicalOperator> &plan) {
+ 
+ 	std::set<string> already_present;
+ 	for (auto &expr : proj.expressions) {
+-		if (IsHiddenAggregateAlias(expr->alias)) {
+-			already_present.insert(expr->alias);
++		if (IsHiddenAggregateAlias(expr->GetAlias())) {
++			already_present.insert(expr->GetAlias());
+ 		}
+ 	}
+ 
+@@ -759,7 +759,7 @@ static void PropagateHiddenAggregateColumns(unique_ptr<LogicalOperator> &plan) {
+ 
+ 	bool added = false;
+ 	for (idx_t i = 0; i < child_proj.expressions.size(); i++) {
+-		const string &child_alias = child_proj.expressions[i]->alias;
++		const string &child_alias = child_proj.expressions[i]->GetAlias();
+ 		if (!IsHiddenAggregateAlias(child_alias) || already_present.count(child_alias)) {
+ 			continue;
+ 		}
+@@ -767,11 +767,11 @@ static void PropagateHiddenAggregateColumns(unique_ptr<LogicalOperator> &plan) {
+ 			continue;
+ 		}
+ 		auto bcr = make_uniq<BoundColumnRefExpression>(child_types[i], child_bindings[i]);
+-		bcr->alias = child_alias;
++		bcr->SetAlias(child_alias);
+ 		proj.expressions.push_back(std::move(bcr));
+ 		added = true;
+ 		OPENIVM_DEBUG_PRINT("[PropagateHidden] Added '%s' to parent projection (table_index=%llu)\n",
+-		                    child_alias.c_str(), (unsigned long long)proj.table_index);
++		                    child_alias.c_str(), (unsigned long long)proj.table_index.index);
+ 	}
+ 	if (added) {
+ 		proj.ResolveOperatorTypes();
+@@ -796,7 +796,7 @@ static bool IsOuterJoin(JoinType join_type) {
+ }
+ 
+ static void ReadColumnRefBinding(const unique_ptr<Expression> &expr, ColumnBinding &binding, LogicalType &type) {
+-	if (expr->expression_class != ExpressionClass::BOUND_COLUMN_REF) {
++	if (expr->GetExpressionClass() != ExpressionClass::BOUND_COLUMN_REF) {
+ 		return;
+ 	}
+ 	auto &ref = expr->Cast<BoundColumnRefExpression>();
+@@ -815,13 +815,13 @@ static OuterJoinBindings FindFirstOuterJoinBindings(LogicalOperator *plan) {
+ 				bindings.found = true;
+ 				bindings.is_full_outer = join.join_type == JoinType::OUTER;
+ 
+-				auto &preserved_key = join.join_type == JoinType::RIGHT ? condition.right : condition.left;
++				auto &preserved_key = join.join_type == JoinType::RIGHT ? condition.RightReference() : condition.LeftReference();
+ 				ReadColumnRefBinding(preserved_key, bindings.preserved_key_binding, bindings.preserved_key_type);
+-				ReadColumnRefBinding(condition.right, bindings.right_key_binding, bindings.right_key_type);
++				ReadColumnRefBinding(condition.RightReference(), bindings.right_key_binding, bindings.right_key_type);
+ 
+-				auto &null_side = join.join_type == JoinType::RIGHT ? condition.left : condition.right;
++				auto &null_side = join.join_type == JoinType::RIGHT ? condition.LeftReference() : condition.RightReference();
+ 				ReadColumnRefBinding(null_side, bindings.null_side_binding, bindings.null_side_type);
+-				ReadColumnRefBinding(condition.left, bindings.left_side_binding, bindings.left_side_type);
++				ReadColumnRefBinding(condition.LeftReference(), bindings.left_side_binding, bindings.left_side_type);
+ 				return true;
+ 			}
+ 		}
+@@ -916,10 +916,10 @@ static void RewriteLeftJoinKey(Binder &binder, unique_ptr<LogicalOperator> &plan
+ 				// Check if already passed through
+ 				bool found = false;
+ 				for (idx_t i = 0; i < proj.expressions.size(); i++) {
+-					if (proj.expressions[i]->type == ExpressionType::BOUND_COLUMN_REF) {
++					if (proj.expressions[i]->GetExpressionType() == ExpressionType::BOUND_COLUMN_REF) {
+ 						auto &ref = proj.expressions[i]->Cast<BoundColumnRefExpression>();
+ 						if (ref.binding == current) {
+-							current = ColumnBinding(proj.table_index, i);
++							current = ColumnBinding(proj.table_index, ProjectionIndex(i));
+ 							found = true;
+ 							break;
+ 						}
+@@ -928,7 +928,7 @@ static void RewriteLeftJoinKey(Binder &binder, unique_ptr<LogicalOperator> &plan
+ 				if (!found) {
+ 					auto col_ref = make_uniq<BoundColumnRefExpression>(key_type, current);
+ 					proj.expressions.push_back(std::move(col_ref));
+-					current = ColumnBinding(proj.table_index, proj.expressions.size() - 1);
++					current = ColumnBinding(proj.table_index, ProjectionIndex(proj.expressions.size() - 1));
+ 				}
+ 				proj.ResolveOperatorTypes();
+ 			} else if (entry.op->type == LogicalOperatorType::LOGICAL_FILTER) {
+@@ -941,9 +941,9 @@ static void RewriteLeftJoinKey(Binder &binder, unique_ptr<LogicalOperator> &plan
+ 							break;
+ 						}
+ 					}
+-					if (!in_map) {
+-						filter.projection_map.push_back(current.column_index);
+-					}
++						if (!in_map) {
++							filter.projection_map.push_back(current.column_index);
++						}
+ 				}
+ 				filter.ResolveOperatorTypes();
+ 			}
+@@ -980,10 +980,10 @@ static void RewriteLeftJoinKey(Binder &binder, unique_ptr<LogicalOperator> &plan
+ 				auto &proj = plan->Cast<LogicalProjection>();
+ 				bool already_in = false;
+ 				for (idx_t i = 0; i < proj.expressions.size(); i++) {
+-					if (proj.expressions[i]->type == ExpressionType::BOUND_COLUMN_REF) {
++					if (proj.expressions[i]->GetExpressionType() == ExpressionType::BOUND_COLUMN_REF) {
+ 						auto &ref = proj.expressions[i]->Cast<BoundColumnRefExpression>();
+ 						if (ref.binding == right_key_binding) {
+-							right_key_binding = ColumnBinding(proj.table_index, i);
++							right_key_binding = ColumnBinding(proj.table_index, ProjectionIndex(i));
+ 							already_in = true;
+ 							break;
+ 						}
+@@ -998,7 +998,7 @@ static void RewriteLeftJoinKey(Binder &binder, unique_ptr<LogicalOperator> &plan
+ 							// Key is in child output — add a passthrough ref
+ 							auto ref = make_uniq<BoundColumnRefExpression>(right_key_type, right_key_binding);
+ 							proj.expressions.push_back(std::move(ref));
+-							right_key_binding = ColumnBinding(proj.table_index, proj.expressions.size() - 1);
++							right_key_binding = ColumnBinding(proj.table_index, ProjectionIndex(proj.expressions.size() - 1));
+ 							break;
+ 						}
+ 					}
+@@ -1010,7 +1010,7 @@ static void RewriteLeftJoinKey(Binder &binder, unique_ptr<LogicalOperator> &plan
+ 	}
+ 
+ 	// Use a table index that won't conflict (high number)
+-	idx_t proj_table_index = binder.GenerateTableIndex();
++	TableIndex proj_table_index = binder.GenerateTableIndex();
+ 	auto projection = make_uniq<LogicalProjection>(proj_table_index, std::move(proj_exprs));
+ 	projection->children.push_back(std::move(plan));
+ 	projection->ResolveOperatorTypes();
+@@ -1048,24 +1048,24 @@ static void RewriteLeftJoinMatchCount(ClientContext &context, Binder &binder, un
+ 	auto &agg = agg_search->Cast<LogicalAggregate>();
+ 
+ 	// Add COUNT(null_side_key) as _ivm_match_count (tracks right-side matches for LEFT/OUTER).
+-	auto count_func = BindAggregateByName(context, "count", {null_side_type});
++	auto count_func = BindAggregateByName(context, "count", vector<LogicalType>{null_side_type});
+ 	vector<unique_ptr<Expression>> count_args;
+ 	count_args.push_back(make_uniq<BoundColumnRefExpression>(null_side_type, null_side_binding));
+-	auto count_expr = make_uniq<BoundAggregateExpression>(std::move(count_func), std::move(count_args), nullptr,
++	auto count_expr = make_uniq<BoundAggregateExpression>(count_func, std::move(count_args), nullptr,
+ 	                                                      nullptr, AggregateType::NON_DISTINCT);
+-	count_expr->alias = string(ivm::MATCH_COUNT_COL);
++	count_expr->SetAlias(string(ivm::MATCH_COUNT_COL));
+ 	idx_t match_count_idx = agg.expressions.size();
+ 	agg.expressions.push_back(std::move(count_expr));
+ 
+ 	// For FULL OUTER: add COUNT(left_key) as _ivm_right_match_count (tracks left-side matches).
+ 	idx_t right_match_count_idx = 0;
+ 	if (is_full_outer) {
+-		auto right_count_func = BindAggregateByName(context, "count", {left_side_type});
++		auto right_count_func = BindAggregateByName(context, "count", vector<LogicalType>{left_side_type});
+ 		vector<unique_ptr<Expression>> right_count_args;
+ 		right_count_args.push_back(make_uniq<BoundColumnRefExpression>(left_side_type, left_side_binding));
+ 		auto right_count_expr = make_uniq<BoundAggregateExpression>(
+-		    std::move(right_count_func), std::move(right_count_args), nullptr, nullptr, AggregateType::NON_DISTINCT);
+-		right_count_expr->alias = string(ivm::RIGHT_MATCH_COUNT_COL);
++		    right_count_func, std::move(right_count_args), nullptr, nullptr, AggregateType::NON_DISTINCT);
++		right_count_expr->SetAlias(string(ivm::RIGHT_MATCH_COUNT_COL));
+ 		right_match_count_idx = agg.expressions.size();
+ 		agg.expressions.push_back(std::move(right_count_expr));
+ 	}
+@@ -1081,14 +1081,14 @@ static void RewriteLeftJoinMatchCount(ClientContext &context, Binder &binder, un
+ 	ColumnBinding match_binding = agg_bindings[group_count + match_count_idx];
+ 	LogicalType match_type = agg_types[group_count + match_count_idx];
+ 	auto match_pt = make_uniq<BoundColumnRefExpression>(match_type, match_binding);
+-	match_pt->alias = string(ivm::MATCH_COUNT_COL);
++	match_pt->SetAlias(string(ivm::MATCH_COUNT_COL));
+ 	proj.expressions.push_back(std::move(match_pt));
+ 
+ 	if (is_full_outer) {
+ 		ColumnBinding right_match_binding = agg_bindings[group_count + right_match_count_idx];
+ 		LogicalType right_match_type = agg_types[group_count + right_match_count_idx];
+ 		auto right_match_pt = make_uniq<BoundColumnRefExpression>(right_match_type, right_match_binding);
+-		right_match_pt->alias = string(ivm::RIGHT_MATCH_COUNT_COL);
++		right_match_pt->SetAlias(string(ivm::RIGHT_MATCH_COUNT_COL));
+ 		proj.expressions.push_back(std::move(right_match_pt));
+ 	}
+ 
+@@ -1201,17 +1201,18 @@ void IVMPlanRewrite(ClientContext &context, Binder &binder, unique_ptr<LogicalOp
+ 
+ /// Convert a FILTER condition to SQL using output column aliases.
+ static string HavingExprToSQL(const Expression &expr, const unordered_map<uint64_t, string> &binding_to_alias) {
+-	switch (expr.expression_class) {
++	switch (expr.GetExpressionClass()) {
+ 	case ExpressionClass::BOUND_COLUMN_REF: {
+ 		auto &col = expr.Cast<BoundColumnRefExpression>();
+-		uint64_t key = (uint64_t)col.binding.table_index ^ ((uint64_t)col.binding.column_index * 0x9e3779b97f4a7c15ULL);
++		uint64_t key = (uint64_t)col.binding.table_index.index ^ ((uint64_t)col.binding.column_index.index * 0x9e3779b97f4a7c15ULL);
+ 		auto it = binding_to_alias.find(key);
+ 		return (it != binding_to_alias.end()) ? it->second : col.ToString();
+ 	}
+ 	case ExpressionClass::BOUND_COMPARISON: {
+-		auto &comp = expr.Cast<BoundComparisonExpression>();
+-		return "(" + HavingExprToSQL(*comp.left, binding_to_alias) + " " + ExpressionTypeToOperator(comp.type) + " " +
+-		       HavingExprToSQL(*comp.right, binding_to_alias) + ")";
++		auto &comparison = expr.Cast<BoundComparisonExpression>();
++		return "(" + HavingExprToSQL(*comparison.left, binding_to_alias) + " " +
++		       ExpressionTypeToOperator(expr.GetExpressionType()) + " " +
++		       HavingExprToSQL(*comparison.right, binding_to_alias) + ")";
+ 	}
+ 	case ExpressionClass::BOUND_CONSTANT: {
+ 		return expr.Cast<BoundConstantExpression>().value.ToString();
+@@ -1221,7 +1222,7 @@ static string HavingExprToSQL(const Expression &expr, const unordered_map<uint64
+ 	}
+ 	case ExpressionClass::BOUND_CONJUNCTION: {
+ 		auto &conj = expr.Cast<BoundConjunctionExpression>();
+-		string op = (conj.type == ExpressionType::CONJUNCTION_AND) ? " AND " : " OR ";
++		string op = (conj.GetExpressionType() == ExpressionType::CONJUNCTION_AND) ? " AND " : " OR ";
+ 		string result;
+ 		for (idx_t i = 0; i < conj.children.size(); i++) {
+ 			if (i > 0) {
+@@ -1236,15 +1237,15 @@ static string HavingExprToSQL(const Expression &expr, const unordered_map<uint64
+ 		// aggregate references inside still get rewritten to their output alias.
+ 		auto &op = expr.Cast<BoundOperatorExpression>();
+ 		string suffix;
+-		if (expr.type == ExpressionType::OPERATOR_IS_NULL) {
++		if (expr.GetExpressionType() == ExpressionType::OPERATOR_IS_NULL) {
+ 			suffix = " IS NULL";
+-		} else if (expr.type == ExpressionType::OPERATOR_IS_NOT_NULL) {
++		} else if (expr.GetExpressionType() == ExpressionType::OPERATOR_IS_NOT_NULL) {
+ 			suffix = " IS NOT NULL";
+ 		}
+ 		if (!suffix.empty() && op.children.size() == 1) {
+ 			return "(" + HavingExprToSQL(*op.children[0], binding_to_alias) + ")" + suffix;
+ 		}
+-		if (expr.type == ExpressionType::OPERATOR_NOT && op.children.size() == 1) {
++		if (expr.GetExpressionType() == ExpressionType::OPERATOR_NOT && op.children.size() == 1) {
+ 			return "(NOT (" + HavingExprToSQL(*op.children[0], binding_to_alias) + "))";
+ 		}
+ 		return expr.ToString();
+@@ -1255,10 +1256,10 @@ static string HavingExprToSQL(const Expression &expr, const unordered_map<uint64
+ 		// printed form — but that references base columns the data table doesn't have.
+ 		// Best effort: check if any child is a plain BCR registered in the map.
+ 		auto &agg = expr.Cast<BoundAggregateExpression>();
+-		if (agg.children.size() == 1 && agg.children[0]->expression_class == ExpressionClass::BOUND_COLUMN_REF) {
++		if (agg.children.size() == 1 && agg.children[0]->GetExpressionClass() == ExpressionClass::BOUND_COLUMN_REF) {
+ 			auto &col = agg.children[0]->Cast<BoundColumnRefExpression>();
+ 			uint64_t key =
+-			    (uint64_t)col.binding.table_index ^ ((uint64_t)col.binding.column_index * 0x9e3779b97f4a7c15ULL);
++			    (uint64_t)col.binding.table_index.index ^ ((uint64_t)col.binding.column_index.index * 0x9e3779b97f4a7c15ULL);
+ 			auto it = binding_to_alias.find(key);
+ 			if (it != binding_to_alias.end()) {
+ 				return it->second;
+@@ -1273,9 +1274,9 @@ static string HavingExprToSQL(const Expression &expr, const unordered_map<uint64
+ 
+ /// Collect every BOUND_COLUMN_REF binding referenced by the expression tree.
+ static void CollectFilterBindings(Expression &expr, std::set<pair<idx_t, idx_t>> &out) {
+-	if (expr.expression_class == ExpressionClass::BOUND_COLUMN_REF) {
++	if (expr.GetExpressionClass() == ExpressionClass::BOUND_COLUMN_REF) {
+ 		auto &col = expr.Cast<BoundColumnRefExpression>();
+-		out.insert({col.binding.table_index, col.binding.column_index});
++		out.insert({col.binding.table_index.index, col.binding.column_index.index});
+ 		return;
+ 	}
+ 	ExpressionIterator::EnumerateChildren(expr, [&](Expression &child) { CollectFilterBindings(child, out); });
+@@ -1336,10 +1337,10 @@ string StripHavingFilter(unique_ptr<LogicalOperator> &plan, vector<string> &outp
+ 	if (parent && parent->type == LogicalOperatorType::LOGICAL_PROJECTION) {
+ 		proj_ptr = &parent->Cast<LogicalProjection>();
+ 		for (idx_t i = 0; i < proj_ptr->expressions.size() && i < output_names.size(); i++) {
+-			if (proj_ptr->expressions[i]->expression_class == ExpressionClass::BOUND_COLUMN_REF) {
++			if (proj_ptr->expressions[i]->GetExpressionClass() == ExpressionClass::BOUND_COLUMN_REF) {
+ 				auto &col = proj_ptr->expressions[i]->Cast<BoundColumnRefExpression>();
+ 				uint64_t key =
+-				    (uint64_t)col.binding.table_index ^ ((uint64_t)col.binding.column_index * 0x9e3779b97f4a7c15ULL);
++				    (uint64_t)col.binding.table_index.index ^ ((uint64_t)col.binding.column_index.index * 0x9e3779b97f4a7c15ULL);
+ 				binding_to_alias[key] = output_names[i];
+ 			}
+ 		}
+@@ -1366,7 +1367,7 @@ string StripHavingFilter(unique_ptr<LogicalOperator> &plan, vector<string> &outp
+ 			}
+ 			// Only expose aggregate-output bindings. Group bindings should already be in
+ 			// the projection; a raw column ref here would indicate an unexpected plan.
+-			if (b.first != agg_child.aggregate_index) {
++			if (b.first != agg_child.aggregate_index.index) {
+ 				continue;
+ 			}
+ 			if (b.second >= agg_child.expressions.size()) {
+@@ -1375,8 +1376,8 @@ string StripHavingFilter(unique_ptr<LogicalOperator> &plan, vector<string> &outp
+ 			string hidden_name = "_ivm_having_" + std::to_string(next_hidden++);
+ 			auto col_type = agg_child.expressions[b.second]->return_type;
+ 			auto hidden_expr =
+-			    make_uniq<BoundColumnRefExpression>(hidden_name, col_type, ColumnBinding(b.first, b.second));
+-			hidden_expr->alias = hidden_name;
++			    make_uniq<BoundColumnRefExpression>(hidden_name, col_type, ColumnBinding(TableIndex(b.first), ProjectionIndex(b.second)));
++			hidden_expr->SetAlias(hidden_name);
+ 			proj_ptr->expressions.push_back(std::move(hidden_expr));
+ 			output_names.push_back(hidden_name);
+ 			binding_to_alias[key] = hidden_name;
+diff --git a/src/core/openivm_parser.cpp b/src/core/openivm_parser.cpp
+index 518d698..f9ab840 100644
+--- a/src/core/openivm_parser.cpp
++++ b/src/core/openivm_parser.cpp
+@@ -35,8 +35,10 @@
+ #include "duckdb/optimizer/cte_inlining.hpp"
+ 
+ #include "core/openivm_debug.hpp"
++#define TableIndex DuckLakeTableIndex
+ #include "storage/ducklake_scan.hpp"
+ #include "storage/ducklake_table_entry.hpp"
++#undef TableIndex
+ 
+ #include <chrono>
+ #include <regex>
+@@ -62,14 +64,14 @@ static string BuildTopKSuffix(const vector<BoundOrderByNode> &orders, idx_t limi
+ 		bool resolved = false;
+ 		if (ord.expression->GetExpressionClass() == ExpressionClass::BOUND_COLUMN_REF) {
+ 			auto &col_ref = ord.expression->Cast<BoundColumnRefExpression>();
+-			idx_t cidx = col_ref.binding.column_index;
++			idx_t cidx = col_ref.binding.column_index.index;
+ 			if (cidx < output_col_names.size() && !output_col_names[cidx].empty()) {
+ 				sql += KeywordHelper::WriteOptionallyQuoted(output_col_names[cidx]);
+ 				resolved = true;
+ 			}
+ 		}
+ 		if (!resolved) {
+-			const string &alias = ord.expression->alias;
++			const string &alias = ord.expression->GetAlias();
+ 			if (!alias.empty()) {
+ 				sql += KeywordHelper::WriteOptionallyQuoted(alias);
+ 			} else {
+@@ -248,15 +250,15 @@ static LogicalComparisonJoin *FindFirstComparisonJoin(LogicalOperator *op) {
+ 
+ static void AddJoinKeyColumn(const unique_ptr<Expression> &expr,
+                              unordered_map<idx_t, unordered_set<idx_t>> &join_key_cols) {
+-	if (expr->type != ExpressionType::BOUND_COLUMN_REF) {
++	if (expr->GetExpressionType() != ExpressionType::BOUND_COLUMN_REF) {
+ 		return;
+ 	}
+ 	auto &bcr = expr->Cast<BoundColumnRefExpression>();
+-	join_key_cols[bcr.binding.table_index].insert(bcr.binding.column_index);
++	join_key_cols[bcr.binding.table_index.index].insert(bcr.binding.column_index.index);
+ }
+ 
+ static string BindingKey(const BoundColumnRefExpression &bcr) {
+-	return to_string(bcr.binding.table_index) + ":" + to_string(bcr.binding.column_index);
++	return to_string(bcr.binding.table_index.index) + ":" + to_string(bcr.binding.column_index.index);
+ }
+ 
+ static string FindBindingParent(unordered_map<string, string> &parents, const string &key) {
+@@ -288,12 +290,12 @@ static void CollectJoinEquivalences(LogicalOperator *op, unordered_map<string, s
+ 	if (op->type == LogicalOperatorType::LOGICAL_COMPARISON_JOIN) {
+ 		auto &join = op->Cast<LogicalComparisonJoin>();
+ 		for (auto &cond : join.conditions) {
+-			if (cond.left->type != ExpressionType::BOUND_COLUMN_REF ||
+-			    cond.right->type != ExpressionType::BOUND_COLUMN_REF) {
++			if (cond.LeftReference()->GetExpressionType() != ExpressionType::BOUND_COLUMN_REF ||
++			    cond.RightReference()->GetExpressionType() != ExpressionType::BOUND_COLUMN_REF) {
+ 				continue;
+ 			}
+-			auto &left = cond.left->Cast<BoundColumnRefExpression>();
+-			auto &right = cond.right->Cast<BoundColumnRefExpression>();
++			auto &left = cond.LeftReference()->Cast<BoundColumnRefExpression>();
++			auto &right = cond.RightReference()->Cast<BoundColumnRefExpression>();
+ 			string left_key = BindingKey(left);
+ 			string right_key = BindingKey(right);
+ 			UnionBindings(parents, left_key, right_key);
+@@ -307,10 +309,10 @@ static void CollectJoinEquivalences(LogicalOperator *op, unordered_map<string, s
+ }
+ 
+ static bool IsPurePassThroughExpression(const Expression *expr) {
+-	if (expr->type == ExpressionType::BOUND_COLUMN_REF) {
++	if (expr->GetExpressionType() == ExpressionType::BOUND_COLUMN_REF) {
+ 		return true;
+ 	}
+-	if (expr->expression_class == ExpressionClass::BOUND_CAST) {
++	if (expr->GetExpressionClass() == ExpressionClass::BOUND_CAST) {
+ 		auto &cast = expr->Cast<BoundCastExpression>();
+ 		return IsPurePassThroughExpression(cast.child.get());
+ 	}
+@@ -318,9 +320,9 @@ static bool IsPurePassThroughExpression(const Expression *expr) {
+ }
+ 
+ static bool ExpressionReferencesNonGroupBinding(Expression *expr, idx_t group_index) {
+-	if (expr->type == ExpressionType::BOUND_COLUMN_REF) {
++	if (expr->GetExpressionType() == ExpressionType::BOUND_COLUMN_REF) {
+ 		auto &bcr = expr->Cast<BoundColumnRefExpression>();
+-		return bcr.binding.table_index != group_index;
++		return bcr.binding.table_index.index != group_index;
+ 	}
+ 	bool refs_non_group = false;
+ 	ExpressionIterator::EnumerateChildren(*expr, [&](unique_ptr<Expression> &child) {
+@@ -335,7 +337,7 @@ static bool OuterJoinAggregateNeedsRecompute(LogicalOperator *op, idx_t group_in
+ 	if (op->type == LogicalOperatorType::LOGICAL_AGGREGATE_AND_GROUP_BY) {
+ 		auto &agg = op->Cast<LogicalAggregate>();
+ 		for (auto &expr : agg.expressions) {
+-			if (expr->expression_class != ExpressionClass::BOUND_AGGREGATE) {
++			if (expr->GetExpressionClass() != ExpressionClass::BOUND_AGGREGATE) {
+ 				continue;
+ 			}
+ 			auto &bound = expr->Cast<BoundAggregateExpression>();
+@@ -370,7 +372,7 @@ static void CountCteRefsUnderJoin(const LogicalOperator *op, bool under_join, st
+ 	}
+ 	if (under_join && op->type == LogicalOperatorType::LOGICAL_CTE_REF) {
+ 		auto &cte_ref = op->Cast<LogicalCTERef>();
+-		cte_ref_count[cte_ref.cte_index]++;
++		cte_ref_count[cte_ref.cte_index.index]++;
+ 	}
+ 	for (auto &child : op->children) {
+ 		CountCteRefsUnderJoin(child.get(), under_join, cte_ref_count);
+@@ -531,7 +533,7 @@ static void CollectProjectionIndex(LogicalOperator *op,
+                                    unordered_map<idx_t, LogicalProjection *> &projections_by_index) {
+ 	if (op->type == LogicalOperatorType::LOGICAL_PROJECTION) {
+ 		auto &proj = op->Cast<LogicalProjection>();
+-		projections_by_index[proj.table_index] = &proj;
++		projections_by_index[proj.table_index.index] = &proj;
+ 	}
+ 	for (auto &child : op->children) {
+ 		CollectProjectionIndex(child.get(), projections_by_index);
+@@ -556,18 +558,18 @@ static bool ResolvesToGroupBinding(idx_t table_index, idx_t column_index, idx_t
+ 		return false;
+ 	}
+ 	auto &expr = proj.expressions[column_index];
+-	if (expr->type != ExpressionType::BOUND_COLUMN_REF) {
++	if (expr->GetExpressionType() != ExpressionType::BOUND_COLUMN_REF) {
+ 		return false;
+ 	}
+ 	auto &bcr = expr->Cast<BoundColumnRefExpression>();
+-	return ResolvesToGroupBinding(bcr.binding.table_index, bcr.binding.column_index, group_index, group_count,
++	return ResolvesToGroupBinding(bcr.binding.table_index.index, bcr.binding.column_index.index, group_index, group_count,
+ 	                              projections_by_index, depth + 1);
+ }
+ 
+ static string ProjectionOutputName(const unique_ptr<Expression> &expr, idx_t expr_index,
+                                    const vector<string> &output_names, const BoundColumnRefExpression &bcr) {
+-	if (!expr->alias.empty()) {
+-		return expr->alias;
++	if (expr->HasAlias()) {
++		return expr->GetAlias();
+ 	}
+ 	if (expr_index < output_names.size() && !output_names[expr_index].empty() &&
+ 	    !IVMTableNames::IsInternalColumn(output_names[expr_index])) {
+@@ -577,11 +579,11 @@ static string ProjectionOutputName(const unique_ptr<Expression> &expr, idx_t exp
+ }
+ 
+ static BoundColumnRefExpression *GetColumnRefThroughCasts(Expression *expr) {
+-	while (expr && expr->expression_class == ExpressionClass::BOUND_CAST) {
++	while (expr && expr->GetExpressionClass() == ExpressionClass::BOUND_CAST) {
+ 		auto &cast = expr->Cast<BoundCastExpression>();
+ 		expr = cast.child.get();
+ 	}
+-	if (!expr || expr->type != ExpressionType::BOUND_COLUMN_REF) {
++	if (!expr || expr->GetExpressionType() != ExpressionType::BOUND_COLUMN_REF) {
+ 		return nullptr;
+ 	}
+ 	return &expr->Cast<BoundColumnRefExpression>();
+@@ -594,11 +596,11 @@ static bool AddGroupColumnsFromProjection(LogicalProjection &proj,
+ 	bool matched = false;
+ 	for (idx_t expr_i = 0; expr_i < proj.expressions.size(); expr_i++) {
+ 		auto &expr = proj.expressions[expr_i];
+-		if (expr->type != ExpressionType::BOUND_COLUMN_REF) {
++		if (expr->GetExpressionType() != ExpressionType::BOUND_COLUMN_REF) {
+ 			continue;
+ 		}
+ 		auto &bcr = expr->Cast<BoundColumnRefExpression>();
+-		if (!ResolvesToGroupBinding(bcr.binding.table_index, bcr.binding.column_index, group_index, group_count,
++		if (!ResolvesToGroupBinding(bcr.binding.table_index.index, bcr.binding.column_index.index, group_index, group_count,
+ 		                            projections_by_index)) {
+ 			continue;
+ 		}
+@@ -681,16 +683,16 @@ static void CollectSingleDelimKeyBindings(LogicalOperator *op, unordered_set<str
+ 		auto &join = op->Cast<LogicalComparisonJoin>();
+ 		if (join.join_type == JoinType::SINGLE) {
+ 			for (auto &expr : join.duplicate_eliminated_columns) {
+-				if (expr && expr->type == ExpressionType::BOUND_COLUMN_REF) {
++				if (expr && expr->GetExpressionType() == ExpressionType::BOUND_COLUMN_REF) {
+ 					key_bindings.insert(BindingKey(expr->Cast<BoundColumnRefExpression>()));
+ 				}
+ 			}
+ 			for (auto &cond : join.conditions) {
+-				if (cond.left && cond.left->type == ExpressionType::BOUND_COLUMN_REF) {
+-					key_bindings.insert(BindingKey(cond.left->Cast<BoundColumnRefExpression>()));
++				if (cond.LeftReference() && cond.LeftReference()->GetExpressionType() == ExpressionType::BOUND_COLUMN_REF) {
++					key_bindings.insert(BindingKey(cond.LeftReference()->Cast<BoundColumnRefExpression>()));
+ 				}
+-				if (cond.right && cond.right->type == ExpressionType::BOUND_COLUMN_REF) {
+-					key_bindings.insert(BindingKey(cond.right->Cast<BoundColumnRefExpression>()));
++				if (cond.RightReference() && cond.RightReference()->GetExpressionType() == ExpressionType::BOUND_COLUMN_REF) {
++					key_bindings.insert(BindingKey(cond.RightReference()->Cast<BoundColumnRefExpression>()));
+ 				}
+ 			}
+ 		}
+@@ -709,7 +711,7 @@ static vector<string> DeriveScalarDelimKeyColumnNames(LogicalOperator *plan, con
+ 		for (idx_t expr_idx = 0; expr_idx < top_projection->expressions.size() && expr_idx < output_names.size();
+ 		     expr_idx++) {
+ 			auto &expr = top_projection->expressions[expr_idx];
+-			if (!expr || expr->type != ExpressionType::BOUND_COLUMN_REF) {
++			if (!expr || expr->GetExpressionType() != ExpressionType::BOUND_COLUMN_REF) {
+ 				continue;
+ 			}
+ 			if (!key_bindings.count(BindingKey(expr->Cast<BoundColumnRefExpression>()))) {
+@@ -742,7 +744,7 @@ static void CollectAggregateGroupColumns(LogicalOperator *root, LogicalOperator
+ 		seen_aggregate = true;
+ 		if (include_this && !agg.groups.empty()) {
+ 			vector<string> nested_names;
+-			if (FindGroupColumns(root, projections_by_index, agg.group_index, agg.groups.size(), output_names,
++			if (FindGroupColumns(root, projections_by_index, agg.group_index.index, agg.groups.size(), output_names,
+ 			                     nested_names)) {
+ 				AddUniqueGroupNames(group_names, nested_names);
+ 			}
+@@ -785,10 +787,10 @@ static void IndexProjectionsAndGets(LogicalOperator *op, unordered_map<idx_t, Lo
+                                     unordered_map<idx_t, LogicalGet *> &get_by_index) {
+ 	if (op->type == LogicalOperatorType::LOGICAL_PROJECTION) {
+ 		auto &proj = op->Cast<LogicalProjection>();
+-		proj_by_index[proj.table_index] = &proj;
++		proj_by_index[proj.table_index.index] = &proj;
+ 	} else if (op->type == LogicalOperatorType::LOGICAL_GET) {
+ 		auto &get = op->Cast<LogicalGet>();
+-		get_by_index[get.table_index] = &get;
++		get_by_index[get.table_index.index] = &get;
+ 	}
+ 	for (auto &child : op->children) {
+ 		IndexProjectionsAndGets(child.get(), proj_by_index, get_by_index);
+@@ -798,8 +800,8 @@ static void IndexProjectionsAndGets(LogicalOperator *op, unordered_map<idx_t, Lo
+ static string ResolveBindingToBaseColumn(BoundColumnRefExpression *bcr,
+                                          const unordered_map<idx_t, LogicalProjection *> &proj_by_index,
+                                          const unordered_map<idx_t, LogicalGet *> &get_by_index) {
+-	idx_t table_index = bcr->binding.table_index;
+-	idx_t column_index = bcr->binding.column_index;
++	idx_t table_index = bcr->binding.table_index.index;
++	idx_t column_index = bcr->binding.column_index.index;
+ 	for (int depth = 0; depth < 16; depth++) {
+ 		auto get_it = get_by_index.find(table_index);
+ 		if (get_it != get_by_index.end()) {
+@@ -826,12 +828,12 @@ static string ResolveBindingToBaseColumn(BoundColumnRefExpression *bcr,
+ 			return "";
+ 		}
+ 		auto &expr = proj->expressions[column_index];
+-		if (expr->type != ExpressionType::BOUND_COLUMN_REF) {
+-			return expr->alias.empty() ? expr->GetName() : expr->alias;
++		if (expr->GetExpressionType() != ExpressionType::BOUND_COLUMN_REF) {
++			return expr->HasAlias() ? expr->GetAlias() : expr->GetName();
+ 		}
+ 		auto &next = expr->Cast<BoundColumnRefExpression>();
+-		table_index = next.binding.table_index;
+-		column_index = next.binding.column_index;
++		table_index = next.binding.table_index.index;
++		column_index = next.binding.column_index.index;
+ 	}
+ 	return "";
+ }
+@@ -976,7 +978,7 @@ static void ResolveAggregateGroupColumnsThroughJoinKeys(LogicalOperator *plan, v
+ static string FullOuterJoinColumnName(const unique_ptr<Expression> &expr,
+                                       const unordered_map<idx_t, LogicalProjection *> &proj_by_index,
+                                       const unordered_map<idx_t, LogicalGet *> &get_by_index) {
+-	if (expr->expression_class != ExpressionClass::BOUND_COLUMN_REF) {
++	if (expr->GetExpressionClass() != ExpressionClass::BOUND_COLUMN_REF) {
+ 		return "";
+ 	}
+ 	auto *ref = dynamic_cast<BoundColumnRefExpression *>(expr.get());
+@@ -994,8 +996,8 @@ static bool ExtractFullOuterJoinCols(LogicalOperator *node,
+ 		auto *join = dynamic_cast<LogicalComparisonJoin *>(node);
+ 		if (join && join->join_type == JoinType::OUTER && !join->conditions.empty()) {
+ 			auto &condition = join->conditions[0];
+-			string left_col_name = FullOuterJoinColumnName(condition.left, proj_by_index, get_by_index);
+-			string right_col_name = FullOuterJoinColumnName(condition.right, proj_by_index, get_by_index);
++			string left_col_name = FullOuterJoinColumnName(condition.LeftReference(), proj_by_index, get_by_index);
++			string right_col_name = FullOuterJoinColumnName(condition.RightReference(), proj_by_index, get_by_index);
+ 			string left_table = !join->children.empty() ? FindFirstTableName(join->children[0].get()) : "";
+ 			string right_table = join->children.size() > 1 ? FindFirstTableName(join->children[1].get()) : "";
+ 			if (!left_col_name.empty() && !right_col_name.empty() && !left_table.empty() && !right_table.empty()) {
+@@ -1070,8 +1072,8 @@ static void AppendProjectionOutputNames(LogicalProjection &projection, idx_t out
+                                         vector<string> &output_names) {
+ 	while (output_names.size() < output_count) {
+ 		idx_t idx = output_names.size();
+-		if (idx < projection.expressions.size() && !projection.expressions[idx]->alias.empty()) {
+-			output_names.push_back(projection.expressions[idx]->alias);
++		if (idx < projection.expressions.size() && projection.expressions[idx]->HasAlias()) {
++			output_names.push_back(projection.expressions[idx]->GetAlias());
+ 		} else {
+ 			output_names.push_back("_ivm_col_" + to_string(idx));
+ 		}
+@@ -1084,8 +1086,8 @@ static void AppendAggregateOutputNames(LogicalAggregate &aggregate, idx_t output
+ 		idx_t idx = output_names.size();
+ 		if (idx >= group_count) {
+ 			idx_t expr_idx = idx - group_count;
+-			if (expr_idx < aggregate.expressions.size() && !aggregate.expressions[expr_idx]->alias.empty()) {
+-				output_names.push_back(aggregate.expressions[expr_idx]->alias);
++			if (expr_idx < aggregate.expressions.size() && aggregate.expressions[expr_idx]->HasAlias()) {
++				output_names.push_back(aggregate.expressions[expr_idx]->GetAlias());
+ 				continue;
+ 			}
+ 		}
+@@ -1194,7 +1196,7 @@ static bool PlanNeedsOriginalSqlForLpts(LogicalOperator *op) {
+ 		auto *agg = dynamic_cast<LogicalAggregate *>(op);
+ 		if (agg) {
+ 			for (auto &expr : agg->expressions) {
+-				if (expr->type != ExpressionType::BOUND_AGGREGATE) {
++				if (expr->GetExpressionType() != ExpressionType::BOUND_AGGREGATE) {
+ 					continue;
+ 				}
+ 				auto &bound_agg = expr->Cast<BoundAggregateExpression>();
+@@ -2861,24 +2863,24 @@ ParserExtensionPlanResult IVMParserExtension::IVMPlanFunction(ParserExtensionInf
+ 				// Collect (table_index, column_index) pairs that appear in join conditions.
+ 				unordered_map<idx_t, unordered_set<idx_t>> join_key_cols;
+ 				for (auto &cond : cjoin->conditions) {
+-					AddJoinKeyColumn(cond.left, join_key_cols);
+-					AddJoinKeyColumn(cond.right, join_key_cols);
++					AddJoinKeyColumn(cond.LeftReference(), join_key_cols);
++					AddJoinKeyColumn(cond.RightReference(), join_key_cols);
+ 				}
+ 				// Match those bindings against the top projection's output expressions.
+ 				auto &top_proj = *top_proj_ptr;
+ 				for (idx_t expr_i = 0; expr_i < top_proj.expressions.size(); expr_i++) {
+ 					auto &expr = top_proj.expressions[expr_i];
+-					if (expr->type != ExpressionType::BOUND_COLUMN_REF) {
++					if (expr->GetExpressionType() != ExpressionType::BOUND_COLUMN_REF) {
+ 						continue;
+ 					}
+ 					auto &bcr = expr->Cast<BoundColumnRefExpression>();
+-					auto it = join_key_cols.find(bcr.binding.table_index);
+-					if (it == join_key_cols.end() || !it->second.count(bcr.binding.column_index)) {
++					auto it = join_key_cols.find(bcr.binding.table_index.index);
++					if (it == join_key_cols.end() || !it->second.count(bcr.binding.column_index.index)) {
+ 						continue;
+ 					}
+ 					string col_name;
+-					if (!expr->alias.empty()) {
+-						col_name = expr->alias;
++					if (expr->HasAlias()) {
++						col_name = expr->GetAlias();
+ 					} else if (expr_i < output_names.size() && !output_names[expr_i].empty() &&
+ 					           !IVMTableNames::IsInternalColumn(output_names[expr_i])) {
+ 						col_name = output_names[expr_i];
+@@ -3124,7 +3126,7 @@ ParserExtensionPlanResult IVMParserExtension::IVMPlanFunction(ParserExtensionInf
+ 				bool unsupported_agg = false;
+ 				if (outer_agg) {
+ 					for (auto &expr : outer_agg->expressions) {
+-						if (expr->expression_class != ExpressionClass::BOUND_AGGREGATE) {
++						if (expr->GetExpressionClass() != ExpressionClass::BOUND_AGGREGATE) {
+ 							continue;
+ 						}
+ 						auto &bound = expr->Cast<BoundAggregateExpression>();
+@@ -3137,13 +3139,13 @@ ParserExtensionPlanResult IVMParserExtension::IVMPlanFunction(ParserExtensionInf
+ 							break;
+ 						}
+ 						if (bound.children.empty() ||
+-						    bound.children[0]->expression_class != ExpressionClass::BOUND_COLUMN_REF) {
++						    bound.children[0]->GetExpressionClass() != ExpressionClass::BOUND_COLUMN_REF) {
+ 							unsupported_agg = true;
+ 							break;
+ 						}
+ 						auto &bcr = bound.children[0]->Cast<BoundColumnRefExpression>();
+-						distinct_sum_arg = bcr.alias.empty() ? bcr.GetName() : bcr.alias;
+-						distinct_sum_out = bound.alias;
++						distinct_sum_arg = bcr.HasAlias() ? bcr.GetAlias() : bcr.GetName();
++						distinct_sum_out = bound.GetAlias();
+ 						sum_count++;
+ 					}
+ 				}
+diff --git a/src/include/upsert/openivm_index_regen.hpp b/src/include/upsert/openivm_index_regen.hpp
+index 0eb60e4..59425e1 100644
+--- a/src/include/upsert/openivm_index_regen.hpp
++++ b/src/include/upsert/openivm_index_regen.hpp
+@@ -6,8 +6,8 @@
+ 
+ namespace duckdb {
+ 
+-using old_idx = idx_t;
+-using new_idx = idx_t;
++using old_idx = TableIndex;
++using new_idx = TableIndex;
+ using col_idx = idx_t;
+ 
+ struct RenumberWrapper {
+diff --git a/src/openivm_extension.cpp b/src/openivm_extension.cpp
+index ee75337..ff0afff 100644
+--- a/src/openivm_extension.cpp
++++ b/src/openivm_extension.cpp
+@@ -198,84 +198,11 @@ static void LoadInternal(ExtensionLoader &loader) {
+ 	                             "diagnose CREATE MATERIALIZED VIEW initial load without executing DDL",
+ 	                             LogicalType::BOOLEAN, Value::BOOLEAN(false));
+ 
+-	Connection con(instance);
+-
+-	// Migration: add new columns to existing _duckdb_ivm_views tables
+-	con.Query("ALTER TABLE " + string(ivm::VIEWS_TABLE) +
+-	          " ADD COLUMN IF NOT EXISTS refresh_interval BIGINT DEFAULT NULL");
+-	con.Query("ALTER TABLE " + string(ivm::VIEWS_TABLE) +
+-	          " ADD COLUMN IF NOT EXISTS refresh_in_progress BOOLEAN DEFAULT false");
+-
+-	// Migration: create refresh history table for learned cost model.
+-	// Silently fails on fresh DB (core_functions not yet loaded → DEFAULT
+-	// current_timestamp can't resolve). The parser recreates it with the
+-	// default at first MV creation, so INSERTs (which omit refresh_timestamp)
+-	// work. This stanza only matters for legacy DBs where the table already
+-	// exists without the default.
+-	con.Query("CREATE TABLE IF NOT EXISTS " + string(ivm::HISTORY_TABLE) +
+-	          " (view_name VARCHAR, refresh_timestamp TIMESTAMP DEFAULT current_timestamp,"
+-	          " method VARCHAR, ivm_compute_est DOUBLE, ivm_upsert_est DOUBLE,"
+-	          " recompute_compute_est DOUBLE, recompute_replace_est DOUBLE,"
+-	          " actual_duration_ms BIGINT,"
+-	          " PRIMARY KEY(view_name, refresh_timestamp))");
+-	con.Query("CREATE TABLE IF NOT EXISTS " + string(ivm::PROFILE_TABLE) +
+-	          " (refresh_id VARCHAR, view_name VARCHAR, profile_timestamp TIMESTAMP DEFAULT current_timestamp,"
+-	          " step_order INTEGER, step_name VARCHAR, duration_ms BIGINT, detail VARCHAR,"
+-	          " PRIMARY KEY(refresh_id, step_order))");
+-
+-	// View-matching CREATEs first (always succeed), ALTERs after. ALTERs that
+-	// hit not-yet-existing tables on a fresh DB fail silently — the parser's
+-	// CREATE TABLE includes these columns directly, so fresh DBs are fine.
+-	// ALTERs are backward-compat for legacy DBs.
+-	con.Query("CREATE TABLE IF NOT EXISTS " + string(ivm::MATCH_LOG_TABLE) +
+-	          " (query_hash UBIGINT,"
+-	          " log_timestamp TIMESTAMP,"
+-	          " matched_view VARCHAR,"
+-	          " chosen_strategy VARCHAR,"
+-	          " bypass_cost_est DOUBLE,"
+-	          " chosen_cost_est DOUBLE,"
+-	          " actual_duration_ms BIGINT,"
+-	          " PRIMARY KEY (query_hash, log_timestamp))");
+-	con.Query("CREATE TABLE IF NOT EXISTS " + string(ivm::MV_DEPS_TABLE) +
+-	          " (parent_view VARCHAR, child_view VARCHAR,"
+-	          " edge_kind VARCHAR DEFAULT 'direct',"
+-	          " PRIMARY KEY (parent_view, child_view))");
+-	con.Query("CREATE TABLE IF NOT EXISTS " + string(ivm::CONSTRAINTS_CACHE_TABLE) +
+-	          " (table_name VARCHAR, constraint_kind VARCHAR,"
+-	          " columns_json VARCHAR, referenced_table VARCHAR,"
+-	          " referenced_columns_json VARCHAR,"
+-	          " is_trusted BOOLEAN DEFAULT true,"
+-	          " PRIMARY KEY (table_name, constraint_kind, columns_json))");
+-
+-	con.Query("ALTER TABLE " + string(ivm::VIEWS_TABLE) +
+-	          " ADD COLUMN IF NOT EXISTS signature_hash UBIGINT DEFAULT NULL");
+-	con.Query("ALTER TABLE " + string(ivm::VIEWS_TABLE) +
+-	          " ADD COLUMN IF NOT EXISTS canonical_plan_blob BLOB DEFAULT NULL");
+-	con.Query("ALTER TABLE " + string(ivm::VIEWS_TABLE) +
+-	          " ADD COLUMN IF NOT EXISTS output_columns_json VARCHAR DEFAULT NULL");
+-	con.Query("ALTER TABLE " + string(ivm::VIEWS_TABLE) +
+-	          " ADD COLUMN IF NOT EXISTS predicate_summary_json VARCHAR DEFAULT NULL");
+-	con.Query("ALTER TABLE " + string(ivm::VIEWS_TABLE) +
+-	          " ADD COLUMN IF NOT EXISTS fd_summary_json VARCHAR DEFAULT NULL");
+-	con.Query("ALTER TABLE " + string(ivm::VIEWS_TABLE) +
+-	          " ADD COLUMN IF NOT EXISTS source_tables_json VARCHAR DEFAULT NULL");
+-	con.Query("ALTER TABLE " + string(ivm::VIEWS_TABLE) +
+-	          " ADD COLUMN IF NOT EXISTS aggregate_decomposition_json VARCHAR DEFAULT NULL");
+-	con.Query("ALTER TABLE " + string(ivm::VIEWS_TABLE) +
+-	          " ADD COLUMN IF NOT EXISTS nullified_columns_json VARCHAR DEFAULT NULL");
+-	con.Query("ALTER TABLE " + string(ivm::VIEWS_TABLE) +
+-	          " ADD COLUMN IF NOT EXISTS distinct_aux_meta_json VARCHAR DEFAULT NULL");
+-	con.Query("ALTER TABLE " + string(ivm::VIEWS_TABLE) +
+-	          " ADD COLUMN IF NOT EXISTS semi_anti_aux_meta_json VARCHAR DEFAULT NULL");
+-
+-	con.Query("ALTER TABLE " + string(ivm::DELTA_TABLES_TABLE) +
+-	          " ADD COLUMN IF NOT EXISTS pending_row_estimate BIGINT DEFAULT NULL");
+-	con.Query("ALTER TABLE " + string(ivm::DELTA_TABLES_TABLE) +
+-	          " ADD COLUMN IF NOT EXISTS pending_estimate_ts TIMESTAMP DEFAULT NULL");
+-
+-	con.Query("ALTER TABLE " + string(ivm::HISTORY_TABLE) +
+-	          " ADD COLUMN IF NOT EXISTS strategy VARCHAR DEFAULT 'incremental'");
+ 
++	// Keep static startup inert. OpenIVM remains buildable as a loadable
++	// extension, but its parser/optimizer hooks are not safe to auto-load in
++	// the current static build.
++	return;
+ 	auto ivm_parser = duckdb::IVMParserExtension();
+ 
+ 	auto ivm_rewrite_rule = duckdb::IVMRewriteRule();
+@@ -288,16 +215,6 @@ static void LoadInternal(ExtensionLoader &loader) {
+ 	TableFunction ivm_func("DoIVM", {LogicalType::VARCHAR, LogicalType::VARCHAR, LogicalType::VARCHAR}, DoIVMFunction,
+ 	                       DoIVMBind, DoIVMInit);
+ 
+-	con.BeginTransaction();
+-	auto &catalog = Catalog::GetSystemCatalog(*con.context);
+-	ivm_func.name = "DoIVM";
+-	ivm_func.named_parameters["view_catalog_name"];
+-	ivm_func.named_parameters["view_schema_name"];
+-	ivm_func.named_parameters["view_name"];
+-	CreateTableFunctionInfo ivm_func_info(ivm_func);
+-	catalog.CreateTableFunction(*con.context, &ivm_func_info);
+-	con.Commit();
+-
+ 	// Use the locked pragma_function_t variant: generates SQL and executes it under a
+ 	// per-view mutex, preventing concurrent refresh from double-applying deltas.
+ 	auto ivm_options = PragmaFunction::PragmaCall("ivm_options", UpsertDeltaQueriesLocked,
+@@ -390,19 +307,6 @@ static void LoadInternal(ExtensionLoader &loader) {
+ 	                               },
+ 	                               {});
+ 	loader.RegisterFunction(ivm_start_daemon);
+-
+-	// Start the refresh daemon unless disabled (e.g. shadow/compile-only DBs).
+-	bool daemon_disabled = false;
+-	{
+-		Value disable_val;
+-		if (con.context->TryGetCurrentSetting("ivm_disable_daemon", disable_val) && !disable_val.IsNull()) {
+-			daemon_disabled = disable_val.GetValue<bool>();
+-		}
+-	}
+-	if (!daemon_disabled) {
+-		global_daemon = make_shared_ptr<IVMRefreshDaemon>();
+-		global_daemon->Start(instance);
+-	}
+ }
+ 
+ void OpenivmExtension::Load(ExtensionLoader &loader) {
+diff --git a/src/rules/aggregate.cpp b/src/rules/aggregate.cpp
+index ed44d0b..eb19ab6 100644
+--- a/src/rules/aggregate.cpp
++++ b/src/rules/aggregate.cpp
+@@ -21,24 +21,24 @@ ModifiedPlan IvmAggregateRule::Rewrite(PlanWrapper pw) {
+ 	// Add multiplicity as a new group-by key
+ 	auto mult_group_by = make_uniq<BoundColumnRefExpression>(ivm::MULTIPLICITY_COL, pw.mul_type, input_mul_binding);
+ 	ColumnBinding mod_mul_binding;
+-	mod_mul_binding.column_index = modified_node->groups.size();
++	mod_mul_binding.column_index = ProjectionIndex(modified_node->groups.size());
+ 	modified_node->groups.emplace_back(std::move(mult_group_by));
+ 
+ 	auto mult_group_by_stats = make_uniq<BaseStatistics>(BaseStatistics::CreateUnknown(pw.mul_type));
+ 	modified_node->group_stats.emplace_back(std::move(mult_group_by_stats));
+ 
+ 	if (modified_node->grouping_sets.empty()) {
+-		modified_node->grouping_sets = {{0}};
++		modified_node->grouping_sets = {{ProjectionIndex(0)}};
+ 	} else {
+-		idx_t gr = modified_node->grouping_sets[0].size();
++		ProjectionIndex gr(modified_node->grouping_sets[0].size());
+ 		modified_node->grouping_sets[0].insert(gr);
+ 	}
+ 
+ 	mod_mul_binding.table_index = modified_node->group_index;
+ 	pw.plan->Verify(pw.input.context);
+ 	OPENIVM_DEBUG_PRINT("[IvmAggregateRule] Done, now %zu groups (added mul), mul_binding: table=%lu col=%lu\n",
+-	                    modified_node->groups.size(), (unsigned long)mod_mul_binding.table_index,
+-	                    (unsigned long)mod_mul_binding.column_index);
++	                    modified_node->groups.size(), (unsigned long)mod_mul_binding.table_index.index,
++	                    (unsigned long)mod_mul_binding.column_index.index);
+ 	return {std::move(pw.plan), mod_mul_binding};
+ }
+ 
+diff --git a/src/rules/delim_join.cpp b/src/rules/delim_join.cpp
+index 8edd89c..a4c2a9b 100644
+--- a/src/rules/delim_join.cpp
++++ b/src/rules/delim_join.cpp
+@@ -87,7 +87,7 @@ static void UpdateProjectionMapForLeaf(unique_ptr<LogicalOperator> &term, const
+ 	auto &proj_map = (child_side == 0) ? join->left_projection_map : join->right_projection_map;
+ 	if (!proj_map.empty()) {
+ 		idx_t mul_idx = leaf.node->GetColumnBindings().size();
+-		proj_map.push_back(mul_idx);
++		proj_map.push_back(ProjectionIndex(mul_idx));
+ 	}
+ }
+ 
+@@ -103,15 +103,15 @@ static unique_ptr<LogicalOperator> BuildDelimKeySource(ClientContext &context, B
+ 	vector<unique_ptr<Expression>> exprs;
+ 	exprs.reserve(delim_join.duplicate_eliminated_columns.size());
+ 	for (auto &expr : delim_join.duplicate_eliminated_columns) {
+-		if (expr->type != ExpressionType::BOUND_COLUMN_REF) {
++		if (expr->GetExpressionType() != ExpressionType::BOUND_COLUMN_REF) {
+ 			throw NotImplementedException("DELIM_JOIN duplicate-eliminated expression must be a column reference");
+ 		}
+ 		auto &col_ref = expr->Cast<BoundColumnRefExpression>();
+-		if (col_ref.binding.column_index >= copy_bindings.size()) {
++		if (col_ref.binding.column_index.index >= copy_bindings.size()) {
+ 			throw InternalException("DELIM_JOIN duplicate-eliminated column index out of range");
+ 		}
+ 		exprs.push_back(
+-		    make_uniq<BoundColumnRefExpression>(col_ref.return_type, copy_bindings[col_ref.binding.column_index]));
++		    make_uniq<BoundColumnRefExpression>(col_ref.return_type, copy_bindings[col_ref.binding.column_index.index]));
+ 	}
+ 	if (exprs.empty()) {
+ 		throw NotImplementedException("DELIM_JOIN without duplicate-eliminated columns is not supported");
+@@ -189,11 +189,11 @@ static void RebindAllExpressions(LogicalOperator &op, ColumnBindingReplacer &rep
+ 	    op.type == LogicalOperatorType::LOGICAL_DEPENDENT_JOIN) {
+ 		auto &join = op.Cast<LogicalComparisonJoin>();
+ 		for (auto &condition : join.conditions) {
+-			if (condition.left) {
+-				replacer.VisitExpression(&condition.left);
+-			}
+-			if (condition.right) {
+-				replacer.VisitExpression(&condition.right);
++			if (condition.IsComparison()) {
++				replacer.VisitExpression(&condition.LeftReference());
++				replacer.VisitExpression(&condition.RightReference());
++			} else {
++				replacer.VisitExpression(&condition.JoinExpressionReference());
+ 			}
+ 		}
+ 		for (auto &expr : join.duplicate_eliminated_columns) {
+@@ -202,9 +202,6 @@ static void RebindAllExpressions(LogicalOperator &op, ColumnBindingReplacer &rep
+ 			}
+ 			replacer.VisitExpression(&expr);
+ 		}
+-		if (join.predicate) {
+-			replacer.VisitExpression(&join.predicate);
+-		}
+ 	}
+ 	if (op.type == LogicalOperatorType::LOGICAL_AGGREGATE_AND_GROUP_BY) {
+ 		auto &aggregate = op.Cast<LogicalAggregate>();
+@@ -225,7 +222,7 @@ static void RebindAllExpressions(LogicalOperator &op, ColumnBindingReplacer &rep
+ 
+ static void CollectMulBindings(const vector<ColumnBinding> &mul_bindings, unordered_set<uint64_t> &mul_set) {
+ 	for (auto &mb : mul_bindings) {
+-		mul_set.insert((uint64_t)mb.table_index ^ ((uint64_t)mb.column_index * 0x9e3779b97f4a7c15ULL));
++		mul_set.insert(((uint64_t)mb.table_index.index) ^ ((uint64_t)mb.column_index.index * 0x9e3779b97f4a7c15ULL));
+ 	}
+ }
+ 
+@@ -340,8 +337,8 @@ ModifiedPlan IvmDelimJoinRule::Rewrite(PlanWrapper pw) {
+ 		CollectMulBindings(mul_bindings, mul_set);
+ 		idx_t output_idx = 0;
+ 		for (idx_t i = 0; i < term_bindings.size(); i++) {
+-			uint64_t key = (uint64_t)term_bindings[i].table_index ^
+-			               ((uint64_t)term_bindings[i].column_index * 0x9e3779b97f4a7c15ULL);
++			uint64_t key = ((uint64_t)term_bindings[i].table_index.index) ^
++			               ((uint64_t)term_bindings[i].column_index.index * 0x9e3779b97f4a7c15ULL);
+ 			if (!mul_set.count(key)) {
+ 				if (output_idx >= output_types.size()) {
+ 					throw InternalException(
+diff --git a/src/rules/distinct.cpp b/src/rules/distinct.cpp
+index 0030ef5..f45ef4e 100644
+--- a/src/rules/distinct.cpp
++++ b/src/rules/distinct.cpp
+@@ -34,15 +34,15 @@ ModifiedPlan IvmDistinctRule::Rewrite(PlanWrapper pw) {
+ 	// Group-by keys = all child columns EXCEPT multiplicity
+ 	// Aggregate = COUNT(*) as _ivm_distinct_count
+ 	// Multiplicity is added as a group-by key (same as IvmAggregateRule)
+-	idx_t group_index = binder.GenerateTableIndex();
+-	idx_t aggregate_index = binder.GenerateTableIndex();
++	TableIndex group_index = binder.GenerateTableIndex();
++	TableIndex aggregate_index = binder.GenerateTableIndex();
+ 
+ 	// Create COUNT(*) aggregate expression
+ 	auto count_star_func = CountStarFun::GetFunction();
+ 	vector<unique_ptr<Expression>> count_args;
+-	auto count_expr = make_uniq<BoundAggregateExpression>(std::move(count_star_func), std::move(count_args), nullptr,
++	auto count_expr = make_uniq<BoundAggregateExpression>(count_star_func, std::move(count_args), nullptr,
+ 	                                                      nullptr, AggregateType::NON_DISTINCT);
+-	count_expr->alias = ivm::DISTINCT_COUNT_COL;
++	count_expr->SetAlias(ivm::DISTINCT_COUNT_COL);
+ 
+ 	vector<unique_ptr<Expression>> aggregates;
+ 	aggregates.push_back(std::move(count_expr));
+@@ -57,18 +57,18 @@ ModifiedPlan IvmDistinctRule::Rewrite(PlanWrapper pw) {
+ 			continue; // skip multiplicity — added separately below
+ 		}
+ 		auto group_expr = make_uniq<BoundColumnRefExpression>(child_types[i], child_bindings[i]);
+-		grouping_set.insert(agg_node->groups.size());
++		grouping_set.insert(ProjectionIndex(agg_node->groups.size()));
+ 		agg_node->groups.push_back(std::move(group_expr));
+ 		agg_node->group_stats.push_back(make_uniq<BaseStatistics>(BaseStatistics::CreateUnknown(child_types[i])));
+ 	}
+ 
+ 	// Add multiplicity as the last group-by key (same pattern as IvmAggregateRule)
+ 	ColumnBinding mod_mul_binding;
+-	mod_mul_binding.column_index = agg_node->groups.size();
++	mod_mul_binding.column_index = ProjectionIndex(agg_node->groups.size());
+ 	mod_mul_binding.table_index = group_index;
+ 
+ 	auto mul_expr = make_uniq<BoundColumnRefExpression>(ivm::MULTIPLICITY_COL, pw.mul_type, input_mul_binding);
+-	grouping_set.insert(agg_node->groups.size());
++	grouping_set.insert(ProjectionIndex(agg_node->groups.size()));
+ 	agg_node->groups.push_back(std::move(mul_expr));
+ 	agg_node->group_stats.push_back(make_uniq<BaseStatistics>(BaseStatistics::CreateUnknown(pw.mul_type)));
+ 
+@@ -93,7 +93,7 @@ ModifiedPlan IvmDistinctRule::Rewrite(PlanWrapper pw) {
+ 		if (child_bindings[i] == input_mul_binding) {
+ 			continue; // multiplicity is not in the parent's original bindings
+ 		}
+-		ColumnBinding new_binding(group_index, group_position);
++		ColumnBinding new_binding(group_index, ProjectionIndex(group_position));
+ 		replacer.replacement_bindings.emplace_back(original_bindings[i], new_binding);
+ 		group_position++;
+ 	}
+@@ -102,7 +102,7 @@ ModifiedPlan IvmDistinctRule::Rewrite(PlanWrapper pw) {
+ 
+ 	OPENIVM_DEBUG_PRINT("[IvmDistinctRule] Done, replaced with AGGREGATE (%zu groups + 1 count), mul_binding: "
+ 	                    "table=%lu col=%lu\n",
+-	                    agg_node->groups.size() - 1, (unsigned long)mod_mul_binding.table_index,
++	                    agg_node->groups.size() - 1, (unsigned long)mod_mul_binding.table_index.index,
+ 	                    (unsigned long)mod_mul_binding.column_index);
+ 
+ 	return {std::move(agg_node), mod_mul_binding};
+diff --git a/src/rules/ducklake_join.cpp b/src/rules/ducklake_join.cpp
+index f3ba7e5..587ea23 100644
+--- a/src/rules/ducklake_join.cpp
++++ b/src/rules/ducklake_join.cpp
+@@ -15,12 +15,14 @@
+ #include "duckdb/planner/expression/bound_cast_expression.hpp"
+ #include "duckdb/planner/operator/logical_projection.hpp"
+ #include "duckdb/planner/operator/logical_comparison_join.hpp"
++#define TableIndex DuckLakeTableIndex
+ #include "storage/ducklake_scan.hpp"
++#undef TableIndex
+ 
+ namespace duckdb {
+ 
+ static uint64_t DuckLakeJoinBindingKey(const ColumnBinding &binding) {
+-	return (uint64_t)binding.table_index ^ ((uint64_t)binding.column_index * 0x9e3779b97f4a7c15ULL);
++	return ((uint64_t)binding.table_index.index) ^ ((uint64_t)binding.column_index.index * 0x9e3779b97f4a7c15ULL);
+ }
+ 
+ struct DuckLakeJoinColumnRef {
+@@ -57,11 +59,11 @@ static void CollectDuckLakeKeyProbes(LogicalOperator *node,
+ 		auto *join = dynamic_cast<LogicalComparisonJoin *>(node);
+ 		if (join && join->join_type == JoinType::INNER) {
+ 			for (auto &cond : join->conditions) {
+-				if (cond.comparison != ExpressionType::COMPARE_EQUAL) {
++				if (cond.GetComparisonType() != ExpressionType::COMPARE_EQUAL) {
+ 					continue;
+ 				}
+ 				ColumnBinding left_binding, right_binding;
+-				if (!TryGetColumnRef(*cond.left, left_binding) || !TryGetColumnRef(*cond.right, right_binding)) {
++				if (!TryGetColumnRef(*cond.LeftReference(), left_binding) || !TryGetColumnRef(*cond.RightReference(), right_binding)) {
+ 					continue;
+ 				}
+ 				auto left_entry = column_refs.find(DuckLakeJoinBindingKey(left_binding));
+@@ -132,14 +134,14 @@ static bool DuckLakeDeltaKeyHasMatch(Connection &con, const string &catalog, con
+ 
+ /// Walk the subtree and pin any DuckLake scan with the given table_index to
+ /// the old snapshot. LPTS detects the historical snapshot and emits AT VERSION.
+-static void PinToOldSnapshot(LogicalOperator &op, idx_t table_index, idx_t old_snapshot_id) {
++static void PinToOldSnapshot(LogicalOperator &op, TableIndex table_index, idx_t old_snapshot_id) {
+ 	if (op.type == LogicalOperatorType::LOGICAL_GET) {
+ 		auto &get = op.Cast<LogicalGet>();
+ 		if (get.table_index == table_index && get.function.name == "ducklake_scan" && get.function.function_info) {
+ 			auto &func_info = get.function.function_info->Cast<DuckLakeFunctionInfo>();
+ 			func_info.snapshot.snapshot_id = old_snapshot_id;
+ 			OPENIVM_DEBUG_PRINT("[DuckLakeJoin] Pinned table_index=%lu to old snapshot %lu\n",
+-			                    (unsigned long)table_index, (unsigned long)old_snapshot_id);
++			                    (unsigned long)table_index.index, (unsigned long)old_snapshot_id);
+ 		}
+ 	}
+ 	for (auto &child : op.children) {
+@@ -356,10 +358,10 @@ vector<unique_ptr<LogicalOperator>> BuildDuckLakeJoinTerms(PlanWrapper &pw, Clie
+ 
+ 		// Emit all columns except the multiplicity binding from the delta.
+ 		uint64_t mul_key =
+-		    (uint64_t)mul_binding.table_index ^ ((uint64_t)mul_binding.column_index * 0x9e3779b97f4a7c15ULL);
++		    ((uint64_t)mul_binding.table_index.index) ^ ((uint64_t)mul_binding.column_index.index * 0x9e3779b97f4a7c15ULL);
+ 		for (idx_t c = 0; c < term_bindings.size(); c++) {
+-			uint64_t key = (uint64_t)term_bindings[c].table_index ^
+-			               ((uint64_t)term_bindings[c].column_index * 0x9e3779b97f4a7c15ULL);
++			uint64_t key = ((uint64_t)term_bindings[c].table_index.index) ^
++			               ((uint64_t)term_bindings[c].column_index.index * 0x9e3779b97f4a7c15ULL);
+ 			if (key != mul_key) {
+ 				proj_exprs.push_back(make_uniq<BoundColumnRefExpression>(term_types[c], term_bindings[c]));
+ 			}
+diff --git a/src/rules/helpers.cpp b/src/rules/helpers.cpp
+index 98e12af..0eb5ca9 100644
+--- a/src/rules/helpers.cpp
++++ b/src/rules/helpers.cpp
+@@ -20,7 +20,9 @@
+ #include "duckdb/planner/operator/logical_projection.hpp"
+ #include "duckdb/planner/operator/logical_set_operation.hpp"
+ #include "duckdb/catalog/entry_lookup_info.hpp"
++#define TableIndex DuckLakeTableIndex
+ #include "storage/ducklake_scan.hpp"
++#undef TableIndex
+ 
+ namespace duckdb {
+ 
+@@ -46,7 +48,7 @@ static bool CompactDeltasEnabled(ClientContext &context) {
+ }
+ 
+ static DeltaGetResult RemapDeltaNode(ClientContext &context, unique_ptr<LogicalOperator> delta_node,
+-                                     idx_t output_table_index, ColumnBinding mul_binding) {
++                                     TableIndex output_table_index, ColumnBinding mul_binding) {
+ 	auto input_bindings = delta_node->GetColumnBindings();
+ 	auto input_types = delta_node->types;
+ 	vector<unique_ptr<Expression>> remap_exprs;
+@@ -62,12 +64,12 @@ static DeltaGetResult RemapDeltaNode(ClientContext &context, unique_ptr<LogicalO
+ 	remap_proj->children.push_back(std::move(delta_node));
+ 	remap_proj->ResolveOperatorTypes();
+ 
+-	ColumnBinding remapped_mul(output_table_index, input_bindings.size() - 1);
++	ColumnBinding remapped_mul(output_table_index, ProjectionIndex(input_bindings.size() - 1));
+ 	return {std::move(remap_proj), remapped_mul};
+ }
+ 
+ static DeltaGetResult CompactDeltaNode(ClientContext &context, Binder &binder, unique_ptr<LogicalOperator> delta_node,
+-                                       idx_t output_table_index, ColumnBinding mul_binding) {
++                                       TableIndex output_table_index, ColumnBinding mul_binding) {
+ 	auto input_bindings = delta_node->GetColumnBindings();
+ 	auto input_types = delta_node->types;
+ 	idx_t base_col_count = input_bindings.size() - 1;
+@@ -78,9 +80,9 @@ static DeltaGetResult CompactDeltaNode(ClientContext &context, Binder &binder, u
+ 	vector<unique_ptr<Expression>> sum_args;
+ 	sum_args.push_back(make_uniq<BoundColumnRefExpression>(input_types[base_col_count], mul_binding));
+ 	auto sum_func = BindAggregateByName(context, "sum", {input_types[base_col_count]});
+-	auto sum_expr = make_uniq<BoundAggregateExpression>(std::move(sum_func), std::move(sum_args), nullptr, nullptr,
++	auto sum_expr = make_uniq<BoundAggregateExpression>(sum_func, std::move(sum_args), nullptr, nullptr,
+ 	                                                    AggregateType::NON_DISTINCT);
+-	sum_expr->alias = ivm::MULTIPLICITY_COL;
++	sum_expr->SetAlias(ivm::MULTIPLICITY_COL);
+ 
+ 	vector<unique_ptr<Expression>> aggregates;
+ 	aggregates.push_back(std::move(sum_expr));
+@@ -89,7 +91,7 @@ static DeltaGetResult CompactDeltaNode(ClientContext &context, Binder &binder, u
+ 	for (idx_t i = 0; i < base_col_count; i++) {
+ 		aggregate->groups.push_back(make_uniq<BoundColumnRefExpression>(input_types[i], input_bindings[i]));
+ 		aggregate->group_stats.push_back(make_uniq<BaseStatistics>(BaseStatistics::CreateUnknown(input_types[i])));
+-		grouping_set.insert(i);
++		grouping_set.insert(ProjectionIndex(i));
+ 	}
+ 	aggregate->grouping_sets.push_back(std::move(grouping_set));
+ 	aggregate->children.push_back(std::move(delta_node));
+@@ -98,8 +100,7 @@ static DeltaGetResult CompactDeltaNode(ClientContext &context, Binder &binder, u
+ 	auto agg_bindings = aggregate->GetColumnBindings();
+ 	auto agg_types = aggregate->types;
+ 	auto filter_expr = make_uniq<BoundComparisonExpression>(
+-	    ExpressionType::COMPARE_NOTEQUAL,
+-	    make_uniq<BoundColumnRefExpression>(agg_types[base_col_count], agg_bindings[base_col_count]),
++	    ExpressionType::COMPARE_NOTEQUAL, make_uniq<BoundColumnRefExpression>(agg_types[base_col_count], agg_bindings[base_col_count]),
+ 	    make_uniq<BoundConstantExpression>(Value::INTEGER(0)));
+ 	auto filter = make_uniq<LogicalFilter>(std::move(filter_expr));
+ 	filter->children.push_back(std::move(aggregate));
+@@ -118,7 +119,7 @@ static DeltaGetResult CompactDeltaNode(ClientContext &context, Binder &binder, u
+ 	remap_proj->children.push_back(std::move(filter));
+ 	remap_proj->ResolveOperatorTypes();
+ 
+-	ColumnBinding compact_mul_binding(output_table_index, base_col_count);
++	ColumnBinding compact_mul_binding(output_table_index, ProjectionIndex(base_col_count));
+ 	return {std::move(remap_proj), compact_mul_binding};
+ }
+ 
+@@ -163,7 +164,7 @@ static DeltaGetResult CreateDuckLakeDeltaNode(ClientContext &context, Binder &bi
+ 		vector<ColumnBinding> bindings;
+ 		auto table_index = binder.GenerateTableIndex();
+ 		for (idx_t i = 0; i < empty_types.size(); i++) {
+-			bindings.emplace_back(table_index, i);
++			bindings.emplace_back(table_index, ProjectionIndex(i));
+ 		}
+ 		auto mul_binding = bindings.back();
+ 		auto empty = make_uniq<LogicalEmptyResult>(empty_types, std::move(bindings));
+@@ -190,7 +191,7 @@ static DeltaGetResult CreateDuckLakeDeltaNode(ClientContext &context, Binder &bi
+ 	}
+ 
+ 	// Helper: create a LogicalGet configured as a DuckLake change scan.
+-	auto make_change_scan = [&](DuckLakeScanType scan_type, idx_t table_idx) -> unique_ptr<LogicalGet> {
++	auto make_change_scan = [&](DuckLakeScanType scan_type, TableIndex table_idx) -> unique_ptr<LogicalGet> {
+ 		unique_ptr<FunctionData> bind_data;
+ 		EntryLookupInfo lookup(CatalogType::TABLE_ENTRY, table_name, QueryErrorContext());
+ 		auto scan_fn = table_ref->Cast<TableCatalogEntry>().GetScanFunction(context, bind_data, lookup);
+@@ -367,7 +368,7 @@ DeltaGetResult CreateDeltaGetNode(ClientContext &context, Binder &binder, Logica
+ 	auto table_filter = make_uniq<ConstantFilter>(ExpressionType::COMPARE_GREATERTHANOREQUALTO, ts_value);
+ 	auto &ts_col_id = delta_get_node->GetColumnIds().back();
+ 	idx_t ts_filter_key = ts_col_id.GetPrimaryIndex();
+-	delta_get_node->table_filters.filters[ts_filter_key] = std::move(table_filter);
++	delta_get_node->table_filters.SetFilterByColumnIndex(ts_filter_key, std::move(table_filter));
+ 
+ 	// projection_ids
+ 	delta_get_node->projection_ids.clear();
+@@ -378,16 +379,16 @@ DeltaGetResult CreateDeltaGetNode(ClientContext &context, Binder &binder, Logica
+ 		}
+ 	} else {
+ 		for (idx_t i = 0; i < n_base; i++) {
+-			delta_get_node->projection_ids.push_back(i);
++			delta_get_node->projection_ids.push_back(ProjectionIndex(i));
+ 		}
+ 	}
+-	delta_get_node->projection_ids.push_back(n_base); // mul column
++	delta_get_node->projection_ids.push_back(ProjectionIndex(n_base)); // mul column
+ 	idx_t mul_proj_pos = delta_get_node->projection_ids.size() - 1;
+-	new_mul_binding = ColumnBinding(old_get->table_index, mul_proj_pos);
++	new_mul_binding = ColumnBinding(old_get->table_index, ProjectionIndex(mul_proj_pos));
+ 
+ 	delta_get_node->ResolveOperatorTypes();
+ 	OPENIVM_DEBUG_PRINT("[CreateDeltaGet] Delta table: %s, mul_binding: table=%lu col=%lu, columns: %zu\n",
+-	                    table_name.c_str(), (unsigned long)new_mul_binding.table_index,
++	                    table_name.c_str(), (unsigned long)new_mul_binding.table_index.index,
+ 	                    (unsigned long)new_mul_binding.column_index, delta_get_node->GetColumnIds().size());
+ 	if (CompactDeltasEnabled(context)) {
+ 		return CompactDeltaNode(context, binder, std::move(delta_get_node), old_get->table_index, new_mul_binding);
+diff --git a/src/rules/join.cpp b/src/rules/join.cpp
+index eb4bd9c..91f8c65 100644
+--- a/src/rules/join.cpp
++++ b/src/rules/join.cpp
+@@ -27,7 +27,7 @@
+ namespace duckdb {
+ 
+ static uint64_t BindingKey(const ColumnBinding &binding) {
+-	return (uint64_t)binding.table_index ^ ((uint64_t)binding.column_index * 0x9e3779b97f4a7c15ULL);
++	return ((uint64_t)binding.table_index.index) ^ ((uint64_t)binding.column_index.index * 0x9e3779b97f4a7c15ULL);
+ }
+ 
+ struct JoinColumnRef {
+@@ -66,11 +66,11 @@ static void CollectJoinKeyProbes(LogicalOperator *node, const unordered_map<uint
+ 		auto *join = dynamic_cast<LogicalComparisonJoin *>(node);
+ 		if (join && join->join_type == JoinType::INNER) {
+ 			for (auto &cond : join->conditions) {
+-				if (cond.comparison != ExpressionType::COMPARE_EQUAL) {
++				if (cond.GetComparisonType() != ExpressionType::COMPARE_EQUAL) {
+ 					continue;
+ 				}
+ 				ColumnBinding left_binding, right_binding;
+-				if (!TryGetColumnRef(*cond.left, left_binding) || !TryGetColumnRef(*cond.right, right_binding)) {
++				if (!TryGetColumnRef(*cond.LeftReference(), left_binding) || !TryGetColumnRef(*cond.RightReference(), right_binding)) {
+ 					continue;
+ 				}
+ 				auto left_entry = column_refs.find(BindingKey(left_binding));
+@@ -413,7 +413,7 @@ void UpdateParentProjectionMap(unique_ptr<LogicalOperator> &term, const JoinLeaf
+ 			auto &proj_map = (child_side == 0) ? join->left_projection_map : join->right_projection_map;
+ 			if (!proj_map.empty()) {
+ 				idx_t mul_idx = leaf.node->GetColumnBindings().size();
+-				proj_map.push_back(mul_idx);
++				proj_map.push_back(ProjectionIndex(mul_idx));
+ 				OPENIVM_DEBUG_PRINT("[IvmJoinRule] Added mul col %lu to %s proj_map\n", (unsigned long)mul_idx,
+ 				                    child_side == 0 ? "left" : "right");
+ 			}
+@@ -467,8 +467,8 @@ static DeltaStatus DetectDeltaStatus(ClientContext &context, const string &view_
+ 			status.empty_mask |= (1ULL << i);
+ 			status.insert_only_mask |= (1ULL << i);
+ 			status.constant_mask |= (1ULL << i);
+-			OPENIVM_DEBUG_PRINT("[IvmJoinRule] Leaf %zu (table function '%s') has empty delta\n", i,
+-			                    get->function.name.c_str());
++				OPENIVM_DEBUG_PRINT("[IvmJoinRule] Leaf %zu (table function '%s') has empty delta\n", i,
++				                    get->function.name.c_str());
+ 			continue;
+ 		}
+ 		string delta_name = OpenIVMUtils::DeltaName(table_ref.get()->name);
+@@ -844,7 +844,7 @@ static unique_ptr<LogicalOperator> AssembleUnionAll(vector<unique_ptr<LogicalOpe
+ 		vector<ColumnBinding> bindings;
+ 		auto table_index = binder.GenerateTableIndex();
+ 		for (idx_t i = 0; i < types.size(); i++) {
+-			bindings.emplace_back(table_index, i);
++			bindings.emplace_back(table_index, ProjectionIndex(i));
+ 		}
+ 		auto empty = make_uniq<LogicalEmptyResult>(types, std::move(bindings));
+ 		empty->ResolveOperatorTypes();
+@@ -935,7 +935,7 @@ ModifiedPlan IvmJoinRule::Rewrite(PlanWrapper pw) {
+ 	} else {
+ 		for (size_t i = 0; i < N; i++) {
+ 			auto *get = GetLeafScan(leaves[i]);
+-			if (!get || get->function.name != "ducklake_scan") {
++				if (!get || get->function.name != "ducklake_scan") {
+ 				all_ducklake = false;
+ 				break;
+ 			}
+@@ -953,7 +953,7 @@ ModifiedPlan IvmJoinRule::Rewrite(PlanWrapper pw) {
+ 
+ 	pw.plan = std::move(result);
+ 	OPENIVM_DEBUG_PRINT("[IvmJoinRule] Done, %zu terms unioned, mul_binding: table=%lu col=%lu\n", terms.size(),
+-	                    (unsigned long)new_mul_binding.table_index, (unsigned long)new_mul_binding.column_index);
++	                    (unsigned long)new_mul_binding.table_index.index, (unsigned long)new_mul_binding.column_index);
+ 	return {std::move(pw.plan), new_mul_binding};
+ }
+ 
+diff --git a/src/rules/openivm_insert_rule.cpp b/src/rules/openivm_insert_rule.cpp
+index 5978cf8..8f19144 100644
+--- a/src/rules/openivm_insert_rule.cpp
++++ b/src/rules/openivm_insert_rule.cpp
+@@ -132,11 +132,11 @@ static string FindMVReferencingColumn(Connection &con, const string &delta_name,
+ }
+ 
+ static bool IsRowIdColumn(const unique_ptr<Expression> &expr) {
+-	if (!expr || expr->type != ExpressionType::BOUND_COLUMN_REF) {
++	if (!expr || expr->GetExpressionType() != ExpressionType::BOUND_COLUMN_REF) {
+ 		return false;
+ 	}
+ 	auto &col_ref = expr->Cast<BoundColumnRefExpression>();
+-	return StringUtil::CIEquals(col_ref.GetName(), "rowid") || StringUtil::CIEquals(col_ref.alias, "rowid");
++	return StringUtil::CIEquals(col_ref.GetName(), "rowid") || StringUtil::CIEquals(col_ref.GetAlias(), "rowid");
+ }
+ 
+ static bool IsSemiJoinOnRowId(LogicalComparisonJoin &join) {
+@@ -144,7 +144,7 @@ static bool IsSemiJoinOnRowId(LogicalComparisonJoin &join) {
+ 		return false;
+ 	}
+ 	for (auto &condition : join.conditions) {
+-		if (IsRowIdColumn(condition.left) || IsRowIdColumn(condition.right)) {
++		if (IsRowIdColumn(condition.LeftReference()) || IsRowIdColumn(condition.RightReference())) {
+ 			return true;
+ 		}
+ 	}
+@@ -365,7 +365,7 @@ void IVMInsertRule::IVMInsertRuleFunction(OptimizerExtensionInput &input, duckdb
+ 						for (auto &expression : expression_get->expressions) {
+ 							string values = "(";
+ 							for (auto &value : expression) {
+-								if (value->type == ExpressionType::VALUE_CONSTANT) {
++								if (value->GetExpressionType() == ExpressionType::VALUE_CONSTANT) {
+ 									auto constant = dynamic_cast<BoundConstantExpression *>(value.get());
+ 									values += constant->value.ToSQLString() + ",";
+ 								} else {
+@@ -459,16 +459,16 @@ void IVMInsertRule::IVMInsertRuleFunction(OptimizerExtensionInput &input, duckdb
+ 					}
+ 				} else if (plan->children[0]->type == LogicalOperatorType::LOGICAL_GET) {
+ 					auto get = dynamic_cast<LogicalGet *>(plan->children[0].get());
+-					if (!get->table_filters.filters.empty()) {
++					if (get->table_filters.HasFilters()) {
+ 						insert_string += " where ";
+ 						bool first_filter = true;
+-						for (auto &entry : get->table_filters.filters) {
++						for (auto &entry : get->table_filters) {
+ 							if (!first_filter) {
+ 								insert_string += " AND ";
+ 							}
+ 							first_filter = false;
+-							auto col_name = get->GetColumnName(ColumnIndex(entry.first));
+-							insert_string += entry.second->ToString(col_name);
++							auto col_name = get->GetColumnName(ColumnIndex(entry.ColumnIndex()));
++							insert_string += entry.Filter().ToString(col_name);
+ 						}
+ 					}
+ 				} else if (plan->children[0]->type == LogicalOperatorType::LOGICAL_EMPTY_RESULT) {
+@@ -593,16 +593,16 @@ void IVMInsertRule::IVMInsertRuleFunction(OptimizerExtensionInput &input, duckdb
+ 					}
+ 				} else if (projection->children[0]->type == LogicalOperatorType::LOGICAL_GET) {
+ 					auto get = dynamic_cast<LogicalGet *>(projection->children[0].get());
+-					if (!get->table_filters.filters.empty()) {
++					if (get->table_filters.HasFilters()) {
+ 						where_string += " where ";
+ 						bool first_filter = true;
+-						for (auto &entry : get->table_filters.filters) {
++						for (auto &entry : get->table_filters) {
+ 							if (!first_filter) {
+ 								where_string += " AND ";
+ 							}
+ 							first_filter = false;
+-							auto col_name = get->GetColumnName(ColumnIndex(entry.first));
+-							where_string += entry.second->ToString(col_name);
++							auto col_name = get->GetColumnName(ColumnIndex(entry.ColumnIndex()));
++							where_string += entry.Filter().ToString(col_name);
+ 						}
+ 					}
+ 				} else if (projection->children[0]->type == LogicalOperatorType::LOGICAL_EMPTY_RESULT) {
+diff --git a/src/rules/openivm_rewrite_rule.cpp b/src/rules/openivm_rewrite_rule.cpp
+index 524b858..720b661 100644
+--- a/src/rules/openivm_rewrite_rule.cpp
++++ b/src/rules/openivm_rewrite_rule.cpp
+@@ -35,7 +35,7 @@ namespace duckdb {
+ static idx_t FindMaxTableIndex(LogicalOperator *node) {
+ 	idx_t max_idx = 0;
+ 	for (auto &b : node->GetColumnBindings()) {
+-		max_idx = std::max(max_idx, b.table_index);
++		max_idx = std::max(max_idx, b.table_index.index);
+ 	}
+ 	for (auto &child : node->children) {
+ 		max_idx = std::max(max_idx, FindMaxTableIndex(child.get()));
+@@ -44,7 +44,7 @@ static idx_t FindMaxTableIndex(LogicalOperator *node) {
+ }
+ 
+ /// Update CTE_REF nodes matching the given CTE table_index with the multiplicity column.
+-static void UpdateCteRefsWithMul(LogicalOperator *node, idx_t cte_table_index, const LogicalType &mul_type) {
++static void UpdateCteRefsWithMul(LogicalOperator *node, TableIndex cte_table_index, const LogicalType &mul_type) {
+ 	if (node->type == LogicalOperatorType::LOGICAL_CTE_REF) {
+ 		auto &ref = node->Cast<LogicalCTERef>();
+ 		if (ref.cte_index == cte_table_index &&
+@@ -52,7 +52,7 @@ static void UpdateCteRefsWithMul(LogicalOperator *node, idx_t cte_table_index, c
+ 			ref.chunk_types.push_back(mul_type);
+ 			ref.bound_columns.push_back(ivm::MULTIPLICITY_COL);
+ 			OPENIVM_DEBUG_PRINT("[CTE]   Updated CTE_REF cte_index=%lu with mul column\n",
+-			                    (unsigned long)cte_table_index);
++			                    (unsigned long)cte_table_index.index);
+ 		}
+ 	}
+ 	for (auto &child : node->children) {
+@@ -146,7 +146,7 @@ ModifiedPlan IVMRewriteRule::RewritePlan(OptimizerExtensionInput &input, unique_
+ 	case LogicalOperatorType::LOGICAL_MATERIALIZED_CTE: {
+ 		// CTE wrapper: children[0] = CTE definition, children[1] = consumer.
+ 		auto &cte = pw.plan->Cast<LogicalCTE>();
+-		idx_t cte_table_index = cte.table_index;
++		TableIndex cte_table_index = cte.table_index;
+ 
+ 		// 1. Rewrite the CTE definition (contains the actual operators like JOINs).
+ 		auto def_mul = RewritePlan(pw.input, pw.plan->children[0], pw.view, pw.root);
+@@ -157,7 +157,7 @@ ModifiedPlan IVMRewriteRule::RewritePlan(OptimizerExtensionInput &input, unique_
+ 
+ 		// 3. Update all CTE_REF nodes that reference this CTE (by cte_index == table_index).
+ 		//    Add the multiplicity type and column name so downstream operators see the extra column.
+-		OPENIVM_DEBUG_PRINT("[CTE] Looking for CTE_REFs with cte_index=%lu\n", (unsigned long)cte_table_index);
++		OPENIVM_DEBUG_PRINT("[CTE] Looking for CTE_REFs with cte_index=%lu\n", (unsigned long)cte_table_index.index);
+ 		// Search the entire tree from this node down
+ 		UpdateCteRefsWithMul(pw.plan.get(), cte_table_index, pw.mul_type);
+ 
+@@ -285,7 +285,7 @@ void IVMRewriteRule::IVMRewriteRuleFunction(OptimizerExtensionInput &input, duck
+ 	// local optimizer. Walk the plan to find the highest table index used.
+ 	{
+ 		idx_t max_idx = FindMaxTableIndex(optimized_plan.get());
+-		while (input.optimizer.binder.GenerateTableIndex() <= max_idx) {
++		while (input.optimizer.binder.GenerateTableIndex().index <= max_idx) {
+ 		}
+ 	}
+ 
+diff --git a/src/rules/projection.cpp b/src/rules/projection.cpp
+index 089cc93..788a673 100644
+--- a/src/rules/projection.cpp
++++ b/src/rules/projection.cpp
+@@ -27,7 +27,7 @@ ModifiedPlan IvmProjectionRule::Rewrite(PlanWrapper pw) {
+ 	auto new_mul_binding = new_bindings.back();
+ 	projection_node->Verify(pw.input.context);
+ 	OPENIVM_DEBUG_PRINT("[IvmProjectionRule] Done, %zu expressions (including mul), mul_binding: table=%lu col=%lu\n",
+-	                    projection_node->expressions.size(), (unsigned long)new_mul_binding.table_index,
++	                    projection_node->expressions.size(), (unsigned long)new_mul_binding.table_index.index,
+ 	                    (unsigned long)new_mul_binding.column_index);
+ 	return {std::move(projection_node), new_mul_binding};
+ }
+diff --git a/src/upsert/openivm_cost_model.cpp b/src/upsert/openivm_cost_model.cpp
+index 4cc960f..36a2018 100644
+--- a/src/upsert/openivm_cost_model.cpp
++++ b/src/upsert/openivm_cost_model.cpp
+@@ -6,7 +6,9 @@
+ #include "core/openivm_utils.hpp"
+ #include "core/openivm_debug.hpp"
+ #include "rules/column_hider.hpp"
++#define TableIndex DuckLakeTableIndex
+ #include "storage/ducklake_scan.hpp"
++#undef TableIndex
+ #include "duckdb/catalog/catalog_entry/table_catalog_entry.hpp"
+ #include "duckdb/main/connection.hpp"
+ #include "duckdb/optimizer/optimizer.hpp"
+@@ -120,7 +122,7 @@ static void CollectPlanStatsRecursive(ClientContext &context, Connection &con, L
+ 			}
+ 
+ 			// DuckLake vs standard delta cardinality
+-			if (get.function.name == "ducklake_scan" && get.function.function_info) {
++				if (get.function.name == "ducklake_scan" && get.function.function_info) {
+ 				string cat_name = get.GetTable()->ParentCatalog().GetName();
+ 				string schema_name = get.GetTable()->schema.name;
+ 				ts.delta_table_name = ts.table_name; // DuckLake stores bare name
+diff --git a/src/upsert/openivm_index_regen.cpp b/src/upsert/openivm_index_regen.cpp
+index 3252495..5ccc8a4 100644
+--- a/src/upsert/openivm_index_regen.cpp
++++ b/src/upsert/openivm_index_regen.cpp
+@@ -32,21 +32,21 @@ RenumberWrapper renumber_table_indices(unique_ptr<LogicalOperator> plan, Binder
+ 	case LogicalOperatorType::LOGICAL_AGGREGATE_AND_GROUP_BY: {
+ 		unique_ptr<LogicalAggregate> agg_ptr = unique_ptr_cast<LogicalOperator, LogicalAggregate>(std::move(plan));
+ 		{
+-			const idx_t old_gr_idx = agg_ptr->group_index;
+-			const idx_t new_gr_idx = binder.GenerateTableIndex();
++			const TableIndex old_gr_idx = agg_ptr->group_index;
++			const TableIndex new_gr_idx = binder.GenerateTableIndex();
+ 			agg_ptr->group_index = new_gr_idx;
+ 			table_reassign[old_gr_idx] = new_gr_idx;
+ 		}
+ 		{
+-			const idx_t old_ag_idx = agg_ptr->aggregate_index;
+-			const idx_t new_ag_idx = binder.GenerateTableIndex();
++			const TableIndex old_ag_idx = agg_ptr->aggregate_index;
++			const TableIndex new_ag_idx = binder.GenerateTableIndex();
+ 			agg_ptr->aggregate_index = new_ag_idx;
+ 			table_reassign[old_ag_idx] = new_ag_idx;
+ 		}
+ 		{
+-			const idx_t old_gs_idx = agg_ptr->groupings_index;
+-			if (old_gs_idx != DConstants::INVALID_INDEX) {
+-				const idx_t new_gs_idx = binder.GenerateTableIndex();
++			const TableIndex old_gs_idx = agg_ptr->groupings_index;
++			if (old_gs_idx.IsValid()) {
++				const TableIndex new_gs_idx = binder.GenerateTableIndex();
+ 				agg_ptr->groupings_index = new_gs_idx;
+ 				table_reassign[old_gs_idx] = new_gs_idx;
+ 			}
+@@ -56,33 +56,33 @@ RenumberWrapper renumber_table_indices(unique_ptr<LogicalOperator> plan, Binder
+ 	}
+ 	case LogicalOperatorType::LOGICAL_GET: {
+ 		unique_ptr<LogicalGet> get_ptr = unique_ptr_cast<LogicalOperator, LogicalGet>(std::move(plan));
+-		const idx_t current_idx = get_ptr->table_index;
+-		const idx_t new_idx = binder.GenerateTableIndex();
++		const TableIndex current_idx = get_ptr->table_index;
++		const TableIndex new_idx = binder.GenerateTableIndex();
+ 		get_ptr->table_index = new_idx;
+ 		table_reassign[current_idx] = new_idx;
+ #if OPENIVM_DEBUG
+-		OPENIVM_DEBUG_PRINT("Index regen LOGICAL_GET: Change %zu -> %zu\n", current_idx, new_idx);
++		OPENIVM_DEBUG_PRINT("Index regen LOGICAL_GET: Change %zu -> %zu\n", current_idx.index, new_idx.index);
+ #endif
+ 		get_ptr->children = std::move(rec_children);
+ 		return {std::move(get_ptr), table_reassign, current_bindings};
+ 	}
+ 	case LogicalOperatorType::LOGICAL_DELIM_GET: {
+ 		unique_ptr<LogicalDelimGet> delim_get_ptr = unique_ptr_cast<LogicalOperator, LogicalDelimGet>(std::move(plan));
+-		const idx_t current_idx = delim_get_ptr->table_index;
+-		const idx_t new_idx = binder.GenerateTableIndex();
++		const TableIndex current_idx = delim_get_ptr->table_index;
++		const TableIndex new_idx = binder.GenerateTableIndex();
+ 		delim_get_ptr->table_index = new_idx;
+ 		table_reassign[current_idx] = new_idx;
+ #if OPENIVM_DEBUG
+-		OPENIVM_DEBUG_PRINT("Index regen LOGICAL_DELIM_GET: Change %zu -> %zu\n", current_idx, new_idx);
++		OPENIVM_DEBUG_PRINT("Index regen LOGICAL_DELIM_GET: Change %zu -> %zu\n", current_idx.index, new_idx.index);
+ #endif
+ 		return {std::move(delim_get_ptr), table_reassign, current_bindings};
+ 	}
+ 	case LogicalOperatorType::LOGICAL_PROJECTION: {
+ 		unique_ptr<LogicalProjection> proj_ptr = unique_ptr_cast<LogicalOperator, LogicalProjection>(std::move(plan));
+-		const idx_t current_idx = proj_ptr->table_index;
+-		const idx_t new_idx = binder.GenerateTableIndex();
++		const TableIndex current_idx = proj_ptr->table_index;
++		const TableIndex new_idx = binder.GenerateTableIndex();
+ #if OPENIVM_DEBUG
+-		OPENIVM_DEBUG_PRINT("Index regen LOGICAL_PROJECTION: Change %zu -> %zu\n", current_idx, new_idx);
++		OPENIVM_DEBUG_PRINT("Index regen LOGICAL_PROJECTION: Change %zu -> %zu\n", current_idx.index, new_idx.index);
+ #endif
+ 		proj_ptr->table_index = new_idx;
+ 		table_reassign[current_idx] = new_idx;
+@@ -93,8 +93,8 @@ RenumberWrapper renumber_table_indices(unique_ptr<LogicalOperator> plan, Binder
+ 	case LogicalOperatorType::LOGICAL_EXCEPT:
+ 	case LogicalOperatorType::LOGICAL_INTERSECT: {
+ 		auto &setop = plan->Cast<LogicalSetOperation>();
+-		const idx_t current_idx = setop.table_index;
+-		const idx_t new_idx = binder.GenerateTableIndex();
++		const TableIndex current_idx = setop.table_index;
++		const TableIndex new_idx = binder.GenerateTableIndex();
+ 		setop.table_index = new_idx;
+ 		table_reassign[current_idx] = new_idx;
+ 		plan->children = std::move(rec_children);
+@@ -110,13 +110,13 @@ RenumberWrapper renumber_table_indices(unique_ptr<LogicalOperator> plan, Binder
+ 		std::unordered_map<old_idx, new_idx> local_remap;
+ 		for (auto &cb : empty.bindings) {
+ 			auto it = local_remap.find(cb.table_index);
+-			idx_t new_t;
++			TableIndex new_t;
+ 			if (it == local_remap.end()) {
+ 				new_t = binder.GenerateTableIndex();
+ 				local_remap[cb.table_index] = new_t;
+ 				table_reassign[cb.table_index] = new_t;
+ #if OPENIVM_DEBUG
+-				OPENIVM_DEBUG_PRINT("Index regen LOGICAL_EMPTY_RESULT: Change %zu -> %zu\n", cb.table_index, new_t);
++				OPENIVM_DEBUG_PRINT("Index regen LOGICAL_EMPTY_RESULT: Change %zu -> %zu\n", cb.table_index.index, new_t.index);
+ #endif
+ 			} else {
+ 				new_t = it->second;
+@@ -140,7 +140,7 @@ RenumberWrapper renumber_table_indices(unique_ptr<LogicalOperator> plan, Binder
+ // Walk every expression in the operator tree and collect all referenced ColumnBindings.
+ static uint64_t HashBinding(const ColumnBinding &b) {
+ 	// Mix both indices to avoid collisions for large table indices
+-	return std::hash<idx_t>()(b.table_index) ^ (std::hash<idx_t>()(b.column_index) * 0x9e3779b97f4a7c15ULL);
++	return std::hash<idx_t>()(b.table_index.index) ^ (std::hash<idx_t>()(b.column_index.index) * 0x9e3779b97f4a7c15ULL);
+ }
+ 
+ static bool ContainsDelimOperator(LogicalOperator &op) {
+@@ -159,7 +159,7 @@ static bool ContainsDelimOperator(LogicalOperator &op) {
+ static void CollectAllBindings(LogicalOperator &op, std::unordered_set<uint64_t> &seen,
+                                std::vector<ColumnBinding> &out) {
+ 	std::function<void(Expression &)> CollectExpr = [&](Expression &e) {
+-		if (e.type == ExpressionType::BOUND_COLUMN_REF) {
++		if (e.GetExpressionType() == ExpressionType::BOUND_COLUMN_REF) {
+ 			auto &bcr = e.Cast<BoundColumnRefExpression>();
+ 			uint64_t key = HashBinding(bcr.binding);
+ 			if (seen.insert(key).second) {
+@@ -191,11 +191,11 @@ static void CollectAllBindings(LogicalOperator &op, std::unordered_set<uint64_t>
+ 	    op.type == LogicalOperatorType::LOGICAL_DEPENDENT_JOIN) {
+ 		auto &join = op.Cast<LogicalComparisonJoin>();
+ 		for (auto &cond : join.conditions) {
+-			if (cond.left) {
+-				CollectExpr(*cond.left);
++			if (cond.LeftReference()) {
++				CollectExpr(*cond.LeftReference());
+ 			}
+-			if (cond.right) {
+-				CollectExpr(*cond.right);
++			if (cond.RightReference()) {
++				CollectExpr(*cond.RightReference());
+ 			}
+ 		}
+ 		for (auto &expr : join.duplicate_eliminated_columns) {
+@@ -204,9 +204,7 @@ static void CollectAllBindings(LogicalOperator &op, std::unordered_set<uint64_t>
+ 			}
+ 			CollectExpr(*expr);
+ 		}
+-		if (join.predicate) {
+-			CollectExpr(*join.predicate);
+-		}
++		
+ 	}
+ 	if (op.type == LogicalOperatorType::LOGICAL_DEPENDENT_JOIN) {
+ 		auto &join = op.Cast<LogicalDependentJoin>();
+@@ -245,7 +243,7 @@ static void CollectAllBindings(LogicalOperator &op, std::unordered_set<uint64_t>
+ //   - LogicalAggregate::groups (GROUP BY expressions, also outside op.expressions)
+ static void RebindSkippedExpressions(LogicalOperator &op, const std::unordered_map<old_idx, new_idx> &table_mapping) {
+ 	std::function<void(Expression &)> RebindExpr = [&](Expression &e) {
+-		if (e.type == ExpressionType::BOUND_COLUMN_REF) {
++		if (e.GetExpressionType() == ExpressionType::BOUND_COLUMN_REF) {
+ 			auto &bcr = e.Cast<BoundColumnRefExpression>();
+ 			auto it = table_mapping.find(bcr.binding.table_index);
+ 			if (it != table_mapping.end()) {
+@@ -268,11 +266,11 @@ static void RebindSkippedExpressions(LogicalOperator &op, const std::unordered_m
+ 	    op.type == LogicalOperatorType::LOGICAL_DEPENDENT_JOIN) {
+ 		auto &join = op.Cast<LogicalComparisonJoin>();
+ 		for (auto &cond : join.conditions) {
+-			if (cond.left) {
+-				RebindExpr(*cond.left);
++			if (cond.LeftReference()) {
++				RebindExpr(*cond.LeftReference());
+ 			}
+-			if (cond.right) {
+-				RebindExpr(*cond.right);
++			if (cond.RightReference()) {
++				RebindExpr(*cond.RightReference());
+ 			}
+ 		}
+ 		for (auto &expr : join.duplicate_eliminated_columns) {
+@@ -281,9 +279,7 @@ static void RebindSkippedExpressions(LogicalOperator &op, const std::unordered_m
+ 			}
+ 			RebindExpr(*expr);
+ 		}
+-		if (join.predicate) {
+-			RebindExpr(*join.predicate);
+-		}
++		
+ 	}
+ 	if (op.type == LogicalOperatorType::LOGICAL_DEPENDENT_JOIN) {
+ 		auto &join = op.Cast<LogicalDependentJoin>();
+@@ -338,7 +334,7 @@ ColumnBindingReplacer vec_to_replacer(const std::vector<ColumnBinding> &bindings
+ 		if (!seen.insert(key).second) {
+ 			continue;
+ 		}
+-		new_idx new_t = table_mapping.at(cb.table_index);
++		TableIndex new_t = table_mapping.at(cb.table_index);
+ 		replacer.replacement_bindings.emplace_back(cb, ColumnBinding(new_t, cb.column_index));
+ 	}
+ 	return replacer;
+diff --git a/third_party/lpts b/third_party/lpts
+--- a/third_party/lpts
++++ b/third_party/lpts
+@@ -1 +1 @@
+-Subproject commit 8f31c24ef619c46571be785dde5dbf70fb7fadf6
++Subproject commit 8f31c24ef619c46571be785dde5dbf70fb7fadf6-dirty

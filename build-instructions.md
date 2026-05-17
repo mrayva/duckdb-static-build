@@ -1,11 +1,12 @@
 # DuckDB Static Build Runbook
 
-This document captures the complete build workflow implemented by `build-duckdb-static.sh`, including clean-environment setup and the spatial-specific dependency caveat.
+This document captures the build workflow implemented by `build-duckdb-static.sh`, including clean-environment setup and the spatial-specific dependency caveat.
 
 ## 1. Prerequisites
 
 - Linux x64
 - `git`, `cmake` (3.15+), `make`, `gcc`, `g++`, `sed`, `awk`, `python3`, `cargo`, `rustc`
+- `xxd` for spatial builds
 - vcpkg at `~/vcpkg` (or pass `--vcpkg-dir`)
 - Enough disk space (`/tmp` can fill quickly; ~20GB+ recommended for fresh runs)
 
@@ -40,33 +41,13 @@ CCACHE_DISABLE=1 ./build-duckdb-static.sh \
   --clean
 ```
 
-To include experimental robust RPT:
+To include OpenIVM:
 
 ```bash
 CCACHE_DISABLE=1 ./build-duckdb-static.sh \
   --duckdb-dir /tmp/duckdb-clean/duckdbsrc \
   --vcpkg-dir "$HOME/vcpkg" \
-  --with-robust-rpt \
-  --clean
-```
-
-To build and validate a COPY-safe binary that excludes robust RPT:
-
-```bash
-CCACHE_DISABLE=1 ./build-duckdb-static.sh \
-  --duckdb-dir /tmp/duckdb-clean/duckdbsrc \
-  --vcpkg-dir "$HOME/vcpkg" \
-  --copy-tests \
-  --clean
-```
-
-To include experimental aggjoin:
-
-```bash
-CCACHE_DISABLE=1 ./build-duckdb-static.sh \
-  --duckdb-dir /tmp/duckdb-clean/duckdbsrc \
-  --vcpkg-dir "$HOME/vcpkg" \
-  --with-aggjoin \
+  --with-openivm \
   --clean
 ```
 
@@ -77,6 +58,7 @@ You may need to allow:
 1. Network access for:
 - `git clone` of DuckDB
 - FetchContent extension repos during CMake configure
+- OpenIVM source checkout when `--with-openivm` is used
 
 2. Temporary directory cleanup when `/tmp` is full:
 - `rm -rf /tmp/<old-build-dir>`
@@ -94,28 +76,22 @@ The script performs these exact phases:
 5. Writes `extension/extension_config_local.cmake` with the externally managed extensions that should start with DuckDB.
 6. Patches selected extension config files:
 - removes `DONT_LINK` where needed (`fts`, `vss`, `postgres_scanner`)
-- injects required `INCLUDE_DIR` entries.
-7. Writes patch files under `.github/patches/extensions/` for:
-- `postgres_scanner` static build target + include/link wiring
-- `delta` rustls feature selection (avoids problematic native-tls/OpenSSL path)
-- `robust` current-DuckDB compatibility when `--with-robust-rpt` is used
-- `aggjoin` current-DuckDB compatibility when `--with-aggjoin` is used
-8. Optional dependency install (unless `--skip-vcpkg`):
+- injects required `INCLUDE_DIR` entries
+- prepares OpenIVM source when `--with-openivm` is passed
+7. Optional dependency install (unless `--skip-vcpkg`):
 - AWS SDK components
 - Azure SDK components
 - roaring
+- libmariadb for `mysql_scanner`
 - Spatial dependencies when `--with-spatial` is used: GDAL, PROJ, GEOS, SQLite with RTREE, curl, OpenSSL, zlib, expat
-- OpenSSL when `--with-robust-rpt` is used
-- None for `--copy-tests` because `robust` is excluded entirely
-- No extra vcpkg packages for `--with-aggjoin`
-9. Configures out-of-source build at `<duckdb-dir>/build/release-static` with:
+8. Configures out-of-source build at `<duckdb-dir>/build/release-static` with:
 - vcpkg toolchain
 - `-DVCPKG_MANIFEST_MODE=OFF`
 - linker flag `--allow-multiple-definition`
-10. Merges global and extension-local `vcpkg_installed` trees.
-11. When `--with-spatial` is used, regenerates spatial's embedded `proj_db.c` from the matching vcpkg `proj.db`.
-12. Builds with `EXTENSION_STATIC_BUILD=1 make -j$(nproc)`.
-13. Verifies runtime by counting loaded extensions from `duckdb_extensions()`.
+9. Merges global and extension-local `vcpkg_installed` trees.
+10. When `--with-spatial` is used, regenerates spatial's embedded `proj_db.c` from the matching vcpkg `proj.db`.
+11. Builds with `EXTENSION_STATIC_BUILD=1 make -j$(nproc)`.
+12. Verifies runtime by counting loaded extensions from `duckdb_extensions()`.
 
 ## 5. Output/Success Criteria
 
@@ -126,8 +102,19 @@ On success, you should see:
 - `All 24 extensions loaded successfully!`
 
 With `--with-spatial`, expect 25 loaded extensions and a larger binary.
+With both `--with-spatial --with-openivm`, expect 26 loaded extensions.
 
-With `--with-robust-rpt` or `--with-aggjoin`, expect one additional loaded extension per flag. Combining `--with-spatial --with-robust-rpt --with-aggjoin` should produce 27 loaded extensions.
+Current known-good verification matrix:
+- `--clean`
+- `--skip-vcpkg`
+- `--with-spatial`
+- `--with-openivm`
+
+That matrix built successfully with:
+- Binary at `/tmp/duckdbsrc-exec/build/release-static/duckdb`
+- Size `199M`
+- `All 26 extensions loaded successfully!`
+- `./duckdb -version` returned `v1.6.0-dev1450 (Development Version) 0bf859fca7`
 
 ## 6. Fast Rebuilds
 
@@ -181,32 +168,13 @@ If you pass `--skip-vcpkg`, these vcpkg packages must already be installed:
 gdal[geos] proj geos expat sqlite3[rtree] curl openssl zlib libmariadb
 ```
 
-## 9. Robust RPT Extension
+## 9. OpenIVM Extension
 
-`robust-labs/robust` is integrated behind `--with-robust-rpt`. It is not included by default because it requires patching upstream extension code for current DuckDB APIs.
-For COPY-related validation, use `--copy-tests` so the static build excludes `robust` entirely and then runs the COPY repro harness against the resulting binary.
+`openivm` is integrated behind `--with-openivm`.
 
-Observed bisect outcome:
-- The COPY crash only reproduces when `robust` is loaded into the static build.
-- The following compatibility shims were tested individually and did not by themselves reproduce the crash when reverted/restored one at a time: `probe_empty_registry`, `robust_profiling`, `robust_optimizer` cleanup/body changes, `table_manager` index access, `physical_create_filter`, `physical_probe_filter`, `logical_probe_filter`, and `dag_printer`.
-- The practical build-time mitigation is to keep `robust` out of COPY validation entirely via `--copy-tests`.
+It is now part of the current known-good verification matrix on this DuckDB snapshot.
 
-The script pins robust to:
-
-```text
-5ec7800e000291e27f7433cb513ba606fc675fc1
-```
-
-The compatibility patch handles:
-- The missing upstream `probe_empty_registry.hpp` include.
-- `TableIndex` becoming a wrapper type instead of a raw `idx_t`.
-- `ProjectionIndex` being required for dynamic table filter pushdown.
-- Protected expression type access moving to `GetExpressionType()`.
-- `GetTableIndex()` returning `TableIndex` values.
-
-Focused validation performed:
-- CMake configure loaded `robust` from `robust-labs/robust` at `5ec7800`.
-- `cmake --build ... --target robust_extension duckdb -j4` completed successfully against DuckDB `ae0aec232a` / `v1.6.0-dev5563`.
+The integration still relies on a maintained local patch because OpenIVM and its bundled `lpts` subtree need API-drift fixes for current DuckDB.
 
 Preferred recipe:
 
@@ -215,43 +183,11 @@ cd /home/mrayva/duckdbbld
 CCACHE_DISABLE=1 ./build-duckdb-static.sh \
   --duckdb-dir /tmp/duckdb-clean/duckdbsrc \
   --vcpkg-dir "$HOME/vcpkg" \
-  --with-robust-rpt \
+  --with-openivm \
   --clean
 ```
 
-## 10. AggJoin Extension
-
-`arselzer/duckdb_aggjoin` is integrated behind `--with-aggjoin`. It is not included by default because it requires patching upstream extension code for current DuckDB APIs.
-
-The script pins aggjoin to:
-
-```text
-5f4b64ac879b13662142bd7624784a4ad709393c
-```
-
-The compatibility patch handles:
-- Protected function/expression fields replaced with `GetName()`, `GetReturnType()`, and `GetExpressionType()`.
-- `TableIndex` and `ProjectionIndex` wrapper conversions.
-- Private `JoinCondition` fields replaced with accessors/constructor use.
-- Mutable vector writes moved to `FlatVector::GetDataMutable()` / `ValidityMutable()`.
-
-Focused validation performed:
-- CMake configure loaded `aggjoin` from `arselzer/duckdb_aggjoin` at `5f4b64a`.
-- `cmake --build ... --target aggjoin_extension duckdb -j4` completed successfully against DuckDB `ae0aec232a` / `v1.6.0-dev5563`.
-- Full script validation with `--skip-vcpkg --with-aggjoin` produced a 153MB binary with 25 loaded extensions, including `aggjoin`.
-
-Preferred recipe:
-
-```bash
-cd /home/mrayva/duckdbbld
-CCACHE_DISABLE=1 ./build-duckdb-static.sh \
-  --duckdb-dir /tmp/duckdb-clean/duckdbsrc \
-  --vcpkg-dir "$HOME/vcpkg" \
-  --with-aggjoin \
-  --clean
-```
-
-## 11. Troubleshooting
+## 10. Troubleshooting
 
 ### `/tmp` out of space
 

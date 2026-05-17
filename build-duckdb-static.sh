@@ -4,8 +4,6 @@ set -euo pipefail
 # DuckDB Static Build Script
 # Builds DuckDB with 24 statically-linked core extensions
 # Optionally adds the spatial extension for a 25-extension build
-# Optionally adds robust-labs/robust RPT as an experimental extension
-# Optionally adds arselzer/duckdb_aggjoin as an experimental extension
 # Optionally adds ila/openivm as an experimental extension
 # Usage: ./build-duckdb-static.sh [options]
 #   Options:
@@ -14,10 +12,7 @@ set -euo pipefail
 #     --skip-vcpkg       Skip vcpkg dependency installation
 #     --clean            Clean build before starting
 #     --with-spatial     Include spatial as a statically-linked extension
-#     --with-robust-rpt  Include robust-labs/robust RPT as a statically-linked extension
-#     --with-aggjoin     Include arselzer/duckdb_aggjoin as a statically-linked extension
 #     --with-openivm     Include ila/openivm as a statically-linked extension
-#     --copy-tests       Build and validate a COPY-safe binary that excludes robust RPT
 #     --help             Show this help
 
 # Colors for output
@@ -30,19 +25,20 @@ NC='\033[0m' # No Color
 # Default paths
 VCPKG_DIR="$HOME/vcpkg"
 DUCKDB_DIR="$HOME/duckdbsrc"
+BUILD_SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 SKIP_VCPKG=false
 CLEAN_BUILD=false
 WITH_SPATIAL=false
+WITH_OPENIVM=false
 WITH_ROBUST_RPT=false
 WITH_AGGJOIN=false
-WITH_OPENIVM=false
 COPY_TESTS=false
-ROBUST_BISECT_MINIMAL_EXTENSIONS=${ROBUST_BISECT_MINIMAL_EXTENSIONS:-false}
-ROBUST_PATCH_CURRENT_COMPAT=${ROBUST_PATCH_CURRENT_COMPAT:-true}
-ROBUST_PATCH_EXCEPTION_SAFE_CLEANUP=${ROBUST_PATCH_EXCEPTION_SAFE_CLEANUP:-true}
-ROBUST_PATCH_PROBE_EMPTY_REGISTRY_CLEANUP=${ROBUST_PATCH_PROBE_EMPTY_REGISTRY_CLEANUP:-true}
-ROBUST_PATCH_SKIP_COPY_OPTIMIZATION=${ROBUST_PATCH_SKIP_COPY_OPTIMIZATION:-true}
-ROBUST_LOCAL_DIR=${ROBUST_LOCAL_DIR:-/tmp/robust-patched}
+ROBUST_BISECT_MINIMAL_EXTENSIONS=false
+ROBUST_PATCH_CURRENT_COMPAT=false
+ROBUST_PATCH_EXCEPTION_SAFE_CLEANUP=false
+ROBUST_PATCH_PROBE_EMPTY_REGISTRY_CLEANUP=false
+ROBUST_PATCH_SKIP_COPY_OPTIMIZATION=false
+ROBUST_LOCAL_DIR=${ROBUST_LOCAL_DIR:-/tmp/robust-labs-robust}
 
 require_cmd() {
     local cmd="$1"
@@ -86,258 +82,6 @@ sanitize_dirty_fetchcontent_deps() {
     fi
 }
 
-run_copy_repro_validation() {
-    local repro_dir repro_src repro_bin ld_library_path exit_code
-
-    repro_dir=$(mktemp -d /tmp/duckdb-copy-repro.XXXXXX)
-    repro_src="$repro_dir/copy_repro.cpp"
-    repro_bin="$repro_dir/copy_repro"
-
-    cat > "$repro_src" <<'EOF'
-#include "duckdb.h"
-#include <cstdlib>
-#include <cstdio>
-#include <cstring>
-#include <string>
-using std::string;
-
-struct MyCopyFunctionExtraInfo { idx_t illegal_min_value = 42; };
-struct MyCopyFunctionBindData { idx_t max_size; idx_t min_size; };
-struct MyCopyFunctionGlobalState {
-    idx_t total_written_bytes = 0;
-    duckdb_file_system file_system = nullptr;
-    duckdb_file_handle file_handle = nullptr;
-    ~MyCopyFunctionGlobalState() {
-        if (file_handle) {
-            duckdb_destroy_file_handle(&file_handle);
-        }
-        if (file_system) {
-            duckdb_destroy_file_system(&file_system);
-        }
-    }
-};
-
-static void MyCopyFunctionBind(duckdb_copy_function_bind_info info) {
-    auto options = duckdb_copy_function_bind_get_options(info);
-    if (!options) {
-        duckdb_copy_function_bind_set_error(info, "No options given!");
-        return;
-    }
-    auto options_type = duckdb_get_value_type(options);
-    if (duckdb_get_type_id(options_type) != DUCKDB_TYPE_STRUCT) {
-        duckdb_destroy_value(&options);
-        duckdb_copy_function_bind_set_error(info, "No options given!");
-        return;
-    }
-    auto struct_size = duckdb_struct_type_child_count(options_type);
-    if (struct_size > 2) {
-        duckdb_destroy_value(&options);
-        duckdb_copy_function_bind_set_error(info, "Too many options given!");
-        return;
-    }
-    int32_t min_size = 0, max_size = 0;
-    for (idx_t i = 0; i < struct_size; i++) {
-        auto child_name = duckdb_struct_type_child_name(options_type, i);
-        auto child_value = duckdb_get_struct_child(options, i);
-        auto child_type = duckdb_get_value_type(child_value);
-        if (duckdb_get_type_id(child_type) != DUCKDB_TYPE_INTEGER) {
-            duckdb_destroy_value(&options);
-            duckdb_destroy_value(&child_value);
-            duckdb_free(child_name);
-            duckdb_copy_function_bind_set_error(info, "Options must be of type INT");
-            return;
-        }
-        if (strcmp(child_name, "MAX_SIZE") == 0) {
-            max_size = duckdb_get_int32(child_value);
-        } else if (strcmp(child_name, "MIN_SIZE") == 0) {
-            min_size = duckdb_get_int32(child_value);
-        } else {
-            duckdb_destroy_value(&options);
-            duckdb_destroy_value(&child_value);
-            duckdb_free(child_name);
-            duckdb_copy_function_bind_set_error(info, "Unknown option given");
-            return;
-        }
-        duckdb_free(child_name);
-        duckdb_destroy_value(&child_value);
-    }
-    if (max_size < 0) {
-        duckdb_destroy_value(&options);
-        duckdb_copy_function_bind_set_error(info, "MAX_SIZE must be >= 0");
-        return;
-    }
-    if (min_size < 0) {
-        duckdb_destroy_value(&options);
-        duckdb_copy_function_bind_set_error(info, "MIN_SIZE must be >= 0");
-        return;
-    }
-    duckdb_destroy_value(&options);
-    auto column_count = duckdb_copy_function_bind_get_column_count(info);
-    if (column_count != 1) {
-        duckdb_copy_function_bind_set_error(info, "Expected exactly one column");
-        return;
-    }
-    auto column_type = duckdb_copy_function_bind_get_column_type(info, 0);
-    if (duckdb_get_type_id(column_type) != DUCKDB_TYPE_BIGINT) {
-        duckdb_copy_function_bind_set_error(info, "Expected column of type BIGINT");
-        duckdb_destroy_logical_type(&column_type);
-        return;
-    }
-    auto my_bind_data = new MyCopyFunctionBindData();
-    my_bind_data->max_size = max_size;
-    my_bind_data->min_size = min_size;
-    duckdb_copy_function_bind_set_bind_data(info, my_bind_data, [](void *bind_data) {
-        delete (MyCopyFunctionBindData *)bind_data;
-    });
-    duckdb_destroy_logical_type(&column_type);
-}
-
-static void MyCopyFunctionInit(duckdb_copy_function_global_init_info info) {
-    auto bind_data = (MyCopyFunctionBindData *)duckdb_copy_function_global_init_get_bind_data(info);
-    auto extra_info = (MyCopyFunctionExtraInfo *)duckdb_copy_function_global_init_get_extra_info(info);
-    auto client_context = duckdb_copy_function_global_init_get_client_context(info);
-    if (bind_data->min_size == extra_info->illegal_min_value) {
-        duckdb_copy_function_global_init_set_error(info, "My bad, min_size cannot be set to that value!");
-        duckdb_destroy_client_context(&client_context);
-        return;
-    }
-    auto g_state = new MyCopyFunctionGlobalState();
-    duckdb_copy_function_global_init_set_global_state(info, g_state, [](void *state) {
-        delete (MyCopyFunctionGlobalState *)state;
-    });
-    g_state->file_system = duckdb_client_context_get_file_system(client_context);
-    auto file_path = duckdb_copy_function_global_init_get_file_path(info);
-    auto file_flag = duckdb_create_file_open_options();
-    duckdb_file_open_options_set_flag(file_flag, DUCKDB_FILE_FLAG_WRITE, true);
-    duckdb_file_open_options_set_flag(file_flag, DUCKDB_FILE_FLAG_CREATE, true);
-    if (duckdb_file_system_open(g_state->file_system, file_path, file_flag, &g_state->file_handle) != DuckDBSuccess) {
-        auto error_data = duckdb_file_system_error_data(g_state->file_system);
-        duckdb_copy_function_global_init_set_error(info, duckdb_error_data_message(error_data));
-        duckdb_destroy_error_data(&error_data);
-    }
-    duckdb_destroy_file_open_options(&file_flag);
-    duckdb_destroy_client_context(&client_context);
-}
-
-static void MyCopyFunctionSink(duckdb_copy_function_sink_info info, duckdb_data_chunk input) {
-    auto bind_data = (MyCopyFunctionBindData *)duckdb_copy_function_sink_get_bind_data(info);
-    auto g_state = (MyCopyFunctionGlobalState *)duckdb_copy_function_sink_get_global_state(info);
-    auto row_count = duckdb_data_chunk_get_size(input);
-    auto col_vec = duckdb_data_chunk_get_vector(input, 0);
-    auto col_data = (int64_t *)duckdb_vector_get_data(col_vec);
-    for (idx_t r = 0; r < row_count; r++) {
-        auto written = duckdb_file_handle_write(g_state->file_handle, &col_data[r], sizeof(int64_t));
-        if (written != sizeof(int64_t)) {
-            auto error_data = duckdb_file_handle_error_data(g_state->file_handle);
-            duckdb_copy_function_sink_set_error(info, duckdb_error_data_message(error_data));
-            duckdb_destroy_error_data(&error_data);
-            return;
-        }
-        g_state->total_written_bytes += written;
-        if (g_state->total_written_bytes > bind_data->max_size) {
-            duckdb_copy_function_sink_set_error(info, "Wrote too much data");
-            return;
-        }
-    }
-}
-
-static void MyCopyFunctionFinalize(duckdb_copy_function_finalize_info info) {
-    auto bind_data = (MyCopyFunctionBindData *)duckdb_copy_function_finalize_get_bind_data(info);
-    auto g_state = (MyCopyFunctionGlobalState *)duckdb_copy_function_finalize_get_global_state(info);
-    if (g_state->total_written_bytes < bind_data->min_size) {
-        duckdb_copy_function_finalize_set_error(info, "Wrote too little data");
-        return;
-    }
-}
-
-static void exec_query(duckdb_connection con, const string &q, bool expect_success) {
-    duckdb_result r;
-    fprintf(stderr, "RUN: %s\n", q.c_str());
-    auto st = duckdb_query(con, q.c_str(), &r);
-    auto err = duckdb_result_error(&r);
-    fprintf(stderr, " -> %d %s\n", (int)st, err ? err : "(no error)");
-    bool ok = expect_success ? (st == DuckDBSuccess) : (st != DuckDBSuccess);
-    duckdb_destroy_result(&r);
-    if (!ok) {
-        fprintf(stderr, "unexpected %s\n", expect_success ? "failure" : "success");
-        exit(1);
-    }
-}
-
-int main() {
-    duckdb_database db;
-    duckdb_connection con;
-    if (duckdb_open(nullptr, &db) != DuckDBSuccess) {
-        fprintf(stderr, "duckdb_open failed\n");
-        return 1;
-    }
-    if (duckdb_connect(db, &con) != DuckDBSuccess) {
-        fprintf(stderr, "duckdb_connect failed\n");
-        duckdb_close(&db);
-        return 1;
-    }
-
-    auto func = duckdb_create_copy_function();
-    duckdb_copy_function_set_extra_info(func, new MyCopyFunctionExtraInfo(), [](void *data) {
-        delete (MyCopyFunctionExtraInfo *)data;
-    });
-    duckdb_copy_function_set_name(func, "my_copy");
-    duckdb_copy_function_set_bind(func, MyCopyFunctionBind);
-    duckdb_copy_function_set_global_init(func, MyCopyFunctionInit);
-    duckdb_copy_function_set_sink(func, MyCopyFunctionSink);
-    duckdb_copy_function_set_finalize(func, MyCopyFunctionFinalize);
-
-    auto scan_func = duckdb_create_table_function();
-    auto varchar_type = duckdb_create_logical_type(DUCKDB_TYPE_VARCHAR);
-    auto int_type = duckdb_create_logical_type(DUCKDB_TYPE_INTEGER);
-    duckdb_table_function_add_parameter(scan_func, varchar_type);
-    duckdb_table_function_add_named_parameter(scan_func, "MAX_SIZE", int_type);
-    duckdb_table_function_add_named_parameter(scan_func, "MIN_SIZE", int_type);
-    duckdb_table_function_set_name(scan_func, "my_copy");
-    duckdb_destroy_logical_type(&varchar_type);
-    duckdb_destroy_logical_type(&int_type);
-    duckdb_copy_function_set_copy_from_function(func, scan_func);
-    duckdb_destroy_table_function(&scan_func);
-
-    auto register_status = duckdb_register_copy_function(con, func);
-    fprintf(stderr, "register=%d\n", (int)register_status);
-    if (register_status != DuckDBSuccess) {
-        fprintf(stderr, "copy function registration failed\n");
-        duckdb_destroy_copy_function(&func);
-        duckdb_disconnect(&con);
-        duckdb_close(&db);
-        return 1;
-    }
-
-    const string fp = "/tmp/copy_safe_repro";
-    exec_query(con, "COPY (SELECT i FROM range(10) as r(i)) TO '" + fp + "_1.txt' (FORMAT MY_COPY, MIN_SIZE 2000, MAX_SIZE 1000)", false);
-    exec_query(con, "COPY (SELECT i FROM range(10) as r(i)) TO '" + fp + "_2.txt' (FORMAT MY_COPY, MIN_SIZE 0, MAX_SIZE 100)", true);
-
-    duckdb_destroy_copy_function(&func);
-    duckdb_disconnect(&con);
-    duckdb_close(&db);
-    return 0;
-}
-EOF
-
-    log_info "Compiling COPY repro harness..."
-    g++ -std=c++17 -O2 -I"$DUCKDB_DIR/src/include" "$repro_src" \
-        -L"$BUILD_DIR/src" -Wl,-rpath,"$BUILD_DIR/src" -lduckdb -lpthread -ldl -lm \
-        -o "$repro_bin"
-
-    log_info "Running COPY repro harness against COPY-safe binary..."
-    if env LD_LIBRARY_PATH="$BUILD_DIR/src${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}" "$repro_bin"; then
-        log_success "COPY repro passed"
-        rm -rf "$repro_dir"
-        return 0
-    fi
-
-    exit_code=$?
-    log_error "COPY repro failed with exit code $exit_code"
-    rm -rf "$repro_dir"
-    return "$exit_code"
-}
-
 # Parse arguments
 while [[ $# -gt 0 ]]; do
   case $1 in
@@ -369,20 +113,8 @@ while [[ $# -gt 0 ]]; do
       WITH_SPATIAL=true
       shift
       ;;
-    --with-robust-rpt)
-      WITH_ROBUST_RPT=true
-      shift
-      ;;
-    --with-aggjoin)
-      WITH_AGGJOIN=true
-      shift
-      ;;
     --with-openivm)
       WITH_OPENIVM=true
-      shift
-      ;;
-    --copy-tests)
-      COPY_TESTS=true
       shift
       ;;
     --help)
@@ -414,15 +146,14 @@ log_error() {
 
 # Check prerequisites
 log_info "Checking prerequisites..."
-for cmd in git cmake make gcc g++ sed awk nproc python3 cargo rustc; do
+for cmd in git cmake make sed awk nproc python3; do
+    require_cmd "$cmd"
+done
+for cmd in gcc g++ cargo rustc; do
     require_cmd "$cmd"
 done
 if [ "$WITH_SPATIAL" = true ]; then
     require_cmd xxd
-fi
-if [ "$COPY_TESTS" = true ] && [ "$WITH_ROBUST_RPT" = true ]; then
-    log_warning "COPY-safe mode requested; ignoring --with-robust-rpt for this build"
-    WITH_ROBUST_RPT=false
 fi
 log_success "All prerequisites found"
 
@@ -2574,343 +2305,9 @@ if [ "$WITH_OPENIVM" = true ]; then
     # Avoid pulling other nested LPTS submodules (duckdb clone, sqlstorm, skills).
     git -C "$OPENIVM_LOCAL_DIR" submodule update --init third_party/lpts
     git -C "$OPENIVM_LOCAL_DIR/third_party/lpts" submodule update --init third_party/ducklake
+    git -C "$OPENIVM_LOCAL_DIR/third_party/lpts" reset --hard HEAD
     log_info "Applying OpenIVM compatibility patch for current DuckDB APIs..."
-    OPENIVM_LPTS_PIPELINE="$OPENIVM_LOCAL_DIR/third_party/lpts/src/lpts_pipeline.cpp"
-    perl -0pi -e '
-      s|#include "storage/ducklake_scan.hpp"|#include "duckdb.hpp"\n#define TableIndex DuckLakeTableIndex\n#include "storage/ducklake_scan.hpp"\n#undef TableIndex|g;
-      s/\bexpr\.type\b/expr.GetExpressionType()/g;
-      s/->type/->GetExpressionType()/g;
-      s/->GetExpressionType\(\) (==|!=) LogicalOperatorType/->type $1 LogicalOperatorType/g;
-      s/op->GetExpressionType\(\)/op->type/g;
-      s/\.return_type/.GetReturnType()/g;
-      s/empty\.GetReturnType\(\)s/empty.return_types/g;
-      s/\bref\.alias\.empty\(\)/!ref.HasAlias()/g;
-      s/\bref\.alias\b/ref.GetAlias()/g;
-      s/function\.name/function.GetName()/g;
-      s/window\.aggregate->name/window.aggregate->GetName()/g;
-      s/func\.function\.bind_lambda != nullptr/func.bind_info/g;
-      s/func_expr\.function\.bind_lambda != nullptr/func_expr.bind_info/g;
-      s/func_expr\.function\.arguments/func_expr.function.GetArguments()/g;
-      s/get\.function\.arguments/get.function.GetArguments()/g;
-      s/aggregate\.function\.name/aggregate.function.GetName()/g;
-      s/ba\.function\.name/ba.function.GetName()/g;
-      s/\(unsigned long long\)([A-Za-z0-9_\.\[\]]+\.table_index)/(unsigned long long)$1.index/g;
-      s/std::to_string\(([A-Za-z0-9_\.\[\]]+\.table_index)\)/std::to_string($1.index)/g;
-      s/(\\w+)\.table_index\]/$1.table_index.index]/g;
-      s/(\\w+)\.table_index\] =/$1.table_index.index] =/g;
-      s/out\.push_back\(([^;]+?)\.table_index\)/out.push_back($1.table_index.index)/g;
-      s/const idx_t ([A-Za-z_]+) = ([A-Za-z0-9_\.]+\.(?:window_index|group_index|aggregate_index|table_index));/const idx_t $1 = $2.index;/g;
-      s/const idx_t table_index = unnest\.unnest_index;/const idx_t table_index = unnest.unnest_index.index;/g;
-      s/const idx_t cte_index = cte_ref\.cte_index;/const idx_t cte_index = cte_ref.cte_index.index;/g;
-      s/const idx_t dg_ti = dg\.table_index;/const idx_t dg_ti = dg.table_index.index;/g;
-      s/const idx_t table_index = dg\.table_index;/const idx_t table_index = dg.table_index.index;/g;
-      s/auto col_struct = make_uniq<ColStruct>\(([^,\n]+\.table_index),/auto col_struct = make_uniq<ColStruct>($1.index,/g;
-      s/make_uniq<AstMaterializedCteNode>\(([^)]+\.table_index)\)/make_uniq<AstMaterializedCteNode>($1.index)/g;
-      s/materialized_cte_body_column_names\[([^\]]+\.table_index)\]/materialized_cte_body_column_names[$1.index]/g;
-      s/const ColumnBinding new_cb\(table_index, i\);/const ColumnBinding new_cb(TableIndex(table_index), ProjectionIndex(i));/g;
-      s/ColumnBinding new_cb\(table_index, i\)/ColumnBinding new_cb(TableIndex(table_index), ProjectionIndex(i))/g;
-      s/ColumnBinding new_cb\(group_table_index, i\)/ColumnBinding new_cb(TableIndex(group_table_index), ProjectionIndex(i))/g;
-      s/ColumnBinding mark_cb\((join_op|dj)\.mark_index, 0\)/ColumnBinding mark_cb(TableIndex($1.mark_index), ProjectionIndex(0))/g;
-      s/make_uniq<ColStruct>\((join_op|dj)\.mark_index, mark_expr, \"_mark\"\)/make_uniq<ColStruct>(DConstants::INVALID_INDEX, mark_expr, "_mark")/g;
-      s/\bColumnBinding\(([^,\n]+), ([A-Za-z0-9_]+)\)/ColumnBinding($1, ProjectionIndex($2))/g;
-      s/\bColumnBinding\(([^,\n]+), 0\)/ColumnBinding($1, ProjectionIndex(0))/g;
-      s/\bColumnBinding\(([^,\n]+), i\)/ColumnBinding($1, ProjectionIndex(i))/g;
-      s/ColumnBinding\((dg_ti|table_index|group_table_index|agg_table_index), ProjectionIndex\(/ColumnBinding(TableIndex($1), ProjectionIndex(/g;
-      s/const ColumnBinding new_cb\(TableIndex\(([^)]+)\), ProjectionIndex\(([^)]+)\)\);/const ColumnBinding new_cb{TableIndex($1), ProjectionIndex($2)};/g;
-      s/ColumnBinding new_cb\(TableIndex\(([^)]+)\), ProjectionIndex\(([^)]+)\)\);/ColumnBinding new_cb{TableIndex($1), ProjectionIndex($2)};/g;
-      s/ColumnBinding mark_cb\((join_op|dj)\.mark_index, ProjectionIndex\(0\)\)/ColumnBinding mark_cb(TableIndex(DConstants::INVALID_INDEX), ProjectionIndex(0))/g;
-      s/std::to_string\((join_op|dj)\.mark_index\)/std::to_string(DConstants::INVALID_INDEX)/g;
-      s/make_uniq<ColStruct>\((join_op|dj)\.mark_index\.index,/make_uniq<ColStruct>(DConstants::INVALID_INDEX,/g;
-      s/cond\.comparison/cond.GetComparisonType()/g;
-      s/\*cond\.left/*cond.LeftReference()/g;
-      s/\*cond\.right/*cond.RightReference()/g;
-      s/cond\.left->/cond.LeftReference()->/g;
-      s/cond\.right->/cond.RightReference()->/g;
-      s/RegisterChildBindingFallbacks\(\*cond\.left/RegisterChildBindingFallbacks(*cond.LeftReference()/g;
-      s/RegisterChildBindingFallbacks\(\*cond\.right/RegisterChildBindingFallbacks(*cond.RightReference()/g;
-      s/ExpressionToAliasedString\(cond\.left\)/ExpressionToAliasedString(cond.LeftReference())/g;
-      s/ExpressionToAliasedString\(cond\.right\)/ExpressionToAliasedString(cond.RightReference())/g;
-      s/join_op\.conditions\[0\]\.right/join_op.conditions[0].RightReference()/g;
-      s/dj\.conditions\[0\]\.right/dj.conditions[0].RightReference()/g;
-      s/dj\.conditions\[0\]\.left/dj.conditions[0].LeftReference()/g;
-      s/const LogicalComparisonJoin &dj = op->Cast<LogicalComparisonJoin>\(\);/auto \&dj = op->Cast<LogicalComparisonJoin>();/g;
-      s/const LogicalComparisonJoin &join_op = op->Cast<LogicalComparisonJoin>\(\);/auto \&join_op = op->Cast<LogicalComparisonJoin>();/g;
-      s/const auto &cond/auto \&cond/g;
-      s/ExpressionClass::BOUND_COMPARISON/ExpressionClass::BOUND_FUNCTION/g;
-      s/expression->Cast<BoundComparisonExpression>\(\)/expression->Cast<BoundFunctionExpression>()/g;
-      s/const BoundComparisonExpression &cmp = expression->Cast<BoundFunctionExpression>\(\);/const BoundFunctionExpression \&cmp = expression->Cast<BoundFunctionExpression>();/g;
-      s/cmp\.left/BoundComparisonExpression::Left(cmp)/g;
-      s/cmp\.right/BoundComparisonExpression::Right(cmp)/g;
-      s/cmp\.GetExpressionType\(\)/expression->GetExpressionType()/g;
-      s/\n\t\tif \(window\.offset_expr\) \{\n\t\t\tif \(!window\.children\.empty\(\)\) \{\n\t\t\t\tresult << ", ";\n\t\t\t\}\n\t\t\tresult << ExpressionToAliasedString\(window\.offset_expr\);\n\t\t\}//gs;
-      s/\n\t\tif \(window\.default_expr\) \{\n\t\t\tif \(!window\.children\.empty\(\) \|\| window\.offset_expr\) \{\n\t\t\t\tresult << ", ";\n\t\t\t\}\n\t\t\tresult << ExpressionToAliasedString\(window\.default_expr\);\n\t\t\}//gs;
-      s/if \(!get\.table_filters\.filters\.empty\(\)\) \{\n\t\t\t\tfor \(auto &entry : get\.table_filters\.filters\) \{\n\t\t\t\t\tstring filter_str = entry\.second->ToString\(get\.names\[entry\.first\]\);/if (get.table_filters.HasFilters()) {\n\t\t\t\tfor (auto \&entry : get.table_filters) {\n\t\t\t\t\tstring filter_str = entry.Filter().ToString(get.names[entry.GetIndex()]);/g;
-      s/\.table_index\.index\.index/.table_index.index/g;
-      s/const idx_t dg_ti = dg\.table_index;/const idx_t dg_ti = dg.table_index.index;/g;
-      s/const idx_t table_index = dg\.table_index;/const idx_t table_index = dg.table_index.index;/g;
-      s/\(unsigned long long\)dg\.table_index\.index/(unsigned long long)dg.table_index/g;
-    ' "$OPENIVM_LPTS_PIPELINE"
-    perl -0pi -e '
-      s/(case ExpressionClass::BOUND_FUNCTION: \{\n\t\t\tconst BoundFunctionExpression &func_expr = expression->Cast<BoundFunctionExpression>\(\);)/$1\n\t\t\tif (BoundComparisonExpression::IsComparison(*expression)) {\n\t\t\t\texpr_str << "(";\n\t\t\t\texpr_str << ExpressionToAliasedString(func_expr.children[0]);\n\t\t\t\texpr_str << ") ";\n\t\t\t\texpr_str << ExpressionTypeToOperator(expression->GetExpressionType());\n\t\t\t\texpr_str << " (";\n\t\t\t\texpr_str << ExpressionToAliasedString(func_expr.children[1]);\n\t\t\t\texpr_str << ")";\n\t\t\t\tbreak;\n\t\t\t}/g;
-    ' "$OPENIVM_LPTS_PIPELINE"
-    OPENIVM_EXTENSION="$OPENIVM_LOCAL_DIR/src/openivm_extension.cpp"
-    perl -0pi -e '
-      s/\n\tConnection con\(instance\);\n.*?\n\tauto ivm_parser = duckdb::IVMParserExtension\(\);/\n\tauto ivm_parser = duckdb::IVMParserExtension();/s;
-      s/\n\tcon.BeginTransaction\(\);\n\tauto \&catalog = Catalog::GetSystemCatalog\(\*con.context\);\n\tivm_func.name = "DoIVM";\n\tivm_func.named_parameters\["view_catalog_name"\];\n\tivm_func.named_parameters\["view_schema_name"\];\n\tivm_func.named_parameters\["view_name"\];\n\tCreateTableFunctionInfo ivm_func_info\(ivm_func\);\n\tcatalog.CreateTableFunction\(\*con.context, &ivm_func_info\);\n\tcon.Commit\(\);\n//s;
-      s/\n\t\/\/ Start the refresh daemon unless disabled \(e\.g\. shadow\/compile-only DBs\)\.\n.*?\n\}/\n/s;
-      s/(db_config\.AddExtensionOption\("ivm_explain_initial_load_only",\n\t\s*"diagnose CREATE MATERIALIZED VIEW initial load without executing DDL",\n\t\s*LogicalType::BOOLEAN, Value::BOOLEAN\(false\)\);\n)/$1\n\n\t\/\/ Keep static startup inert. OpenIVM remains buildable as a loadable\n\t\/\/ extension, but its parser\/optimizer hooks are not safe to auto-load in\n\t\/\/ the current static build.\n\treturn;/s;
-    ' "$OPENIVM_EXTENSION"
-    OPENIVM_PARSER="$OPENIVM_LOCAL_DIR/src/core/openivm_parser.cpp"
-	    sed -i \
-	      -e 's/binding.table_index/binding.table_index.index/g' \
-      -e 's|#include "storage/ducklake_scan.hpp"|#define TableIndex DuckLakeTableIndex\
-#include "storage/ducklake_scan.hpp"|g' \
-      -e 's|#include "storage/ducklake_table_entry.hpp"|#include "storage/ducklake_table_entry.hpp"\
-#undef TableIndex|g' \
-      -e 's/expr->expression_class/expr->GetExpressionClass()/g' \
-      -e 's/expr->type/expr->GetExpressionType()/g' \
-      -e 's/ord.expression->alias/ord.expression->GetAlias()/g' \
-      -e 's/condition.left/condition.LeftReference()/g' \
-      -e 's/condition.right/condition.RightReference()/g' \
-      -e 's/cond.left/cond.LeftReference()/g' \
-      -e 's/cond.right/cond.RightReference()/g' \
-      -e 's/expr->alias.empty() ? expr->GetName() : expr->alias/expr->HasAlias() ? expr->GetAlias() : expr->GetName()/g' \
-      -e 's/expr->alias.empty()/expr->HasAlias()/g' \
-      -e 's/expr->alias/expr->GetAlias()/g' \
-      -e 's/!projection\.expressions\[idx\]->alias\.empty()/projection.expressions[idx]->HasAlias()/g' \
-      -e 's/projection\.expressions\[idx\]->alias\.empty()/!projection.expressions[idx]->HasAlias()/g' \
-      -e 's/projection\.expressions\[idx\]->alias/projection.expressions[idx]->GetAlias()/g' \
-      -e 's/!aggregate\.expressions\[expr_idx\]->alias\.empty()/aggregate.expressions[expr_idx]->HasAlias()/g' \
-      -e 's/aggregate\.expressions\[expr_idx\]->alias\.empty()/!aggregate.expressions[expr_idx]->HasAlias()/g' \
-      -e 's/aggregate\.expressions\[expr_idx\]->alias/aggregate.expressions[expr_idx]->GetAlias()/g' \
-      -e 's/bound_agg.function.name/bound_agg.function.GetName()/g' \
-      -e 's/bound.function.name/bound.function.GetName()/g' \
-      -e 's/bound\.children\[0\]->expression_class/bound.children[0]->GetExpressionClass()/g' \
-      -e 's/bcr.alias.empty()/bcr.HasAlias()/g' \
-      -e 's/bcr.alias/bcr.GetAlias()/g' \
-      -e 's/bound.alias/bound.GetAlias()/g' \
-      -e 's/cond.LeftReference()->type/cond.LeftReference()->GetExpressionType()/g' \
-      -e 's/cond.RightReference()->type/cond.RightReference()->GetExpressionType()/g' \
-      -e 's/->type != ExpressionType::BOUND_COLUMN_REF/->GetExpressionType() != ExpressionType::BOUND_COLUMN_REF/g' \
-      -e 's/->type == ExpressionType::BOUND_COLUMN_REF/->GetExpressionType() == ExpressionType::BOUND_COLUMN_REF/g' \
-      -e 's/projections_by_index\[proj\.table_index\]/projections_by_index[proj.table_index.index]/g' \
-      -e 's/proj_by_index\[proj\.table_index\]/proj_by_index[proj.table_index.index]/g' \
-      -e 's/get_by_index\[get\.table_index\]/get_by_index[get.table_index.index]/g' \
-      -e 's/cte_ref_count\[cte_ref\.cte_index\]/cte_ref_count[cte_ref.cte_index.index]/g' \
-      -e 's/FindGroupColumns(root, projections_by_index, agg.group_index,/FindGroupColumns(root, projections_by_index, agg.group_index.index,/g' \
-      -e 's/TableIndex table_index = bcr->binding.table_index.index;/idx_t table_index = bcr->binding.table_index.index;/g' \
-      -e 's/unordered_map<TableIndex, unordered_set<idx_t>> join_key_cols/unordered_map<idx_t, unordered_set<idx_t>> join_key_cols/g' \
-      -e 's/if (!expr->HasAlias()) {/if (expr->HasAlias()) {/g' \
-	      -e 's/distinct_sum_arg = bcr.HasAlias() ? bcr.GetName() : bcr.GetAlias()/distinct_sum_arg = bcr.HasAlias() ? bcr.GetAlias() : bcr.GetName()/g' \
-	      "$OPENIVM_PARSER"
-	    OPENIVM_CHECKER="$OPENIVM_LOCAL_DIR/src/core/ivm_checker.cpp"
-	    sed -i \
-	      -e 's/expr\.type/expr.GetExpressionType()/g' \
-	      -e 's/expr->expression_class/expr->GetExpressionClass()/g' \
-	      -e 's/child\.expression_class/child.GetExpressionClass()/g' \
-	      -e 's/part->type/part->GetExpressionType()/g' \
-	      -e 's/bcr.alias.empty()/bcr.HasAlias()/g' \
-	      -e 's/bcr.alias/bcr.GetAlias()/g' \
-	      -e 's/function.name/function.GetName()/g' \
-	      -e 's/result\.group_index = agg->group_index;/result.group_index = agg->group_index.index;/g' \
-	      "$OPENIVM_CHECKER"
-	    OPENIVM_PLAN_REWRITE="$OPENIVM_LOCAL_DIR/src/core/ivm_plan_rewrite.cpp"
-	    perl -0pi -e '
-	      s/make_uniq<BoundAggregateExpression>\(std::move\(([^)]+)\),/make_uniq<BoundAggregateExpression>(BoundAggregateFunction($1),/g;
-	      s/make_uniq<BoundComparisonExpression>\((ExpressionType::[A-Z_]+),\s*std::move\(([^)]+)\),\s*make_uniq<BoundConstantExpression>\(([^;]+?)\)\)/BoundComparisonExpression::Create($1, std::move($2), make_uniq<BoundConstantExpression>($3))/gs;
-	      s/\bidx_t group_index = binder\.GenerateTableIndex\(\);/TableIndex group_index = binder.GenerateTableIndex();/g;
-	      s/\bidx_t aggregate_index = binder\.GenerateTableIndex\(\);/TableIndex aggregate_index = binder.GenerateTableIndex();/g;
-	      s/\bidx_t cte_index = cte\.table_index;/TableIndex cte_index = cte.table_index;/g;
-	      s/\bidx_t proj_table_index = binder\.GenerateTableIndex\(\);/TableIndex proj_table_index = binder.GenerateTableIndex();/g;
-	      s/\((unsigned long(?: long)?)((?:)[^)]+\.table_index)\)/(\\1)\\2.index/g;
-	      s/\((uint64_t)([^;\n]*?\.table_index)\)/(\\1)\\2.index/g;
-	      s/\(unsigned long\)ref\.table_index/(unsigned long)ref.table_index.index/g;
-	      s/\(unsigned long long\)proj\.table_index/(unsigned long long)proj.table_index.index/g;
-	      s/\(uint64_t\)([^;\n]*?\.table_index)/(uint64_t)$1.index/g;
-	      s/ColumnBinding\(([^,\n]+), ([^)]+)\)/ColumnBinding($1, ProjectionIndex($2))/g;
-	      s/grouping_set\.insert\(([^)]+)\)/grouping_set.insert(ProjectionIndex($1))/g;
-	      s/proj_map\.push_back\(([^)]+)\)/proj_map.push_back(ProjectionIndex($1))/g;
-	      s/filter\.projection_map\.push_back\(([^)]+)\)/filter.projection_map.push_back(ProjectionIndex($1))/g;
-	      s/(\b\w+)->alias = ([^;]+);/$1->SetAlias($2);/g;
-	      s/(\b\w+)\.alias\.empty\(\)/!$1.HasAlias()/g;
-	      s/(\b\w+)\.alias/$1.GetAlias()/g;
-	      s/->alias/->GetAlias()/g;
-	      s/->expression_class/->GetExpressionClass()/g;
-	      s/\.expression_class/.GetExpressionClass()/g;
-	      s/->type/->GetExpressionType()/g;
-	      s/\.type/.GetExpressionType()/g;
-	      s/->return_type/->GetReturnType()/g;
-	      s/\.return_type/.GetReturnType()/g;
-	      s/function\.name/function.GetName()/g;
-	      s/ref\.cte_index != cte_index/ref.cte_index != cte_index/g;
-	      s/\(unsigned long\)ref\.cte_index/(unsigned long)ref.cte_index.index/g;
-	      s/bcr\.binding\.column_index = ([^;]+);/bcr.binding.column_index = ProjectionIndex($1);/g;
-	      s/old_binding_to_decomp\[key\] = &d;/old_binding_to_decomp[key] = \&d;/g;
-	      s/ExpressionClass::BOUND_COMPARISON/ExpressionClass::BOUND_FUNCTION/g;
-	      s/auto &comp = expr\.Cast<BoundComparisonExpression>\(\);//g;
-	      s/HavingExprToSQL\(\*comp\.left, binding_to_alias\) \+ " " \+ ExpressionTypeToOperator\(comp\.GetExpressionType\(\)\) \+ " " \+\s*HavingExprToSQL\(\*comp\.right, binding_to_alias\)/HavingExprToSQL(BoundComparisonExpression::Left(expr.Cast<BoundFunctionExpression>()), binding_to_alias) + " " + ExpressionTypeToOperator(expr.GetExpressionType()) + " " + HavingExprToSQL(BoundComparisonExpression::Right(expr.Cast<BoundFunctionExpression>()), binding_to_alias)/gs;
-	      s/comp\.left/BoundComparisonExpression::Left(expr.Cast<BoundFunctionExpression>())/g;
-	      s/comp\.right/BoundComparisonExpression::Right(expr.Cast<BoundFunctionExpression>())/g;
-	      s/comp\.GetExpressionType\(\)/expr.GetExpressionType()/g;
-	      s/condition\.left/condition.LeftReference()/g;
-	      s/condition\.right/condition.RightReference()/g;
-	      s/condition\.comparison/condition.Comparison()/g;
-	      s/->GetExpressionType\(\) ([!=]= LogicalOperatorType::)/->type $1/g;
-	      s/->GetExpressionType\(\)s/->types/g;
-	      s/\.GetExpressionType\(\)s/.types/g;
-	      s/\bd\.GetAlias\(\)/d.alias/g;
-	      s/bound\.alias/bound.GetAlias()/g;
-	      s/ColumnBinding\(agg\.aggregate_index, d\.old_idx\)/ColumnBinding(agg.aggregate_index, ProjectionIndex(d.old_idx))/g;
-	      s/ColumnBinding\(agg\.aggregate_index, new_agg_idx\)/ColumnBinding(agg.aggregate_index, ProjectionIndex(new_agg_idx))/g;
-	      s/agg\.aggregate_index, d\.old_idx/agg.aggregate_index, ProjectionIndex(d.old_idx)/g;
-	      s/agg\.aggregate_index, new_agg_idx/agg.aggregate_index, ProjectionIndex(new_agg_idx)/g;
-	      s/\(uint64_t\)agg\.aggregate_index/(uint64_t)agg.aggregate_index.index/g;
-	      s/plan->GetExpressionType\(\) == type/plan->type == type/g;
-	      s/std::move\(right_count_func\)/BoundAggregateFunction(right_count_func)/g;
-	      s/ColumnBinding\(proj\.table_index, ProjectionIndex\(proj\.expressions\.size\(\)\) - 1\)/ColumnBinding(proj.table_index, ProjectionIndex(proj.expressions.size() - 1))/g;
-	      s/ColumnBinding\(b\.first, ProjectionIndex\(b\.second\)\)/ColumnBinding(TableIndex(b.first), ProjectionIndex(b.second))/g;
-	      s/out\.insert\(\{col\.binding\.table_index, col\.binding\.column_index\}\)/out.insert({col.binding.table_index.index, col.binding.column_index})/g;
-	      s/b\.first != agg_child\.aggregate_index/b.first != agg_child.aggregate_index.index/g;
-	    ' "$OPENIVM_PLAN_REWRITE"
-	    for ducklake_include_file in \
-	      "$OPENIVM_LOCAL_DIR/src/upsert/openivm_cost_model.cpp" \
-	      "$OPENIVM_LOCAL_DIR/src/rules/helpers.cpp" \
-	      "$OPENIVM_LOCAL_DIR/src/rules/ducklake_join.cpp"; do
-	      sed -i \
-	        -e 's|#include "storage/ducklake_scan.hpp"|#define TableIndex DuckLakeTableIndex\
-#include "storage/ducklake_scan.hpp"\
-#undef TableIndex|g' \
-	        "$ducklake_include_file"
-	    done
-	    OPENIVM_DUCKLAKE_JOIN_RULE="$OPENIVM_LOCAL_DIR/src/rules/ducklake_join.cpp"
-	    perl -0pi -e '
-	      s/\(uint64_t\)(binding|mul_binding|term_bindings\[c\])\.table_index/((uint64_t)$1.table_index.index)/g;
-	      s/cond\.comparison/cond.GetComparisonType()/g;
-	      s/\*cond\.left/*cond.LeftReference()/g;
-	      s/\*cond\.right/*cond.RightReference()/g;
-	      s/static void PinToOldSnapshot\(LogicalOperator &op, idx_t table_index/static void PinToOldSnapshot(LogicalOperator \&op, TableIndex table_index/g;
-	      s/get\.function\.name/get.function.GetName()/g;
-	      s/first_get->function\.name/first_get->function.GetName()/g;
-	      s/old_get->function\.name/old_get->function.GetName()/g;
-	      s/\(unsigned long\)table_index/(unsigned long)table_index.index/g;
-	    ' "$OPENIVM_DUCKLAKE_JOIN_RULE"
-	    OPENIVM_HELPERS="$OPENIVM_LOCAL_DIR/src/rules/helpers.cpp"
-	    perl -0pi -e '
-	      s/static DeltaGetResult RemapMulType\(ClientContext &context, unique_ptr<LogicalOperator> delta_node,\n\s*idx_t output_table_index/static DeltaGetResult RemapMulType(ClientContext \&context, unique_ptr<LogicalOperator> delta_node,\n                                       TableIndex output_table_index/gs;
-	      s/static DeltaGetResult RemapDeltaNode\(ClientContext &context, unique_ptr<LogicalOperator> delta_node,\n\s*idx_t output_table_index/static DeltaGetResult RemapDeltaNode(ClientContext \&context, unique_ptr<LogicalOperator> delta_node,\n                                     TableIndex output_table_index/gs;
-	      s/static DeltaGetResult CompactDeltaNode\(ClientContext &context, Binder &binder, unique_ptr<LogicalOperator> delta_node,\n\s*idx_t output_table_index/static DeltaGetResult CompactDeltaNode(ClientContext \&context, Binder \&binder, unique_ptr<LogicalOperator> delta_node,\n                                       TableIndex output_table_index/gs;
-	      s/ColumnBinding\((output_table_index|old_get->table_index), ([^)]+)\)/ColumnBinding($1, ProjectionIndex($2))/g;
-	      s/ColumnBinding\(output_table_index, input_bindings\.size\(\) - 1\)/ColumnBinding(output_table_index, ProjectionIndex(input_bindings.size() - 1))/g;
-	      s/ColumnBinding remapped_mul\(output_table_index, input_bindings\.size\(\) - 1\)/ColumnBinding remapped_mul(output_table_index, ProjectionIndex(input_bindings.size() - 1))/g;
-	      s/ColumnBinding compact_mul_binding\(output_table_index, base_col_count\)/ColumnBinding compact_mul_binding(output_table_index, ProjectionIndex(base_col_count))/g;
-	      s/make_uniq<LogicalProjection>\(output_table_index,/make_uniq<LogicalProjection>(output_table_index,/g;
-	      s/make_uniq<BoundAggregateExpression>\(std::move\(([^)]+)\),/make_uniq<BoundAggregateExpression>(BoundAggregateFunction($1),/g;
-	      s/->alias = ([^;]+);/->SetAlias($1);/g;
-	      s/grouping_set\.insert\(([^)]+)\)/grouping_set.insert(ProjectionIndex($1))/g;
-	      s/make_uniq<BoundComparisonExpression>\((ExpressionType::[A-Z_]+),\s*make_uniq<BoundColumnRefExpression>\(([^;]+?)\),\s*make_uniq<BoundConstantExpression>\(([^;]+?)\)\)/BoundComparisonExpression::Create($1, make_uniq<BoundColumnRefExpression>($2), make_uniq<BoundConstantExpression>($3))/gs;
-	      s/auto filter_expr = make_uniq<BoundComparisonExpression>\(\s*ExpressionType::COMPARE_NOTEQUAL,\s*make_uniq<BoundColumnRefExpression>\(([^;]+?)\),\s*make_uniq<BoundConstantExpression>\(([^;]+?)\)\);/auto filter_expr = BoundComparisonExpression::Create(ExpressionType::COMPARE_NOTEQUAL, make_uniq<BoundColumnRefExpression>($1), make_uniq<BoundConstantExpression>($2));/gs;
-	      s/bindings\.emplace_back\(table_index, i\)/bindings.emplace_back(table_index, ProjectionIndex(i))/g;
-	      s/\[&\]\(DuckLakeScanType scan_type, idx_t table_idx\)/[&](DuckLakeScanType scan_type, TableIndex table_idx)/g;
-	      s/table_filters\.filters\[ts_filter_key\] = std::move\(table_filter\)/table_filters.SetFilterByColumnIndex(ProjectionIndex(ts_filter_key), std::move(table_filter))/g;
-	      s/projection_ids\.push_back\((i|n_base)\)/projection_ids.push_back(ProjectionIndex($1))/g;
-	      s/\(unsigned long\)new_mul_binding\.table_index/(unsigned long)new_mul_binding.table_index.index/g;
-	      s/old_get->table_index, new_mul_binding/old_get->table_index, new_mul_binding/g;
-	    ' "$OPENIVM_HELPERS"
-	    OPENIVM_INDEX_REGEN_HDR="$OPENIVM_LOCAL_DIR/src/include/upsert/openivm_index_regen.hpp"
-	    sed -i \
-	      -e 's/using old_idx = idx_t;/using old_idx = TableIndex;/g' \
-	      -e 's/using new_idx = idx_t;/using new_idx = TableIndex;/g' \
-	      "$OPENIVM_INDEX_REGEN_HDR"
-	    OPENIVM_INDEX_REGEN="$OPENIVM_LOCAL_DIR/src/upsert/openivm_index_regen.cpp"
-	    perl -0pi -e '
-	      s/const idx_t (old_(?:gr|ag|gs)_idx) =/const TableIndex $1 =/g;
-	      s/const idx_t (current_idx) =/const TableIndex $1 =/g;
-	      s/const idx_t (new_(?:gr|ag|gs)_idx|new_idx) =/const TableIndex $1 =/g;
-	      s/idx_t new_t;/TableIndex new_t;/g;
-	      s/old_gs_idx != DConstants::INVALID_INDEX/old_gs_idx.IsValid()/g;
-	      s/b\.table_index\)/b.table_index.index)/g;
-	      s/cb\.table_index\)/cb.table_index.index)/g;
-	      s/(current_idx|new_idx|new_t)\)/$1.index)/g;
-	      s/cb\.table_index, new_t/cb.table_index.index, new_t.index/g;
-	      s/e\.type/e.GetExpressionType()/g;
-	      s/cond\.left/cond.LeftReference()/g;
-	      s/cond\.right/cond.RightReference()/g;
-	      s/if \(join\.predicate\) \{\s*(?:CollectExpr|RebindExpr)\(\*join\.predicate\);\s*\}//gs;
-	      s/table_mapping\.find\(([^)]*?\.table_index)\)/table_mapping.find($1)/g;
-	      s/table_mapping\.at\(([^)]*?\.table_index)\)/table_mapping.at($1)/g;
-	      s/ColumnBinding\(new_t, cb\.column_index\)/ColumnBinding(new_t, cb.column_index)/g;
-	      s/local_remap\.find\(cb\.table_index\.index\)/local_remap.find(cb.table_index)/g;
-	      s/table_mapping\.find\(cb\.table_index\.index\)/table_mapping.find(cb.table_index)/g;
-	      s/table_mapping\.at\(cb\.table_index\.index\)/table_mapping.at(cb.table_index)/g;
-	      s/new_t\.index\.index/new_t.index/g;
-	      s/, current_idx, new_idx\.index/, current_idx.index, new_idx.index/g;
-	    ' "$OPENIVM_INDEX_REGEN"
-	    OPENIVM_REWRITE_RULE="$OPENIVM_LOCAL_DIR/src/rules/openivm_rewrite_rule.cpp"
-	    perl -0pi -e '
-	      s/std::max\(max_idx, b\.table_index\)/std::max(max_idx, b.table_index.index)/g;
-	      s/static void UpdateCteRefsWithMul\(LogicalOperator \*node, idx_t cte_table_index/static void UpdateCteRefsWithMul(LogicalOperator *node, TableIndex cte_table_index/g;
-	      s/\(unsigned long\)cte_table_index/(unsigned long)cte_table_index.index/g;
-	      s/plan->expressions\[i\]->return_type/plan->expressions[i]->GetReturnType()/g;
-	      s/idx_t cte_table_index = cte\.table_index/TableIndex cte_table_index = cte.table_index/g;
-	      s/input\.optimizer\.binder\.GenerateTableIndex\(\) <= max_idx/input.optimizer.binder.GenerateTableIndex().index <= max_idx/g;
-	    ' "$OPENIVM_REWRITE_RULE"
-	    OPENIVM_INSERT_RULE="$OPENIVM_LOCAL_DIR/src/rules/openivm_insert_rule.cpp"
-	    perl -0pi -e '
-	      s/expr->type/expr->GetExpressionType()/g;
-	      s/value->type/value->GetExpressionType()/g;
-	      s/col_ref\.alias/col_ref.GetAlias()/g;
-	      s/condition\.left/condition.LeftReference()/g;
-	      s/condition\.right/condition.RightReference()/g;
-	      s/!get->table_filters\.filters\.empty\(\)/get->table_filters.HasFilters()/g;
-	      s/get->table_filters\.filters/get->table_filters/g;
-	      s/ColumnIndex\(entry\.first\)/ColumnIndex(entry.GetIndex())/g;
-	      s/entry\.second->ToString\(col_name\)/entry.Filter().ToString(col_name)/g;
-	    ' "$OPENIVM_INSERT_RULE"
-	    sed -i \
-	      -e 's/expr->return_type/expr->GetReturnType()/g' \
-	      -e 's/(unsigned long)new_mul_binding\.table_index/(unsigned long)new_mul_binding.table_index.index/g' \
-	      "$OPENIVM_LOCAL_DIR/src/rules/projection.cpp"
-	    OPENIVM_AGGREGATE_RULE="$OPENIVM_LOCAL_DIR/src/rules/aggregate.cpp"
-	    perl -0pi -e '
-	      s/mod_mul_binding\.column_index = modified_node->groups\.size\(\);/mod_mul_binding.column_index = ProjectionIndex(modified_node->groups.size());/g;
-	      s/modified_node->grouping_sets = \{\{0\}\};/modified_node->grouping_sets.clear();\n\t\tmodified_node->grouping_sets.push_back(GroupingSet());\n\t\tmodified_node->grouping_sets[0].insert(ProjectionIndex(0));/g;
-	      s/grouping_sets\[0\]\.insert\(gr\)/grouping_sets[0].insert(ProjectionIndex(gr))/g;
-	      s/\(unsigned long\)mod_mul_binding\.table_index/(unsigned long)mod_mul_binding.table_index.index/g;
-	    ' "$OPENIVM_AGGREGATE_RULE"
-	    OPENIVM_JOIN_RULE="$OPENIVM_LOCAL_DIR/src/rules/join.cpp"
-	    perl -0pi -e '
-	      s/\(uint64_t\)binding\.table_index/((uint64_t)binding.table_index.index)/g;
-	      s/cond\.comparison/cond.GetComparisonType()/g;
-	      s/\*cond\.left/*cond.LeftReference()/g;
-	      s/\*cond\.right/*cond.RightReference()/g;
-	      s/proj_map\.push_back\(mul_idx\)/proj_map.push_back(ProjectionIndex(mul_idx))/g;
-	      s/bindings\.emplace_back\(table_index, i\)/bindings.emplace_back(table_index, ProjectionIndex(i))/g;
-	      s/\(unsigned long\)new_mul_binding\.table_index/(unsigned long)new_mul_binding.table_index.index/g;
-	    ' "$OPENIVM_JOIN_RULE"
-	    OPENIVM_DELIM_JOIN_RULE="$OPENIVM_LOCAL_DIR/src/rules/delim_join.cpp"
-	    perl -0pi -e '
-	      s/proj_map\.push_back\(mul_idx\)/proj_map.push_back(ProjectionIndex(mul_idx))/g;
-	      s/expr->type/expr->GetExpressionType()/g;
-	      s/col_ref\.return_type/col_ref.GetReturnType()/g;
-	      s/\(uint64_t\)(mb|term_bindings\[i\])\.table_index/((uint64_t)$1.table_index.index)/g;
-	      s/if \(condition\.left\) \{\s*replacer\.VisitExpression\(&condition\.left\);\s*\}\s*if \(condition\.right\) \{\s*replacer\.VisitExpression\(&condition\.right\);\s*\}/if (condition.IsComparison()) {\n\t\t\t\treplacer.VisitExpression(\&condition.LeftReference());\n\t\t\t\treplacer.VisitExpression(\&condition.RightReference());\n\t\t\t} else {\n\t\t\t\treplacer.VisitExpression(\&condition.JoinExpressionReference());\n\t\t\t}/gs;
-	      s/\s*if \(join\.predicate\) \{\s*replacer\.VisitExpression\(&join\.predicate\);\s*\}//gs;
-	    ' "$OPENIVM_DELIM_JOIN_RULE"
-	    OPENIVM_DISTINCT_RULE="$OPENIVM_LOCAL_DIR/src/rules/distinct.cpp"
-	    perl -0pi -e '
-	      s/idx_t group_index = binder\.GenerateTableIndex\(\);/TableIndex group_index = binder.GenerateTableIndex();/g;
-	      s/idx_t aggregate_index = binder\.GenerateTableIndex\(\);/TableIndex aggregate_index = binder.GenerateTableIndex();/g;
-	      s/make_uniq<BoundAggregateExpression>\(std::move\(count_star_func\),/make_uniq<BoundAggregateExpression>(BoundAggregateFunction(count_star_func),/g;
-	      s/count_expr->alias = ([^;]+);/count_expr->SetAlias($1);/g;
-	      s/grouping_set\.insert\(agg_node->groups\.size\(\)\)/grouping_set.insert(ProjectionIndex(agg_node->groups.size()))/g;
-	      s/mod_mul_binding\.column_index = agg_node->groups\.size\(\);/mod_mul_binding.column_index = ProjectionIndex(agg_node->groups.size());/g;
-	      s/ColumnBinding new_binding\(group_index, group_position\);/ColumnBinding new_binding(group_index, ProjectionIndex(group_position));/g;
-	      s/\(unsigned long\)mod_mul_binding\.table_index/(unsigned long)mod_mul_binding.table_index.index/g;
-	    ' "$OPENIVM_DISTINCT_RULE"
-	    OPENIVM_CMAKE="$OPENIVM_LOCAL_DIR/CMakeLists.txt"
-	    perl -0pi -e '
-	      s/\n# Test and benchmark tools - only build for native platforms\nif\(NOT EMSCRIPTEN AND NOT WIN32\).*?\nendif\(\)\s*$/\n# Test and benchmark tools are disabled for embedded static builds.\n# They link the generated extension loader without every static extension library.\n/gms;
-	    ' "$OPENIVM_CMAKE"
+    git -C "$OPENIVM_LOCAL_DIR" apply "$BUILD_SCRIPT_DIR/patches/openivm-current-duckdb.patch"
 	    log_success "OpenIVM source prepared at $OPENIVM_LOCAL_DIR"
 	fi
 

@@ -1,7 +1,7 @@
 # DuckDB Static Build Kit
 
-Build DuckDB with 24 statically-linked core extensions.
-Optionally include `spatial`, experimental `robust-labs/robust` RPT, and experimental `arselzer/duckdb_aggjoin`.
+Build DuckDB with 24 statically linked core extensions.
+Optionally include `spatial`, and optionally include `openivm`.
 
 ## Quick Start
 
@@ -15,14 +15,8 @@ Optionally include `spatial`, experimental `robust-labs/robust` RPT, and experim
 # Include spatial (requires GDAL/PROJ/GEOS/SQLite vcpkg deps)
 ./build-duckdb-static.sh --duckdb-dir /tmp/duckdb-clean/duckdbsrc --with-spatial --clean
 
-# Include robust RPT (experimental)
-./build-duckdb-static.sh --duckdb-dir /tmp/duckdb-clean/duckdbsrc --with-robust-rpt --clean
-
-# Build and validate a COPY-safe binary that excludes robust RPT
-./build-duckdb-static.sh --duckdb-dir /tmp/duckdb-clean/duckdbsrc --copy-tests --clean
-
-# Include aggjoin (experimental aggregate-over-join optimizer extension)
-./build-duckdb-static.sh --duckdb-dir /tmp/duckdb-clean/duckdbsrc --with-aggjoin --clean
+# Include openivm
+./build-duckdb-static.sh --duckdb-dir /tmp/duckdb-clean/duckdbsrc --with-openivm --clean
 ```
 
 ## What This Produces
@@ -30,13 +24,19 @@ Optionally include `spatial`, experimental `robust-labs/robust` RPT, and experim
 - Binary: `<duckdb-dir>/build/release-static/duckdb`
 - Size: typically ~149-150MB
 - 24 statically linked extensions loaded at runtime
-- Add 1 loaded extension for each optional flag: `--with-spatial`, `--with-robust-rpt`, `--with-aggjoin`
-- 27 loaded extensions when all three optional flags are enabled
+- Add 1 loaded extension for `--with-spatial`
+- Add 1 loaded extension for `--with-openivm`
+- 26 loaded extensions when both optional flags are enabled
+
+Current known-good verification matrix:
+- `--skip-vcpkg --with-spatial`
+- `--skip-vcpkg --with-spatial --with-openivm`
+- The current validated `--with-spatial --with-openivm` path produces `26` loaded extensions and a `199M` binary on the current snapshot
 
 ## Extensions Included (24)
 
 | Category | Extensions |
-|----------|-----------|
+|----------|------------|
 | Core | autocomplete, icu, json, parquet, core_functions, jemalloc, shell |
 | Benchmarks | tpcds, tpch |
 | Search | fts, vss |
@@ -60,34 +60,13 @@ If you use `--skip-vcpkg`, the spatial dependencies must already exist in `~/vcp
 
 See [build-instructions.md](/home/mrayva/duckdbbld/build-instructions.md) for a dedicated spatial section.
 
-## Robust RPT Status
+## OpenIVM Status
 
-`robust-labs/robust` is available through `--with-robust-rpt` and is intentionally not part of the default build.
-If you are validating COPY behavior, use `--copy-tests` instead. That mode excludes `robust` entirely from the static build and runs the COPY repro harness after the build completes.
+`openivm` is available through `--with-openivm`.
 
-Current finding:
-- The COPY segfault only reproduces when `robust` is present in the static build.
-- Re-enabling or disabling the individual compatibility shims one by one did not isolate a single file that reproduces the crash on its own.
-- The cleanest working path for COPY validation is therefore `--copy-tests`, which keeps `robust` out of the binary entirely.
+The current source snapshot now builds and starts cleanly with `--with-spatial --with-openivm`.
 
-The integration pins `robust` to commit `5ec7800e000291e27f7433cb513ba606fc675fc1` and applies a compatibility patch for current DuckDB source:
-- Adds the missing `probe_empty_registry.hpp` required by the upstream robust code.
-- Updates DuckDB API drift around `TableIndex`, `ProjectionIndex`, expression type access, and dynamic table filters.
-- Uses OpenSSL from vcpkg.
-
-This path is experimental because it patches upstream extension code. Keep it separate from the default build unless you are specifically testing robust/RPT behavior.
-
-## AggJoin Status
-
-`arselzer/duckdb_aggjoin` is available through `--with-aggjoin` and is intentionally not part of the default build.
-
-The integration pins `duckdb_aggjoin` to commit `5f4b64ac879b13662142bd7624784a4ad709393c` and applies a compatibility patch for current DuckDB source:
-- Updates protected DuckDB API access to `GetName()`, `GetReturnType()`, and `GetExpressionType()`.
-- Updates binding/index construction for `TableIndex` and `ProjectionIndex`.
-- Updates `JoinCondition` handling for private fields and constructor-based ownership.
-- Uses mutable vector APIs where the extension writes output vectors.
-
-This path is experimental because it patches upstream extension code and because aggjoin is an optimizer/runtime extension, not a normal scalar/table function package.
+This path still does source preparation before the static build consumes OpenIVM, so upstream DuckDB or OpenIVM refreshes may require patch refreshes.
 
 ## Files
 
@@ -103,4 +82,5 @@ This path is experimental because it patches upstream extension code and because
 - Git, CMake 3.15+, GCC/G++, Make
 - Rust toolchain (for delta extension)
 - vcpkg
+- `xxd` for spatial builds
 - ~20GB free disk if doing fresh dependency setup
