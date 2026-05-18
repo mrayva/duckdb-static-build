@@ -41,7 +41,7 @@ CCACHE_DISABLE=1 ./build-duckdb-static.sh \
   --clean
 ```
 
-To include OpenIVM:
+To include OpenIVM in the stable default profile:
 
 ```bash
 CCACHE_DISABLE=1 ./build-duckdb-static.sh \
@@ -50,6 +50,18 @@ CCACHE_DISABLE=1 ./build-duckdb-static.sh \
   --with-openivm \
   --clean
 ```
+
+To include OpenIVM in the active profile:
+
+```bash
+CCACHE_DISABLE=1 ./build-duckdb-static.sh \
+  --duckdb-dir /tmp/duckdb-clean/duckdbsrc \
+  --vcpkg-dir "$HOME/vcpkg" \
+  --with-openivm-active \
+  --clean
+```
+
+This active profile is still experimental and not functionally validated yet.
 
 ## 3. Permissions Needed In Restricted/Sandboxed Environments
 
@@ -78,20 +90,23 @@ The script performs these exact phases:
 - removes `DONT_LINK` where needed (`fts`, `vss`, `postgres_scanner`)
 - injects required `INCLUDE_DIR` entries
 - prepares OpenIVM source when `--with-openivm` is passed
-7. Optional dependency install (unless `--skip-vcpkg`):
+7. If `--with-openivm-active` is used, applies an extra OpenIVM runtime patch and enables OpenIVM sqllogictest discovery.
+8. Optional dependency install (unless `--skip-vcpkg`):
 - AWS SDK components
 - Azure SDK components
 - roaring
 - libmariadb for `mysql_scanner`
 - Spatial dependencies when `--with-spatial` is used: GDAL, PROJ, GEOS, SQLite with RTREE, curl, OpenSSL, zlib, expat
-8. Configures out-of-source build at `<duckdb-dir>/build/release-static` with:
+9. Configures out-of-source build at `<duckdb-dir>/build/release-static` with:
 - vcpkg toolchain
 - `-DVCPKG_MANIFEST_MODE=OFF`
 - linker flag `--allow-multiple-definition`
-9. Merges global and extension-local `vcpkg_installed` trees.
-10. When `--with-spatial` is used, regenerates spatial's embedded `proj_db.c` from the matching vcpkg `proj.db`.
-11. Builds with `EXTENSION_STATIC_BUILD=1 make -j$(nproc)`.
-12. Verifies runtime by counting loaded extensions from `duckdb_extensions()`.
+10. `--with-openivm-active` uses `<duckdb-dir>/build/release-static-openivm-active` instead so it does not overwrite the stable build.
+11. Merges global and extension-local `vcpkg_installed` trees.
+12. When `--with-spatial` is used, regenerates spatial's embedded `proj_db.c` from the matching vcpkg `proj.db`.
+13. Builds with `EXTENSION_STATIC_BUILD=1 make -j$(nproc)`.
+14. Verifies runtime by counting loaded extensions from `duckdb_extensions()`.
+15. If `--with-openivm-active` is used, builds `unittest/fast`, runs an OpenIVM shell smoke test, and runs selected OpenIVM sqllogictests.
 
 ## 5. Output/Success Criteria
 
@@ -103,6 +118,7 @@ On success, you should see:
 
 With `--with-spatial`, expect 25 loaded extensions and a larger binary.
 With both `--with-spatial --with-openivm`, expect 26 loaded extensions.
+With `--with-spatial --with-openivm-active`, also expect 26 loaded extensions if the build completes.
 
 Current known-good verification matrix:
 - `--clean`
@@ -115,6 +131,10 @@ That matrix built successfully with:
 - Size `199M`
 - `All 26 extensions loaded successfully!`
 - `./duckdb -version` returned `v1.6.0-dev1450 (Development Version) 0bf859fca7`
+
+Current non-validated profile:
+- `--with-openivm-active`
+- This profile currently builds, but runtime validation still fails in OpenIVM metadata publication and selected OpenIVM sqllogictests.
 
 ## 6. Fast Rebuilds
 
@@ -170,9 +190,16 @@ gdal[geos] proj geos expat sqlite3[rtree] curl openssl zlib libmariadb
 
 ## 9. OpenIVM Extension
 
-`openivm` is integrated behind `--with-openivm`.
+`openivm` is integrated behind two modes:
 
-It is now part of the current known-good verification matrix on this DuckDB snapshot.
+- `--with-openivm`
+This is the stable default profile. OpenIVM is built and loaded, but the runtime hooks stay inert so DuckDB startup remains predictable.
+
+- `--with-openivm-active`
+This is the explicitly active profile. It re-enables OpenIVM parser/optimizer/pragma hooks, includes OpenIVM `test/sql` in DuckDB's generated extension test paths, and runs a small OpenIVM validation suite after build.
+
+The stable profile is part of the current verified matrix.
+The active profile is currently buildable but not functionally validated on this DuckDB snapshot.
 
 The integration still relies on a maintained local patch because OpenIVM and its bundled `lpts` subtree need API-drift fixes for current DuckDB.
 
@@ -186,6 +213,22 @@ CCACHE_DISABLE=1 ./build-duckdb-static.sh \
   --with-openivm \
   --clean
 ```
+
+Active-profile recipe:
+
+```bash
+cd /home/mrayva/duckdbbld
+CCACHE_DISABLE=1 ./build-duckdb-static.sh \
+  --duckdb-dir /tmp/duckdb-clean/duckdbsrc \
+  --vcpkg-dir "$HOME/vcpkg" \
+  --with-openivm-active \
+  --clean
+```
+
+Current active-profile failure surface:
+- `CREATE MATERIALIZED VIEW` returns success but OpenIVM catalog state is not yet functionally validated end-to-end.
+- Selected OpenIVM sqllogictests still fail after build.
+- Treat this mode as buildable/experimental, not production-ready.
 
 ## 10. Troubleshooting
 

@@ -1,7 +1,7 @@
 # DuckDB Static Build Kit
 
 Build DuckDB with 24 statically linked core extensions.
-Optionally include `spatial`, and optionally include `openivm`.
+Optionally include `spatial`, and optionally include `openivm` in either stable or active mode.
 
 ## Quick Start
 
@@ -15,8 +15,12 @@ Optionally include `spatial`, and optionally include `openivm`.
 # Include spatial (requires GDAL/PROJ/GEOS/SQLite vcpkg deps)
 ./build-duckdb-static.sh --duckdb-dir /tmp/duckdb-clean/duckdbsrc --with-spatial --clean
 
-# Include openivm
+# Include openivm in the stable default profile
 ./build-duckdb-static.sh --duckdb-dir /tmp/duckdb-clean/duckdbsrc --with-openivm --clean
+
+# Include openivm with runtime hooks and tests enabled
+# This active profile is still experimental and not functionally validated yet.
+./build-duckdb-static.sh --duckdb-dir /tmp/duckdb-clean/duckdbsrc --with-openivm-active --clean
 ```
 
 ## What This Produces
@@ -25,7 +29,7 @@ Optionally include `spatial`, and optionally include `openivm`.
 - Size: typically ~149-150MB
 - 24 statically linked extensions loaded at runtime
 - Add 1 loaded extension for `--with-spatial`
-- Add 1 loaded extension for `--with-openivm`
+- Add 1 loaded extension for `--with-openivm` or `--with-openivm-active`
 - 26 loaded extensions when both optional flags are enabled
 
 Current known-good verification matrix:
@@ -64,9 +68,15 @@ See [build-instructions.md](/home/mrayva/duckdbbld/build-instructions.md) for a 
 
 `openivm` is available through `--with-openivm`.
 
-The current source snapshot now builds and starts cleanly with `--with-spatial --with-openivm`.
+The stable `--with-openivm` profile builds and starts cleanly, but intentionally keeps OpenIVM runtime hooks inert.
 
-This path still does source preparation before the static build consumes OpenIVM, so upstream DuckDB or OpenIVM refreshes may require patch refreshes.
+`--with-openivm-active` is the explicitly active profile. It re-enables OpenIVM runtime hooks, adds OpenIVM `test/sql` discovery, and attempts an OpenIVM smoke check plus selected OpenIVM sqllogictests.
+
+That active profile is currently buildable, but it is not functionally validated on this DuckDB snapshot. The remaining failures are in OpenIVM runtime behavior after build, not in source fetch or compile integration.
+
+The active profile builds into `<duckdb-dir>/build/release-static-openivm-active/duckdb` so it does not overwrite the stable default build.
+
+Both profiles still do source preparation before the static build consumes OpenIVM, so upstream DuckDB or OpenIVM refreshes may require patch refreshes.
 
 ## Files
 
