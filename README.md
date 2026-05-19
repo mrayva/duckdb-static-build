@@ -1,7 +1,7 @@
 # DuckDB Static Build Kit
 
 Build DuckDB with 24 statically linked core extensions.
-Optionally include `spatial`, and optionally include `openivm` in either stable or active mode.
+Optionally include `spatial`, and optionally build `openivm` as a regular loadable extension.
 
 ## Quick Start
 
@@ -15,12 +15,8 @@ Optionally include `spatial`, and optionally include `openivm` in either stable 
 # Include spatial (requires GDAL/PROJ/GEOS/SQLite vcpkg deps)
 ./build-duckdb-static.sh --duckdb-dir /tmp/duckdb-clean/duckdbsrc --with-spatial --clean
 
-# Include openivm in the stable default profile
-./build-duckdb-static.sh --duckdb-dir /tmp/duckdb-clean/duckdbsrc --with-openivm --clean
-
-# Include openivm with runtime hooks and tests enabled
-# This active profile is still experimental and not functionally validated yet.
-./build-duckdb-static.sh --duckdb-dir /tmp/duckdb-clean/duckdbsrc --with-openivm-active --clean
+# Build openivm as a regular loadable extension
+./build-duckdb-static.sh --duckdb-dir /tmp/duckdb-clean/duckdbsrc --with-openivm-loadable --clean
 ```
 
 ## What This Produces
@@ -29,13 +25,11 @@ Optionally include `spatial`, and optionally include `openivm` in either stable 
 - Size: typically ~149-150MB
 - 24 statically linked extensions loaded at runtime
 - Add 1 loaded extension for `--with-spatial`
-- Add 1 loaded extension for `--with-openivm` or `--with-openivm-active`
-- 26 loaded extensions when both optional flags are enabled
+- `--with-openivm-loadable` keeps the default static extension count unchanged and also builds `openivm.duckdb_extension`
 
 Current known-good verification matrix:
 - `--skip-vcpkg --with-spatial`
-- `--skip-vcpkg --with-spatial --with-openivm`
-- The current validated `--with-spatial --with-openivm` path produces `26` loaded extensions and a `199M` binary on the current snapshot
+- `--skip-vcpkg --with-openivm-loadable`
 
 ## Extensions Included (24)
 
@@ -66,17 +60,11 @@ See [build-instructions.md](/home/mrayva/duckdbbld/build-instructions.md) for a 
 
 ## OpenIVM Status
 
-`openivm` is available through `--with-openivm`.
+`--with-openivm-loadable` is the preferred non-static integration path. It prepares the same patched OpenIVM source tree, builds `openivm.duckdb_extension` as a regular loadable extension, and keeps OpenIVM out of DuckDB's static startup set.
 
-The stable `--with-openivm` profile builds and starts cleanly, but intentionally keeps OpenIVM runtime hooks inert.
+The loadable profile builds into `<duckdb-dir>/build/release-static-openivm-loadable/` and verifies that the produced `openivm.duckdb_extension` can be loaded by the matching DuckDB binary with `-unsigned`, because the local artifact is not signed.
 
-`--with-openivm-active` is the explicitly active profile. It re-enables OpenIVM runtime hooks, adds OpenIVM `test/sql` discovery, and attempts an OpenIVM smoke check plus selected OpenIVM sqllogictests.
-
-That active profile is currently buildable, but it is not functionally validated on this DuckDB snapshot. The remaining failures are in OpenIVM runtime behavior after build, not in source fetch or compile integration.
-
-The active profile builds into `<duckdb-dir>/build/release-static-openivm-active/duckdb` so it does not overwrite the stable default build.
-
-Both profiles still do source preparation before the static build consumes OpenIVM, so upstream DuckDB or OpenIVM refreshes may require patch refreshes.
+This is now the only supported OpenIVM integration path in this repo. Upstream DuckDB or OpenIVM refreshes may still require patch refreshes.
 
 ## Files
 

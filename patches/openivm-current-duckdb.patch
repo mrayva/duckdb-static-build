@@ -1929,7 +1929,7 @@ index 3252495..5ccc8a4 100644
 -		if (join.predicate) {
 -			CollectExpr(*join.predicate);
 -		}
-+		
++
  	}
  	if (op.type == LogicalOperatorType::LOGICAL_DEPENDENT_JOIN) {
  		auto &join = op.Cast<LogicalDependentJoin>();
@@ -1965,7 +1965,7 @@ index 3252495..5ccc8a4 100644
 -		if (join.predicate) {
 -			RebindExpr(*join.predicate);
 -		}
-+		
++
  	}
  	if (op.type == LogicalOperatorType::LOGICAL_DEPENDENT_JOIN) {
  		auto &join = op.Cast<LogicalDependentJoin>();
@@ -1975,9 +1975,9 @@ index 3252495..5ccc8a4 100644
  		}
 -		new_idx new_t = table_mapping.at(cb.table_index);
 +		TableIndex new_t = table_mapping.at(cb.table_index);
-		replacer.replacement_bindings.emplace_back(cb, ColumnBinding(new_t, cb.column_index));
-	}
-	return replacer;
+ 		replacer.replacement_bindings.emplace_back(cb, ColumnBinding(new_t, cb.column_index));
+ 	}
+ 	return replacer;
 diff --git a/third_party/lpts/src/include/lpts_ast.hpp b/third_party/lpts/src/include/lpts_ast.hpp
 index 2efda04..0eacd85 100644
 --- a/third_party/lpts/src/include/lpts_ast.hpp

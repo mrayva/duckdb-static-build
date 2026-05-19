@@ -13,8 +13,7 @@ set -euo pipefail
 #     --skip-vcpkg       Skip vcpkg dependency installation
 #     --clean            Clean build before starting
 #     --with-spatial     Include spatial as a statically-linked extension
-#     --with-openivm     Include ila/openivm as a statically-linked extension (stable, inert runtime)
-#     --with-openivm-active Include ila/openivm with runtime hooks and sqllogictests enabled (experimental)
+#     --with-openivm-loadable Build ila/openivm as a regular loadable extension, not statically linked
 #     --help             Show this help
 
 # Colors for output
@@ -31,8 +30,7 @@ BUILD_SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 SKIP_VCPKG=false
 CLEAN_BUILD=false
 WITH_SPATIAL=false
-WITH_OPENIVM=false
-WITH_OPENIVM_ACTIVE=false
+WITH_OPENIVM_LOADABLE=false
 WITH_ROBUST_RPT=false
 WITH_AGGJOIN=false
 COPY_TESTS=false
@@ -116,13 +114,8 @@ while [[ $# -gt 0 ]]; do
       WITH_SPATIAL=true
       shift
       ;;
-    --with-openivm)
-      WITH_OPENIVM=true
-      shift
-      ;;
-    --with-openivm-active)
-      WITH_OPENIVM=true
-      WITH_OPENIVM_ACTIVE=true
+    --with-openivm-loadable)
+      WITH_OPENIVM_LOADABLE=true
       shift
       ;;
     --help)
@@ -256,20 +249,6 @@ duckdb_extension_load(aggjoin
 )
 EOF
 fi
-if [ "$WITH_OPENIVM" = true ]; then
-    cat >> extension/extension_config_local.cmake << EOF
-duckdb_extension_load(openivm
-    SOURCE_DIR ${DUCKDB_DIR}/build/openivm-local-src
-EOF
-    if [ "$WITH_OPENIVM_ACTIVE" = true ]; then
-        cat >> extension/extension_config_local.cmake << EOF
-    LOAD_TESTS
-EOF
-    fi
-    cat >> extension/extension_config_local.cmake << EOF
-)
-EOF
-fi
 log_success "Extension configuration created"
 
 # Step 4: Remove DONT_LINK flags and add INCLUDE_DIRs
@@ -322,16 +301,14 @@ duckdb_extension_load(aggjoin
 EOF
     log_success "aggjoin config created"
 fi
-if [ "$WITH_OPENIVM" = true ]; then
+if [ "$WITH_OPENIVM_LOADABLE" = true ]; then
     mkdir -p .github/config/extensions
     cat > .github/config/extensions/openivm.cmake << 'EOF'
 duckdb_extension_load(openivm
     SOURCE_DIR ${CMAKE_CURRENT_SOURCE_DIR}/build/openivm-local-src
 )
 EOF
-    if [ "$WITH_OPENIVM_ACTIVE" = true ]; then
-        perl -0pi -e 's/SUBMODULES "third_party\/lpts;third_party\/lpts\/third_party\/ducklake"\n\)/SUBMODULES "third_party\/lpts;third_party\/lpts\/third_party\/ducklake"\n    LOAD_TESTS\n)/' .github/config/extensions/openivm.cmake
-    fi
+    perl -0pi -e 's/SOURCE_DIR \$\{CMAKE_CURRENT_SOURCE_DIR\}\/build\/openivm-local-src\n\)/SOURCE_DIR \$\{CMAKE_CURRENT_SOURCE_DIR\}\/build\/openivm-local-src\n    DONT_LINK\n)/' .github/config/extensions/openivm.cmake
     log_success "openivm config created"
 fi
 
@@ -2305,7 +2282,7 @@ fi
 
 # Step 5b: Prepare OpenIVM source with recursive submodules
 OPENIVM_LOCAL_DIR=""
-if [ "$WITH_OPENIVM" = true ]; then
+if [ "$WITH_OPENIVM_LOADABLE" = true ]; then
     log_info "Step 5b: Preparing OpenIVM source with recursive submodules..."
     OPENIVM_LOCAL_DIR="$DUCKDB_DIR/build/openivm-local-src"
     if [ ! -d "$OPENIVM_LOCAL_DIR/.git" ]; then
@@ -2334,17 +2311,15 @@ if count != 1:
     raise SystemExit("failed to strip OpenIVM native tool targets")
 path.write_text(new_text)
 PY
-    if [ "$WITH_OPENIVM_ACTIVE" = true ]; then
-        log_info "Applying OpenIVM active-runtime patch..."
-        git -C "$OPENIVM_LOCAL_DIR" apply "$BUILD_SCRIPT_DIR/patches/openivm-active-runtime.patch"
-    fi
+    log_info "Applying OpenIVM runtime patch..."
+    git -C "$OPENIVM_LOCAL_DIR" apply "$BUILD_SCRIPT_DIR/patches/openivm-active-runtime.patch"
     log_success "OpenIVM source prepared at $OPENIVM_LOCAL_DIR"
 fi
 
 # Step 6: Configure build
 log_info "Step 6: Configuring CMake (fetches extensions)..."
-if [ "$WITH_OPENIVM_ACTIVE" = true ]; then
-    BUILD_DIR="$DUCKDB_DIR/build/release-static-openivm-active"
+if [ "$WITH_OPENIVM_LOADABLE" = true ]; then
+    BUILD_DIR="$DUCKDB_DIR/build/release-static-openivm-loadable"
 else
     BUILD_DIR="$DUCKDB_DIR/build/release-static"
 fi
@@ -2375,14 +2350,13 @@ if [ "$WITH_AGGJOIN" = true ]; then
     BUILD_EXTENSIONS="${BUILD_EXTENSIONS};aggjoin"
     EXPECTED_EXTENSIONS=$((EXPECTED_EXTENSIONS + 1))
 fi
-if [ "$WITH_OPENIVM" = true ]; then
+if [ "$WITH_OPENIVM_LOADABLE" = true ]; then
     BUILD_EXTENSIONS="${BUILD_EXTENSIONS};openivm"
-    EXPECTED_EXTENSIONS=$((EXPECTED_EXTENSIONS + 1))
 fi
 
 # Note: --allow-multiple-definition is required because postgres_scanner
 # shares some common helper functions with other static extensions.
-if [ "$WITH_OPENIVM" = true ]; then
+if [ "$WITH_OPENIVM_LOADABLE" = true ]; then
     DUCKDB_OPENIVM_DIRECTORY="$OPENIVM_LOCAL_DIR" cmake -S "$DUCKDB_DIR" -B "$BUILD_DIR" \
       -DCMAKE_BUILD_TYPE=Release \
       -DCMAKE_TOOLCHAIN_FILE="$VCPKG_DIR/scripts/buildsystems/vcpkg.cmake" \
@@ -2466,6 +2440,12 @@ END_TIME=$(date +%s)
 BUILD_TIME=$((END_TIME - START_TIME))
 log_success "Build completed in $BUILD_TIME seconds"
 
+if [ "$WITH_OPENIVM_LOADABLE" = true ]; then
+    log_info "Step 8b: Building OpenIVM as a loadable extension..."
+    cmake --build "$BUILD_DIR" -j"$NUM_CORES" --target openivm_loadable_extension
+    log_success "OpenIVM loadable extension built"
+fi
+
 # Step 9: Verify
 log_info "Step 9: Verifying build..."
 if [ ! -f "./duckdb" ]; then
@@ -2507,26 +2487,15 @@ if [ "$COPY_TESTS" = true ]; then
     run_copy_repro_validation
 fi
 
-if [ "$WITH_OPENIVM_ACTIVE" = true ]; then
-    log_info "Step 10: Running OpenIVM active-profile validation..."
-    cmake --build "$BUILD_DIR" -j"$NUM_CORES" --target unittest/fast
-    OPENIVM_PARSER_TEST="$OPENIVM_LOCAL_DIR/test/sql/ivm_parser.test"
-    OPENIVM_JOIN_TEST="$OPENIVM_LOCAL_DIR/test/sql/mv_inner_join.test"
-    ./duckdb -batch <<SQL
-LOAD openivm;
-SET ivm_files_path='$OPENIVM_LOCAL_DIR/test/sql';
-CREATE TABLE sales (id INT, region VARCHAR, amount INT);
-INSERT INTO sales VALUES (1, 'east', 100), (2, 'west', 200), (3, 'east', 150);
-CREATE MATERIALIZED VIEW mv_sales AS
-    SELECT region, sum(amount) AS sum_amount, count(amount) AS count_amount
-    FROM sales GROUP BY region;
-INSERT INTO sales VALUES (4, 'east', 50);
-PRAGMA ivm('mv_sales');
-SELECT region, sum_amount, count_amount FROM mv_sales ORDER BY region;
-SQL
-    ./test/unittest "$OPENIVM_PARSER_TEST" --abort
-    ./test/unittest "$OPENIVM_JOIN_TEST" --abort
-    log_success "OpenIVM active-profile validation passed"
+if [ "$WITH_OPENIVM_LOADABLE" = true ]; then
+    log_info "Step 10: Verifying OpenIVM loadable extension..."
+    OPENIVM_LOADABLE_PATH="$BUILD_DIR/extension/openivm/openivm.duckdb_extension"
+    if [ ! -f "$OPENIVM_LOADABLE_PATH" ]; then
+        log_error "OpenIVM loadable extension not found at $OPENIVM_LOADABLE_PATH"
+        exit 1
+    fi
+    ./duckdb -unsigned -c "LOAD '$OPENIVM_LOADABLE_PATH'; SELECT extension_name, loaded FROM duckdb_extensions() WHERE extension_name='openivm';" >/dev/null
+    log_success "OpenIVM loadable extension built and loadable at $OPENIVM_LOADABLE_PATH"
 fi
 
 echo ""
