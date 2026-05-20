@@ -110,7 +110,7 @@ Current known-good verification matrix:
 - `--clean`
 - `--skip-vcpkg`
 - `--with-spatial`
-- `--with-openivm-loadable`
+- `--with-openivm-loadable` for build/load validation only
 
 Current preferred non-static OpenIVM profile:
 - `--with-openivm-loadable`
@@ -188,6 +188,44 @@ CCACHE_DISABLE=1 ./build-duckdb-static.sh \
 
 Expected artifact:
 - `<duckdb-dir>/build/release-static-openivm-loadable/extension/openivm/openivm.duckdb_extension`
+
+What the build script verifies today:
+- the artifact exists
+- the matching DuckDB binary can `LOAD` it with `-unsigned`
+
+What is not currently green:
+- the full upstream OpenIVM SQL suite
+- several incremental-refresh correctness cases
+- several DuckLake-specific tests
+
+Current measured result on the validated host-side build:
+- core suite (`ivm_*.test` + `mv_*.test`): `27 passed`, `2 failed`
+- full upstream suite (`test/sql/*.test`): `29 passed`, `14 failed`
+
+What is now validated:
+1. `CREATE MATERIALIZED VIEW ...` creates OpenIVM catalog state
+2. `_duckdb_ivm_views` and related metadata tables are created
+3. `PRAGMA ivm('view_name')` works for a substantial subset of views
+4. core inner-join refresh correctness is fixed
+
+Main remaining failures:
+1. one cost-model mismatch in `ivm_auto_refresh.test`
+2. `ivm_concurrency.test` is not fully measurable by the repo-local validator because it uses `concurrentloop`
+3. several DuckLake-specific failures remain in the full suite
+
+Functional validation command:
+
+```bash
+./scripts/validate-openivm-functional.sh \
+  /tmp/duckdb-clean/duckdbsrc/build/release-static-openivm-loadable core
+```
+
+To run the full OpenIVM upstream SQL suite:
+
+```bash
+./scripts/validate-openivm-functional.sh \
+  /tmp/duckdb-clean/duckdbsrc/build/release-static-openivm-loadable full
+```
 
 ## 10. Troubleshooting
 

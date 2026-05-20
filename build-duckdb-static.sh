@@ -2496,6 +2496,8 @@ if [ "$WITH_OPENIVM_LOADABLE" = true ]; then
     fi
     ./duckdb -unsigned -c "LOAD '$OPENIVM_LOADABLE_PATH'; SELECT extension_name, loaded FROM duckdb_extensions() WHERE extension_name='openivm';" >/dev/null
     log_success "OpenIVM loadable extension built and loadable at $OPENIVM_LOADABLE_PATH"
+    log_warning "This verifies build/load only. Functional validation is separate:"
+    log_warning "  $BUILD_SCRIPT_DIR/scripts/validate-openivm-functional.sh $BUILD_DIR core"
 fi
 
 echo ""

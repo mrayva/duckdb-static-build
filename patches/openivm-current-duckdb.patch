@@ -1026,6 +1026,19 @@ index 518d698..f9ab840 100644
  						sum_count++;
  					}
  				}
+diff --git a/src/include/core/openivm_parser.hpp b/src/include/core/openivm_parser.hpp
+index 1d764a0..83005b3 100644
+--- a/src/include/core/openivm_parser.hpp
++++ b/src/include/core/openivm_parser.hpp
+@@ -50,7 +50,7 @@ struct IVMParseData : ParserExtensionParseData {
+ 	string alter_sql;              // non-empty for ALTER MATERIALIZED VIEW (executed directly in plan function)
+ 
+ 	unique_ptr<ParserExtensionParseData> Copy() const override {
+-		auto copy = make_uniq_base<ParserExtensionParseData, IVMParseData>(statement->Copy(), false);
++		auto copy = make_uniq_base<ParserExtensionParseData, IVMParseData>(statement->Copy(), plan, refresh_interval);
+ 		auto &data = dynamic_cast<IVMParseData &>(*copy);
+ 		data.refresh_interval = refresh_interval;
+ 		data.is_replace = is_replace;
 diff --git a/src/include/upsert/openivm_index_regen.hpp b/src/include/upsert/openivm_index_regen.hpp
 index 0eb60e4..59425e1 100644
 --- a/src/include/upsert/openivm_index_regen.hpp
@@ -1586,6 +1599,39 @@ index eb4bd9c..91f8c65 100644
  			continue;
  		}
  		string delta_name = OpenIVMUtils::DeltaName(table_ref.get()->name);
+@@ -722,6 +722,9 @@ static vector<unique_ptr<LogicalOperator>> BuildInclusionExclusionTerms(PlanWrap
+ 		auto term = pw.plan->Copy(context);
+ 		auto renumbered = renumber_and_rebind_subtree(std::move(term), binder);
+ 		term = std::move(renumbered.op);
++		vector<JoinLeafInfo> term_leaves;
++		CollectJoinLeaves(term.get(), {}, term_leaves);
++		D_ASSERT(term_leaves.size() == N);
+ 		LogicalOperator *term_root = term.get();
+ 		vector<ColumnBinding> mul_bindings;
+ 
+@@ -745,17 +748,17 @@ static vector<unique_ptr<LogicalOperator>> BuildInclusionExclusionTerms(PlanWrap
+ 		// Replace delta leaves
+ 		for (size_t i = 0; i < N; i++) {
+ 			if (mask & (1ULL << i)) {
+-				if (leaves[i].get) {
+-					DeltaGetResult delta_i = CreateDeltaGetNode(context, binder, leaves[i].get, pw.view);
++				if (term_leaves[i].get) {
++					DeltaGetResult delta_i = CreateDeltaGetNode(context, binder, term_leaves[i].get, pw.view);
+ 					mul_bindings.push_back(delta_i.mul_binding);
+-					GetNodeAtPath(term, leaves[i].path) = std::move(delta_i.node);
++					GetNodeAtPath(term, term_leaves[i].path) = std::move(delta_i.node);
+ 				} else {
+-					auto &subtree_ref = GetNodeAtPath(term, leaves[i].path);
++					auto &subtree_ref = GetNodeAtPath(term, term_leaves[i].path);
+ 					auto rewritten = IVMRewriteRule::RewritePlan(pw.input, subtree_ref, pw.view, term_root);
+ 					mul_bindings.push_back(rewritten.mul_binding);
+ 					subtree_ref = std::move(rewritten.op);
+ 				}
+-				UpdateParentProjectionMap(term, leaves[i]);
++				UpdateParentProjectionMap(term, term_leaves[i]);
+ 			}
+ 		}
+ 
 @@ -844,7 +844,7 @@ static unique_ptr<LogicalOperator> AssembleUnionAll(vector<unique_ptr<LogicalOpe
  		vector<ColumnBinding> bindings;
  		auto table_index = binder.GenerateTableIndex();
