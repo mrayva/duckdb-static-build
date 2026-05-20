@@ -1,3 +1,55 @@
+diff --git a/CMakeLists.txt b/CMakeLists.txt
+index c4a3959..18fa481 100644
+--- a/CMakeLists.txt
++++ b/CMakeLists.txt
+@@ -57,47 +57,3 @@ install(
+   LIBRARY DESTINATION "${INSTALL_LIB_DIR}"
+   ARCHIVE DESTINATION "${INSTALL_LIB_DIR}")
+ 
+-# Test and benchmark tools - only build for native platforms
+-if(NOT EMSCRIPTEN AND NOT WIN32)
+-    set(OPENIVM_LINK_LIBS
+-        duckdb_static
+-        duckdb_generated_extension_loader
+-        ${EXTENSION_NAME}
+-        core_functions_extension
+-        parquet_extension
+-        duckdb_static)
+-
+-    if(DUCKDB_EXTENSION_JEMALLOC_SHOULD_LINK)
+-        list(APPEND OPENIVM_LINK_LIBS jemalloc_extension)
+-    endif()
+-
+-    # TPC-C data generation tool
+-    add_executable(tpcc_setup benchmark/src/tpcc_setup.cpp)
+-    target_link_libraries(tpcc_setup ${OPENIVM_LINK_LIBS})
+-    target_include_directories(tpcc_setup PUBLIC benchmark)
+-
+-    # Shared TPC-C helpers used by rewriter_benchmark, daemon_benchmark, and flag_benchmark.
+-    add_library(tpcc_helpers STATIC benchmark/src/tpcc_helpers.cpp)
+-    target_link_libraries(tpcc_helpers ${OPENIVM_LINK_LIBS})
+-    target_include_directories(tpcc_helpers PUBLIC benchmark/src)
+-
+-    # TPC-DI schema + data helpers (used only by rewriter_benchmark).
+-    add_library(tpcdi_helpers STATIC benchmark/src/tpcdi_helpers.cpp)
+-    target_link_libraries(tpcdi_helpers ${OPENIVM_LINK_LIBS})
+-    target_include_directories(tpcdi_helpers PUBLIC benchmark/src)
+-
+-    # IVM query benchmark harness (supports --workload tpcc|tpcdi)
+-    add_executable(rewriter_benchmark benchmark/src/rewriter_benchmark.cpp)
+-    target_link_libraries(rewriter_benchmark tpcc_helpers tpcdi_helpers ${OPENIVM_LINK_LIBS})
+-    target_include_directories(rewriter_benchmark PUBLIC benchmark benchmark/src)
+-
+-    # Refresh-daemon / cascade / pipeline benchmark
+-    add_executable(daemon_benchmark benchmark/src/daemon_benchmark.cpp)
+-    target_link_libraries(daemon_benchmark tpcc_helpers ${OPENIVM_LINK_LIBS})
+-    target_include_directories(daemon_benchmark PUBLIC benchmark benchmark/src)
+-
+-    # Optimization-flag performance benchmark (Phase 2)
+-    add_executable(flag_benchmark benchmark/src/flag_benchmark.cpp)
+-    target_link_libraries(flag_benchmark tpcc_helpers ${OPENIVM_LINK_LIBS})
+-    target_include_directories(flag_benchmark PUBLIC benchmark benchmark/src)
+-endif()
 diff --git a/src/core/ivm_checker.cpp b/src/core/ivm_checker.cpp
 index 76be8c6..a5b321e 100644
 --- a/src/core/ivm_checker.cpp
@@ -1055,10 +1107,10 @@ index 0eb60e4..59425e1 100644
  
  struct RenumberWrapper {
 diff --git a/src/openivm_extension.cpp b/src/openivm_extension.cpp
-index ee75337..ff0afff 100644
+index ee75337..bfa69ab 100644
 --- a/src/openivm_extension.cpp
 +++ b/src/openivm_extension.cpp
-@@ -198,84 +198,11 @@ static void LoadInternal(ExtensionLoader &loader) {
+@@ -198,83 +198,6 @@ static void LoadInternal(ExtensionLoader &loader) {
  	                             "diagnose CREATE MATERIALIZED VIEW initial load without executing DDL",
  	                             LogicalType::BOOLEAN, Value::BOOLEAN(false));
  
@@ -1140,14 +1192,9 @@ index ee75337..ff0afff 100644
 -	con.Query("ALTER TABLE " + string(ivm::HISTORY_TABLE) +
 -	          " ADD COLUMN IF NOT EXISTS strategy VARCHAR DEFAULT 'incremental'");
  
-+	// Keep static startup inert. OpenIVM remains buildable as a loadable
-+	// extension, but its parser/optimizer hooks are not safe to auto-load in
-+	// the current static build.
-+	return;
  	auto ivm_parser = duckdb::IVMParserExtension();
  
- 	auto ivm_rewrite_rule = duckdb::IVMRewriteRule();
-@@ -288,16 +215,6 @@ static void LoadInternal(ExtensionLoader &loader) {
+@@ -288,16 +211,7 @@ static void LoadInternal(ExtensionLoader &loader) {
  	TableFunction ivm_func("DoIVM", {LogicalType::VARCHAR, LogicalType::VARCHAR, LogicalType::VARCHAR}, DoIVMFunction,
  	                       DoIVMBind, DoIVMInit);
  
@@ -1161,10 +1208,11 @@ index ee75337..ff0afff 100644
 -	catalog.CreateTableFunction(*con.context, &ivm_func_info);
 -	con.Commit();
 -
++	loader.RegisterFunction(ivm_func);
  	// Use the locked pragma_function_t variant: generates SQL and executes it under a
  	// per-view mutex, preventing concurrent refresh from double-applying deltas.
  	auto ivm_options = PragmaFunction::PragmaCall("ivm_options", UpsertDeltaQueriesLocked,
-@@ -390,19 +307,6 @@ static void LoadInternal(ExtensionLoader &loader) {
+@@ -390,19 +304,6 @@ static void LoadInternal(ExtensionLoader &loader) {
  	                               },
  	                               {});
  	loader.RegisterFunction(ivm_start_daemon);
@@ -1553,7 +1601,7 @@ index 98e12af..0eb5ca9 100644
  	if (CompactDeltasEnabled(context)) {
  		return CompactDeltaNode(context, binder, std::move(delta_get_node), old_get->table_index, new_mul_binding);
 diff --git a/src/rules/join.cpp b/src/rules/join.cpp
-index eb4bd9c..91f8c65 100644
+index eb4bd9c..50ce2a3 100644
 --- a/src/rules/join.cpp
 +++ b/src/rules/join.cpp
 @@ -27,7 +27,7 @@
@@ -1632,7 +1680,7 @@ index eb4bd9c..91f8c65 100644
  			}
  		}
  
-@@ -844,7 +844,7 @@ static unique_ptr<LogicalOperator> AssembleUnionAll(vector<unique_ptr<LogicalOpe
+@@ -844,7 +847,7 @@ static unique_ptr<LogicalOperator> AssembleUnionAll(vector<unique_ptr<LogicalOpe
  		vector<ColumnBinding> bindings;
  		auto table_index = binder.GenerateTableIndex();
  		for (idx_t i = 0; i < types.size(); i++) {
@@ -1641,7 +1689,7 @@ index eb4bd9c..91f8c65 100644
  		}
  		auto empty = make_uniq<LogicalEmptyResult>(types, std::move(bindings));
  		empty->ResolveOperatorTypes();
-@@ -935,7 +935,7 @@ ModifiedPlan IvmJoinRule::Rewrite(PlanWrapper pw) {
+@@ -935,7 +938,7 @@ ModifiedPlan IvmJoinRule::Rewrite(PlanWrapper pw) {
  	} else {
  		for (size_t i = 0; i < N; i++) {
  			auto *get = GetLeafScan(leaves[i]);
@@ -1650,7 +1698,7 @@ index eb4bd9c..91f8c65 100644
  				all_ducklake = false;
  				break;
  			}
-@@ -953,7 +953,7 @@ ModifiedPlan IvmJoinRule::Rewrite(PlanWrapper pw) {
+@@ -953,7 +956,7 @@ ModifiedPlan IvmJoinRule::Rewrite(PlanWrapper pw) {
  
  	pw.plan = std::move(result);
  	OPENIVM_DEBUG_PRINT("[IvmJoinRule] Done, %zu terms unioned, mul_binding: table=%lu col=%lu\n", terms.size(),
@@ -1809,7 +1857,7 @@ index 089cc93..788a673 100644
  	return {std::move(projection_node), new_mul_binding};
  }
 diff --git a/src/upsert/openivm_cost_model.cpp b/src/upsert/openivm_cost_model.cpp
-index 4cc960f..36a2018 100644
+index 4cc960f..8cee159 100644
 --- a/src/upsert/openivm_cost_model.cpp
 +++ b/src/upsert/openivm_cost_model.cpp
 @@ -6,7 +6,9 @@
@@ -1822,17 +1870,103 @@ index 4cc960f..36a2018 100644
  #include "duckdb/catalog/catalog_entry/table_catalog_entry.hpp"
  #include "duckdb/main/connection.hpp"
  #include "duckdb/optimizer/optimizer.hpp"
-@@ -120,7 +122,7 @@ static void CollectPlanStatsRecursive(ClientContext &context, Connection &con, L
- 			}
+@@ -45,12 +47,28 @@ static double GetDeltaRowCount(Connection &con, const string &delta_table_name,
+ 	return count_result->GetValue(0, 0).GetValue<double>();
+ }
  
- 			// DuckLake vs standard delta cardinality
--			if (get.function.name == "ducklake_scan" && get.function.function_info) {
-+				if (get.function.name == "ducklake_scan" && get.function.function_info) {
- 				string cat_name = get.GetTable()->ParentCatalog().GetName();
++/// Get the number of pending delete delta rows for a given base delta table and view.
++static double GetPendingDeleteRowCount(Connection &con, const string &delta_table_name, const string &view_name) {
++	auto ts_string = IVMMetadata(con).GetLastUpdate(view_name, delta_table_name);
++	if (ts_string.empty()) {
++		return 0;
++	}
++	auto count_result = con.Query("SELECT COUNT(*) FROM " + OpenIVMUtils::QuoteIdentifier(delta_table_name) +
++	                              " WHERE " + string(ivm::TIMESTAMP_COL) + " >= '" + ts_string + "' AND " +
++	                              string(ivm::MULTIPLICITY_COL) + " < 0;");
++	if (count_result->HasError() || count_result->RowCount() == 0 || count_result->GetValue(0, 0).IsNull()) {
++		return 0;
++	}
++	return count_result->GetValue(0, 0).GetValue<double>();
++}
++
+ struct TableStats {
+ 	string table_name;
+ 	string delta_table_name;
+ 	double base_card;    // |T| (may reflect pushed-down filter selectivity)
+ 	double actual_card;  // actual unfiltered table row count
+ 	double delta_card;   // |ΔT|
++	double delete_card;  // pending delete rows in ΔT
+ 	bool has_fk = false; // table has FK referencing another table in the join
+ };
+ 
+@@ -97,6 +115,30 @@ static double GetDuckLakeDeltaRowCount(Connection &con, const string &catalog_na
+ 	return count;
+ }
+ 
++/// Get the number of pending deleted rows for a DuckLake table between snapshots.
++static double GetDuckLakeDeleteRowCount(Connection &con, const string &catalog_name, const string &schema_name,
++                                        const string &table_name, const string &view_name) {
++	IVMMetadata metadata(con);
++	auto last_snap = metadata.GetLastSnapshotId(view_name, table_name);
++	auto cur_snap_result = con.Query("SELECT id FROM " + catalog_name + ".current_snapshot()");
++	if (cur_snap_result->HasError() || cur_snap_result->RowCount() == 0 || cur_snap_result->GetValue(0, 0).IsNull()) {
++		return 0;
++	}
++	auto cur_snap = cur_snap_result->GetValue(0, 0).GetValue<int64_t>();
++	if (last_snap == cur_snap) {
++		return 0;
++	}
++
++	auto del_result =
++	    con.Query("SELECT COUNT(*) FROM ducklake_table_deletions('" + OpenIVMUtils::EscapeValue(catalog_name) + "', '" +
++	              OpenIVMUtils::EscapeValue(schema_name) + "', '" + OpenIVMUtils::EscapeValue(table_name) + "', " +
++	              to_string(last_snap) + ", " + to_string(cur_snap) + ")");
++	if (del_result->HasError() || del_result->RowCount() == 0 || del_result->GetValue(0, 0).IsNull()) {
++		return 0;
++	}
++	return del_result->GetValue(0, 0).GetValue<double>();
++}
++
+ /// Walk the plan tree once, collecting table stats, join info, and aggregate presence.
+ static void CollectPlanStatsRecursive(ClientContext &context, Connection &con, LogicalOperator &op,
+                                       const string &view_name, PlanStats &stats) {
+@@ -125,10 +167,12 @@ static void CollectPlanStatsRecursive(ClientContext &context, Connection &con, L
  				string schema_name = get.GetTable()->schema.name;
  				ts.delta_table_name = ts.table_name; // DuckLake stores bare name
+ 				ts.delta_card = GetDuckLakeDeltaRowCount(con, cat_name, schema_name, ts.table_name, view_name);
++				ts.delete_card = GetDuckLakeDeleteRowCount(con, cat_name, schema_name, ts.table_name, view_name);
+ 			} else {
+ 				stats.all_ducklake = false;
+ 				ts.delta_table_name = OpenIVMUtils::DeltaName(ts.table_name);
+ 				ts.delta_card = GetDeltaRowCount(con, ts.delta_table_name, view_name);
++				ts.delete_card = GetPendingDeleteRowCount(con, ts.delta_table_name, view_name);
+ 			}
+ 
+ 			stats.table_stats.push_back(ts);
+@@ -394,9 +438,12 @@ IVMCostEstimate EstimateIVMCost(ClientContext &context, LogicalOperator &plan, c
+ 
+ 	// 2. Compute basic metrics
+ 	double total_base_scan = 0;
++	double total_recompute_base_scan = 0;
+ 	double delta_fraction_sum = 0;
+ 	for (auto &ts : table_stats) {
+ 		total_base_scan += ts.base_card;
++		double recompute_selectivity = std::min(1.0, ts.base_card / ts.actual_card);
++		total_recompute_base_scan += (ts.actual_card + ts.delete_card) * recompute_selectivity;
+ 		delta_fraction_sum += ts.delta_card / ts.base_card;
+ 	}
+ 
+@@ -538,7 +585,7 @@ IVMCostEstimate EstimateIVMCost(ClientContext &context, LogicalOperator &plan, c
+ 	// Recompute compute: run the full query once
+ 	//   - Scan all base tables + join/aggregate processing
+ 	// Recompute replace: delete all MV rows + insert new result
+-	double recompute_compute = total_base_scan + mv_card; // scan + produce result
++	double recompute_compute = total_recompute_base_scan + mv_card; // current visible rows + pending deletes + result
+ 	double recompute_replace = mv_card * 2.0;             // delete all + insert all
+ 	double recompute_total = recompute_compute + recompute_replace;
+ 
 diff --git a/src/upsert/openivm_index_regen.cpp b/src/upsert/openivm_index_regen.cpp
-index 3252495..5ccc8a4 100644
+index 3252495..f8465ea 100644
 --- a/src/upsert/openivm_index_regen.cpp
 +++ b/src/upsert/openivm_index_regen.cpp
 @@ -32,21 +32,21 @@ RenumberWrapper renumber_table_indices(unique_ptr<LogicalOperator> plan, Binder
@@ -2024,1058 +2158,9 @@ index 3252495..5ccc8a4 100644
  		replacer.replacement_bindings.emplace_back(cb, ColumnBinding(new_t, cb.column_index));
  	}
  	return replacer;
-diff --git a/third_party/lpts/src/include/lpts_ast.hpp b/third_party/lpts/src/include/lpts_ast.hpp
-index 2efda04..0eacd85 100644
---- a/third_party/lpts/src/include/lpts_ast.hpp
-+++ b/third_party/lpts/src/include/lpts_ast.hpp
-@@ -58,13 +58,13 @@ public:
- 	string catalog;
- 	string schema;
- 	string table_name;
--	size_t table_index;
-+	TableIndex table_index;
- 	vector<string> column_names;     ///< Physical column names (e.g. "age", "name").
- 	vector<string> cte_column_names; ///< CTE-scoped names (e.g. "t0_age", "t0_name").
- 	vector<string> table_filters;    ///< Pushdown filters (as SQL strings).
- 	idx_t table_function_output_count;
- 
--	AstGetNode(string catalog, string schema, string table_name, size_t table_index, vector<string> column_names,
-+	AstGetNode(string catalog, string schema, string table_name, TableIndex table_index, vector<string> column_names,
- 	           vector<string> cte_column_names, vector<string> table_filters,
- 	           idx_t table_function_output_count = DConstants::INVALID_INDEX)
- 	    : catalog(std::move(catalog)), schema(std::move(schema)), table_name(std::move(table_name)),
-@@ -100,9 +100,9 @@ class AstProjectNode : public AstNode {
- public:
- 	vector<string> expressions;      ///< Projected expressions / column references (child CTE names).
- 	vector<string> cte_column_names; ///< CTE-scoped output names (e.g. "t1_name").
--	size_t table_index;
-+	TableIndex table_index;
- 
--	AstProjectNode(vector<string> expressions, vector<string> cte_column_names, size_t table_index)
-+	AstProjectNode(vector<string> expressions, vector<string> cte_column_names, TableIndex table_index)
- 	    : expressions(std::move(expressions)), cte_column_names(std::move(cte_column_names)), table_index(table_index) {
- 	}
- 
-@@ -260,9 +260,9 @@ public:
- /// Used to correctly order Phase-2 flattening so CTE_REF nodes can look up the body CTE name.
- class AstMaterializedCteNode : public AstNode {
- public:
--	idx_t cte_table_index; ///< table_index from LogicalMaterializedCTE (key for CTE_REF lookup).
-+	TableIndex cte_table_index; ///< table_index from LogicalMaterializedCTE (key for CTE_REF lookup).
- 
--	explicit AstMaterializedCteNode(idx_t cte_table_index_p) : cte_table_index(cte_table_index_p) {
-+	explicit AstMaterializedCteNode(TableIndex cte_table_index_p) : cte_table_index(cte_table_index_p) {
- 	}
- 
- 	string ToString(int indent = 0) const override;
-@@ -275,10 +275,10 @@ public:
- /// Has no children. The body CTE name is resolved in Phase 2 via cte_table_index.
- class AstCteRefNode : public AstNode {
- public:
--	idx_t cte_table_index;           ///< Matches AstMaterializedCteNode::cte_table_index.
-+	TableIndex cte_table_index;      ///< Matches AstMaterializedCteNode::cte_table_index.
- 	vector<string> cte_column_names; ///< Output column names for this CTE scan (e.g. "tN_supplier_no").
- 
--	AstCteRefNode(idx_t cte_table_index_p, vector<string> cte_column_names_p)
-+	AstCteRefNode(TableIndex cte_table_index_p, vector<string> cte_column_names_p)
- 	    : cte_table_index(cte_table_index_p), cte_column_names(std::move(cte_column_names_p)) {
- 	}
- 
-@@ -293,11 +293,11 @@ public:
- /// Has no children. The source CTE name is registered by the parent AstDelimJoinNode in Phase 2.
- class AstDelimGetNode : public AstNode {
- public:
--	idx_t table_index;               ///< Unique table index for this DELIM_GET.
-+	TableIndex table_index;          ///< Unique table index for this DELIM_GET.
- 	vector<string> cte_column_names; ///< Exposed column names (e.g. "tN_p_partkey").
- 	vector<string> source_col_names; ///< Column names to SELECT from the left CTE (e.g. "t3_p_partkey").
- 
--	AstDelimGetNode(idx_t table_index_p, vector<string> cte_column_names_p, vector<string> source_col_names_p)
-+	AstDelimGetNode(TableIndex table_index_p, vector<string> cte_column_names_p, vector<string> source_col_names_p)
- 	    : table_index(table_index_p), cte_column_names(std::move(cte_column_names_p)),
- 	      source_col_names(std::move(source_col_names_p)) {
- 	}
-@@ -316,12 +316,12 @@ public:
- 	JoinType join_type;
- 	vector<string> conditions;         ///< Join conditions as strings.
- 	vector<string> cte_column_names;   ///< Output column names.
--	vector<idx_t> delim_table_indices; ///< table_indices of ALL AstDelimGetNodes in the right subtree.
-+	vector<TableIndex> delim_table_indices; ///< table_indices of ALL AstDelimGetNodes in the right subtree.
- 
- 	string mark_expression; ///< For MARK→LEFT conversion: "(rhs_key IS NOT NULL)" or empty.
- 
- 	AstDelimJoinNode(JoinType join_type_p, vector<string> conditions_p, vector<string> cte_column_names_p,
--	                 vector<idx_t> delim_table_indices_p, string mark_expression_p = "")
-+	                 vector<TableIndex> delim_table_indices_p, string mark_expression_p = "")
- 	    : join_type(join_type_p), conditions(std::move(conditions_p)), cte_column_names(std::move(cte_column_names_p)),
- 	      delim_table_indices(std::move(delim_table_indices_p)), mark_expression(std::move(mark_expression_p)) {
- 	}
-diff --git a/third_party/lpts/src/lpts_ast.cpp b/third_party/lpts/src/lpts_ast.cpp
-index fa69845..9870d93 100644
---- a/third_party/lpts/src/lpts_ast.cpp
-+++ b/third_party/lpts/src/lpts_ast.cpp
-@@ -22,7 +22,7 @@ InsertionOrderPreservingMap<string> AstNode::GetExtraInfo() const {
- string AstGetNode::ToString(int indent) const {
- 	string result = Indent(indent) + "Get";
- 	result += " " + catalog + "." + schema + "." + table_name;
--	result += " (table_index=" + std::to_string(table_index) + ")";
-+	result += " (table_index=" + std::to_string(table_index.index) + ")";
- 	result += "\n" + Indent(indent + 2) + "columns: [";
- 	for (size_t i = 0; i < column_names.size(); i++) {
- 		if (i > 0) {
-@@ -104,7 +104,8 @@ InsertionOrderPreservingMap<string> AstFilterNode::GetExtraInfo() const {
- string AstProjectNode::ToString(int indent) const {
- 	string result = Indent(indent) + "Project";
- 	result +=
--	    " (table_index=" + std::to_string(table_index) + ", expressions=" + std::to_string(expressions.size()) + ")";
-+	    " (table_index=" + std::to_string(table_index.index) + ", expressions=" + std::to_string(expressions.size()) +
-+	    ")";
- 	for (size_t i = 0; i < expressions.size(); i++) {
- 		result += "\n" + Indent(indent + 2) + cte_column_names[i] + " <- " + expressions[i];
- 	}
-@@ -329,7 +330,8 @@ string AstDistinctNode::ToString(int indent) const {
- //------------------------------------------------------------------------------
- 
- string AstMaterializedCteNode::ToString(int indent) const {
--	string result = Indent(indent) + "MaterializedCte (cte_table_index=" + std::to_string(cte_table_index) + ")";
-+	string result =
-+	    Indent(indent) + "MaterializedCte (cte_table_index=" + std::to_string(cte_table_index.index) + ")";
- 	if (children.size() >= 1) {
- 		result += "\n" + Indent(indent + 2) + "body:";
- 		result += "\n" + children[0]->ToString(indent + 4);
-@@ -346,7 +348,7 @@ string AstMaterializedCteNode::ToString(int indent) const {
- //------------------------------------------------------------------------------
- 
- string AstCteRefNode::ToString(int indent) const {
--	string result = Indent(indent) + "CteRef (cte_table_index=" + std::to_string(cte_table_index) + ")";
-+	string result = Indent(indent) + "CteRef (cte_table_index=" + std::to_string(cte_table_index.index) + ")";
- 	if (!cte_column_names.empty()) {
- 		result += "\n" + Indent(indent + 2) + "columns: [";
- 		for (size_t i = 0; i < cte_column_names.size(); i++) {
-@@ -365,7 +367,7 @@ string AstCteRefNode::ToString(int indent) const {
- //------------------------------------------------------------------------------
- 
- string AstDelimGetNode::ToString(int indent) const {
--	string result = Indent(indent) + "DelimGet (table_index=" + std::to_string(table_index) + ")";
-+	string result = Indent(indent) + "DelimGet (table_index=" + std::to_string(table_index.index) + ")";
- 	if (!cte_column_names.empty()) {
- 		result += "\n" + Indent(indent + 2) + "exposed: [";
- 		for (size_t i = 0; i < cte_column_names.size(); i++) {
-@@ -400,7 +402,7 @@ string AstDelimJoinNode::ToString(int indent) const {
- 		if (i > 0) {
- 			result += ",";
- 		}
--		result += std::to_string(delim_table_indices[i]);
-+		result += std::to_string(delim_table_indices[i].index);
- 	}
- 	result += "]";
- 	for (const auto &cond : conditions) {
-diff --git a/third_party/lpts/src/lpts_pipeline.cpp b/third_party/lpts/src/lpts_pipeline.cpp
-index 2f1f197..c66cfb8 100644
---- a/third_party/lpts/src/lpts_pipeline.cpp
-+++ b/third_party/lpts/src/lpts_pipeline.cpp
-@@ -1,5 +1,3 @@
--#include "storage/ducklake_scan.hpp"
--
- //==============================================================================
- // lpts_pipeline.cpp
- //
-@@ -74,6 +72,18 @@ namespace duckdb {
- //==============================================================================
- class AstBuilder {
- private:
-+	static idx_t RawIndex(const TableIndex &table_index) {
-+		return table_index.index;
-+	}
-+
-+	static idx_t RawIndex(const ProjectionIndex &column_index) {
-+		return column_index.index;
-+	}
-+
-+	static ColumnBinding MakeBinding(const TableIndex &table_index, idx_t column_index) {
-+		return ColumnBinding(table_index, ProjectionIndex(column_index));
-+	}
-+
- 	/// Wrapper around ColumnBinding for use as std::map key.
- 	struct MappableColumnBinding {
- 		ColumnBinding cb;
-@@ -86,18 +96,18 @@ private:
- 
- 	/// Metadata for one column as it flows through the plan.
- 	struct ColStruct {
--		const idx_t table_index;
-+		const TableIndex table_index;
- 		string column_name; ///< Original physical column name.
- 		string alias;       ///< Optional alias for expressions. Empty if not set.
- 
--		ColStruct(const idx_t _table_index, string _column_name, string _alias)
-+		ColStruct(const TableIndex &_table_index, string _column_name, string _alias)
- 		    : table_index(_table_index), column_name(std::move(_column_name)), alias(std::move(_alias)) {
- 		}
- 
- 		/// Produce "t{table_index}_{alias || column_name}".
- 		string ToUniqueColumnName() const {
- 			string base = alias.empty() ? column_name : alias;
--			string result = "t" + std::to_string(table_index) + "_";
-+			string result = "t" + std::to_string(table_index.index) + "_";
- 			for (char c : base) {
- 				if (c == '(' || c == ')' || c == ' ' || c == ',' || c == '*') {
- 					result += '_';
-@@ -109,7 +119,7 @@ private:
- 		}
- 	};
- 
--	static unique_ptr<ColStruct> MakeDedupedColumn(idx_t table_index, string column_name, string alias,
-+	static unique_ptr<ColStruct> MakeDedupedColumn(TableIndex table_index, string column_name, string alias,
- 	                                               unordered_set<string> &seen_names, idx_t suffix_seed) {
- 		string base_column_name = column_name;
- 		string base_alias = alias;
-@@ -163,12 +173,12 @@ private:
- 
- 	/// Maps DELIM_GET table_index → source column names (from the outer/left CTE).
- 	/// Populated by PreregisterDelimGetColumns before the right subtree is traversed.
--	unordered_map<idx_t, vector<string>> delim_get_source_col_names;
-+	unordered_map<TableIndex, vector<string>> delim_get_source_col_names;
- 
- 	/// Maps LogicalMaterializedCTE::table_index → the actual body output column names.
- 	/// DuckDB can prune unused CTE body columns while LogicalCTERef::bound_columns still
- 	/// carries the original user-visible names, so CTE refs must follow the body output arity.
--	unordered_map<idx_t, vector<string>> materialized_cte_body_column_names;
-+	unordered_map<TableIndex, vector<string>> materialized_cte_body_column_names;
- 
- 	const unique_ptr<ColStruct> &FindColumnBinding(const ColumnBinding &binding, const char *context) const {
- 		auto it = column_map.find(MappableColumnBinding(binding));
-@@ -176,23 +186,22 @@ private:
- 			return it->second;
- 		}
- 		throw InternalException("LPTS: %s column ref (%llu,%llu) not in column_map", context,
--		                        (unsigned long long)binding.table_index, (unsigned long long)binding.column_index);
-+		                        (unsigned long long)binding.table_index.index,
-+		                        (unsigned long long)binding.column_index.index);
- 	}
- 
--	void RegisterChildBindingFallbacks(Expression &expr, const vector<ColumnBinding> &child_bindings) {
--		if (expr.type == ExpressionType::BOUND_COLUMN_REF) {
-+	void RegisterChildBindingFallbacks(const Expression &expr, const vector<ColumnBinding> &child_bindings) {
-+		if (expr.GetExpressionType() == ExpressionType::BOUND_COLUMN_REF) {
- 			auto &bcr = expr.Cast<BoundColumnRefExpression>();
- 			if (column_map.find(MappableColumnBinding(bcr.binding)) == column_map.end() &&
--			    bcr.binding.column_index < child_bindings.size()) {
--				auto &src = FindColumnBinding(child_bindings[bcr.binding.column_index], "projection fallback");
-+			    bcr.binding.column_index.index < child_bindings.size()) {
-+				auto &src = FindColumnBinding(child_bindings[bcr.binding.column_index.index], "projection fallback");
- 				column_map[MappableColumnBinding(bcr.binding)] =
- 				    make_uniq<ColStruct>(src->table_index, src->column_name, src->alias);
- 			}
- 		}
--		ExpressionIterator::EnumerateChildren(expr, [&](unique_ptr<Expression> &child) {
--			if (child) {
--				RegisterChildBindingFallbacks(*child, child_bindings);
--			}
-+		ExpressionIterator::EnumerateChildren(expr, [&](const Expression &child) {
-+			RegisterChildBindingFallbacks(child, child_bindings);
- 		});
- 	}
- 
-@@ -305,8 +314,8 @@ private:
- 				return "()";
- 			}
- 			vector<string> set_names;
--			for (idx_t group_idx : grouping_set) {
--				set_names.push_back(group_names[group_idx]);
-+			for (const auto &group_idx : grouping_set) {
-+				set_names.push_back(group_names[group_idx.index]);
- 			}
- 			return VecToSeparatedList(set_names);
- 		}
-@@ -318,8 +327,8 @@ private:
- 				continue;
- 			}
- 			vector<string> set_names;
--			for (idx_t group_idx : grouping_set) {
--				set_names.push_back(group_names[group_idx]);
-+			for (const auto &group_idx : grouping_set) {
-+				set_names.push_back(group_names[group_idx.index]);
- 			}
- 			set_clauses.push_back("(" + VecToSeparatedList(set_names) + ")");
- 		}
-@@ -619,22 +628,22 @@ private:
- 	// ColumnBinding references with their CTE column names via column_map.
- 	// Converts a bound Expression into a SQL string.
- 	//--------------------------------------------------------------------------
--	string ExpressionToAliasedString(const unique_ptr<Expression> &expression) const {
--		const ExpressionClass e_class = expression->GetExpressionClass();
-+	string ExpressionToAliasedString(const Expression &expression) const {
-+		const ExpressionClass e_class = expression.GetExpressionClass();
- 		std::ostringstream expr_str;
- 		switch (e_class) {
- 		case ExpressionClass::BOUND_COLUMN_REF: {
--			const BoundColumnRefExpression &bcr = expression->Cast<BoundColumnRefExpression>();
-+			const BoundColumnRefExpression &bcr = expression.Cast<BoundColumnRefExpression>();
- 			const unique_ptr<ColStruct> &col_struct = FindColumnBinding(bcr.binding, "expression");
- 			expr_str << col_struct->ToUniqueColumnName();
- 			break;
- 		}
- 		case ExpressionClass::BOUND_CONSTANT: {
--			expr_str << expression->ToString();
-+			expr_str << expression.ToString();
- 			break;
- 		}
- 		case ExpressionClass::BOUND_COMPARISON: {
--			const BoundComparisonExpression &cmp = expression->Cast<BoundComparisonExpression>();
-+			const BoundComparisonExpression &cmp = expression.Cast<BoundComparisonExpression>();
- 			expr_str << "(";
- 			expr_str << ExpressionToAliasedString(cmp.left);
- 			expr_str << ") ";
-@@ -645,14 +654,14 @@ private:
- 			break;
- 		}
- 		case ExpressionClass::BOUND_CAST: {
--			const BoundCastExpression &cast_expr = expression->Cast<BoundCastExpression>();
-+			const BoundCastExpression &cast_expr = expression.Cast<BoundCastExpression>();
- 			expr_str << (cast_expr.try_cast ? "TRY_CAST(" : "CAST(");
- 			expr_str << ExpressionToAliasedString(cast_expr.child);
- 			expr_str << " AS " + cast_expr.return_type.ToString() + ")";
- 			break;
- 		}
- 		case ExpressionClass::BOUND_CONJUNCTION: {
--			const BoundConjunctionExpression &conj = expression->Cast<BoundConjunctionExpression>();
-+			const BoundConjunctionExpression &conj = expression.Cast<BoundConjunctionExpression>();
- 			// BoundConjunctionExpression can have N children (N ≥ 2).
- 			// Serialize as: (child[0]) OP (child[1]) OP ... OP (child[N-1]).
- 			string op = ExpressionTypeToOperator(conj.GetExpressionType());
-@@ -667,7 +676,7 @@ private:
- 			break;
- 		}
- 		case ExpressionClass::BOUND_FUNCTION: {
--			const BoundFunctionExpression &func_expr = expression->Cast<BoundFunctionExpression>();
-+			const BoundFunctionExpression &func_expr = expression.Cast<BoundFunctionExpression>();
- 			// Dialect-specific function name remapping.
- 			string func_name = func_expr.function.name;
- 			if (dialect == SqlDialect::POSTGRES) {
-@@ -768,15 +777,15 @@ private:
- 			break;
- 		}
- 		case ExpressionClass::BOUND_REF: {
--			expr_str << expression->ToString();
-+			expr_str << expression.ToString();
- 			break;
- 		}
- 		case ExpressionClass::BOUND_LAMBDA_REF: {
--			expr_str << expression->ToString();
-+			expr_str << expression.ToString();
- 			break;
- 		}
- 		case ExpressionClass::BOUND_CASE: {
--			const BoundCaseExpression &case_expr = expression->Cast<BoundCaseExpression>();
-+			const BoundCaseExpression &case_expr = expression.Cast<BoundCaseExpression>();
- 			expr_str << "CASE";
- 			for (auto &check : case_expr.case_checks) {
- 				expr_str << " WHEN " << ExpressionToAliasedString(check.when_expr);
-@@ -789,7 +798,7 @@ private:
- 			break;
- 		}
- 		case ExpressionClass::BOUND_OPERATOR: {
--			const BoundOperatorExpression &op_expr = expression->Cast<BoundOperatorExpression>();
-+			const BoundOperatorExpression &op_expr = expression.Cast<BoundOperatorExpression>();
- 			switch (op_expr.GetExpressionType()) {
- 			case ExpressionType::OPERATOR_IS_NULL:
- 				expr_str << "(" << ExpressionToAliasedString(op_expr.children[0]) << ") IS NULL";
-@@ -840,22 +849,26 @@ private:
- 			break;
- 		}
- 		case ExpressionClass::BOUND_UNNEST: {
--			const BoundUnnestExpression &unnest_expr = expression->Cast<BoundUnnestExpression>();
-+			const BoundUnnestExpression &unnest_expr = expression.Cast<BoundUnnestExpression>();
- 			expr_str << "UNNEST(" << ExpressionToAliasedString(unnest_expr.child) << ")";
- 			break;
- 		}
- 		case ExpressionClass::BOUND_WINDOW: {
--			const BoundWindowExpression &window_expr = expression->Cast<BoundWindowExpression>();
-+			const BoundWindowExpression &window_expr = expression.Cast<BoundWindowExpression>();
- 			expr_str << WindowExpressionToAliasedString(window_expr);
- 			break;
- 		}
- 		default:
- 			throw NotImplementedException("Not implemented expression for ExpressionToAliasedString: %s",
--			                              ExpressionTypeToString(expression->type));
-+			                              ExpressionTypeToString(expression.GetExpressionType()));
- 		}
- 		return expr_str.str();
- 	}
- 
-+	string ExpressionToAliasedString(const unique_ptr<Expression> &expression) const {
-+		return ExpressionToAliasedString(*expression);
-+	}
-+
- 	//--------------------------------------------------------------------------
- 	// IsCompressedMaterializationProjection
- 	//
-@@ -893,7 +906,7 @@ private:
- 	// all LOGICAL_DELIM_GET nodes. Stops at nested LOGICAL_DELIM_JOIN nodes
- 	// (they own their own DELIM_GETs and handle them separately).
- 	//--------------------------------------------------------------------------
--	static void CollectDelimGetTableIndices(const LogicalOperator *subtree, vector<idx_t> &out) {
-+	static void CollectDelimGetTableIndices(const LogicalOperator *subtree, vector<TableIndex> &out) {
- 		if (!subtree) {
- 			return;
- 		}
-@@ -924,7 +937,7 @@ private:
- 		}
- 		if (subtree->type == LogicalOperatorType::LOGICAL_DELIM_GET) {
- 			const LogicalDelimGet &dg = subtree->Cast<LogicalDelimGet>();
--			const idx_t dg_ti = dg.table_index;
-+			const TableIndex dg_ti = dg.table_index;
- 			vector<string> source_names;
- 
- 			for (size_t i = 0; i < dg.chunk_types.size(); i++) {
-@@ -941,7 +954,7 @@ private:
- 				}
- 
- 				source_names.push_back(source_col_name);
--				column_map[MappableColumnBinding(ColumnBinding(dg_ti, i))] = make_uniq<ColStruct>(dg_ti, col_name, "");
-+				column_map[MappableColumnBinding(MakeBinding(dg_ti, i))] = make_uniq<ColStruct>(dg_ti, col_name, "");
- 			}
- 
- 			delim_get_source_col_names[dg_ti] = std::move(source_names);
-@@ -970,7 +983,7 @@ private:
- 		case LogicalOperatorType::LOGICAL_GET: {
- 			const LogicalGet &get = op->Cast<LogicalGet>();
- 			auto catalog_entry = get.GetTable();
--			const idx_t table_index = get.table_index;
-+			const TableIndex table_index = get.table_index;
- 			string catalog_name;
- 			string schema_name;
- 			string table_name;
-@@ -991,53 +1004,11 @@ private:
- 				LPTS_DEBUG_PRINT("[LPTS-AST] GET:   ParamsToString '" + ps.first + "'='" + ps.second + "'");
- 			}
- 
--			// Check for DuckLake snapshot-range scans (insertions/deletions) and time travel.
-+			// The bundled LPTS copy in OpenIVM is not synchronized with current
-+			// DuckLake scan internals. Fall back to generic GET handling here.
- 			bool is_ducklake_change_scan = false;
- 			bool is_ducklake_time_travel = false;
- 			idx_t ducklake_snapshot_id = 0;
--			if (get.function.name == "ducklake_scan" && get.function.function_info) {
--				auto &func_info = get.function.function_info->Cast<DuckLakeFunctionInfo>();
--				// AT VERSION: only emit for explicit time-travel scans, NOT for
--				// regular current-snapshot scans. Every ducklake_scan has a valid
--				// snapshot_id (the current transaction's), but emitting AT VERSION
--				// for those would pin stored queries (e.g. MV definitions) to a
--				// specific snapshot instead of reading current data.
--				// Detection: compare the scan's snapshot against the transaction's
--				// current snapshot (same pattern as ducklake_scan.cpp:158).
--				if (func_info.scan_type == DuckLakeScanType::SCAN_TABLE) {
--					// Detect explicit time travel by comparing the scan's snapshot
--					// against the catalog's current snapshot. Regular scans use the
--					// current snapshot; AT VERSION scans use a historical one.
--					auto catalog_entry = get.GetTable();
--					if (catalog_entry) {
--						string cat_name = catalog_entry->ParentCatalog().GetName();
--						idx_t current_snap = GetDuckLakeCurrentSnapshot(cat_name);
--						if (current_snap != DConstants::INVALID_INDEX &&
--						    func_info.snapshot.snapshot_id != current_snap) {
--							is_ducklake_time_travel = true;
--							ducklake_snapshot_id = func_info.snapshot.snapshot_id;
--						}
--					}
--				}
--				if (func_info.scan_type == DuckLakeScanType::SCAN_INSERTIONS ||
--				    func_info.scan_type == DuckLakeScanType::SCAN_DELETIONS) {
--					is_ducklake_change_scan = true;
--					string func_name = (func_info.scan_type == DuckLakeScanType::SCAN_INSERTIONS)
--					                       ? "ducklake_table_insertions"
--					                       : "ducklake_table_deletions";
--					std::ostringstream func_str;
--					func_str << func_name << "(";
--					for (size_t i = 0; i < get.parameters.size(); i++) {
--						if (i > 0) {
--							func_str << ", ";
--						}
--						func_str << get.parameters[i].ToSQLString();
--					}
--					func_str << ")";
--					table_name = func_str.str();
--					LPTS_DEBUG_PRINT("[LPTS-AST] GET: DuckLake change scan -> " + table_name);
--				}
--			}
- 
- 			if (!is_ducklake_change_scan) {
- 				if (catalog_entry) {
-@@ -1101,7 +1072,7 @@ private:
- 				// this output column corresponds to. When projection_ids is set
- 				// (optimizer removed unused columns), the binding index may
- 				// differ from the loop index.
--				const idx_t col_id_idx = cb.column_index;
-+				const idx_t col_id_idx = cb.column_index.index;
- 				if (col_id_idx >= col_ids.size()) {
- 					string col_name = "rowid";
- 					if (!op->children.empty() && get.parameters.empty()) {
-@@ -1144,16 +1115,16 @@ private:
- 				column_names.clear();
- 				cte_column_names.clear();
- 				column_names.push_back("1");
--				cte_column_names.push_back("t" + std::to_string(table_index) + "_dummy");
-+				cte_column_names.push_back("t" + std::to_string(table_index.index) + "_dummy");
- 			}
- 
- 			// Pushdown table filters (rare, but present in some plans).
- 			// FILTER_PUSHDOWN wraps pushed-down conditions in OptionalFilter, whose
- 			// ToString() prepends "optional: ". Strip that prefix so the condition
- 			// is valid SQL when embedded in a WHERE clause.
--			if (!get.table_filters.filters.empty()) {
--				for (auto &entry : get.table_filters.filters) {
--					string filter_str = entry.second->ToString(get.names[entry.first]);
-+			if (get.table_filters.HasFilters()) {
-+				for (auto &entry : get.table_filters) {
-+					string filter_str = entry.Filter().ToString(get.names[entry.ColumnIndex()]);
- 					static const string kOptionalPrefix = "optional: ";
- 					if (filter_str.substr(0, kOptionalPrefix.size()) == kOptionalPrefix) {
- 						filter_str = filter_str.substr(kOptionalPrefix.size());
-@@ -1180,9 +1151,9 @@ private:
- 		//----------------------------------------------------------------------
- 		case LogicalOperatorType::LOGICAL_WINDOW: {
- 			const LogicalWindow &window = op->Cast<LogicalWindow>();
--			const idx_t table_index = window.window_index;
-+			const TableIndex table_index = window.window_index;
- 
--			LPTS_DEBUG_PRINT("[LPTS-AST] Building LOGICAL_WINDOW (table_index=" + std::to_string(table_index) + ")");
-+			LPTS_DEBUG_PRINT("[LPTS-AST] Building LOGICAL_WINDOW (table_index=" + std::to_string(table_index.index) + ")");
- 
- 			vector<string> expressions;
- 			vector<string> cte_column_names;
-@@ -1206,16 +1177,16 @@ private:
- 
- 				string alias = window.expressions[i]->HasAlias() ? window.expressions[i]->GetAlias()
- 				                                                 : "window_" + std::to_string(i);
--				string unique_name = "t" + std::to_string(table_index) + "_" + alias;
-+				string unique_name = "t" + std::to_string(table_index.index) + "_" + alias;
- 				for (idx_t suffix = i; seen_names.count(unique_name); suffix++) {
- 					alias = "window_" + std::to_string(i) + "_" + std::to_string(suffix);
--					unique_name = "t" + std::to_string(table_index) + "_" + alias;
-+					unique_name = "t" + std::to_string(table_index.index) + "_" + alias;
- 				}
- 				seen_names.insert(unique_name);
- 
- 				auto new_col = make_uniq<ColStruct>(table_index, expr_str, std::move(alias));
- 				cte_column_names.push_back(new_col->ToUniqueColumnName());
--				column_map[MappableColumnBinding(ColumnBinding(table_index, i))] = std::move(new_col);
-+				column_map[MappableColumnBinding(MakeBinding(table_index, i))] = std::move(new_col);
- 			}
- 
- 			LPTS_DEBUG_PRINT("[LPTS-AST] Built LOGICAL_WINDOW with " + std::to_string(window.expressions.size()) +
-@@ -1226,7 +1197,7 @@ private:
- 		//----------------------------------------------------------------------
- 		case LogicalOperatorType::LOGICAL_PROJECTION: {
- 			const LogicalProjection &proj = op->Cast<LogicalProjection>();
--			const idx_t table_index = proj.table_index;
-+			const TableIndex table_index = proj.table_index;
- 
- 			// Skip compressed materialization projections (compress/decompress).
- 			// These contain __internal_compress_* or __internal_decompress_* functions
-@@ -1235,9 +1206,9 @@ private:
- 			// to signal RecursiveTraversal to pass through the child node directly.
- 			if (IsCompressedMaterializationProjection(proj)) {
- 				LPTS_DEBUG_PRINT("[LPTS-AST] Skipping compressed materialization projection (table_index=" +
--				                 std::to_string(table_index) + ")");
-+				                 std::to_string(table_index.index) + ")");
- 				for (size_t i = 0; i < proj.expressions.size(); ++i) {
--					const ColumnBinding new_cb(table_index, i);
-+					const ColumnBinding new_cb = MakeBinding(table_index, i);
- 					const unique_ptr<Expression> &expr = proj.expressions[i];
- 					if (expr->type == ExpressionType::BOUND_FUNCTION) {
- 						// compress/decompress: remap to child's source column,
-@@ -1269,7 +1240,7 @@ private:
- 
- 			for (size_t i = 0; i < proj.expressions.size(); ++i) {
- 				const unique_ptr<Expression> &expr = proj.expressions[i];
--				const ColumnBinding new_cb = ColumnBinding(table_index, i);
-+					const ColumnBinding new_cb = MakeBinding(table_index, i);
- 
- 				if (expr->type == ExpressionType::BOUND_COLUMN_REF) {
- 					BoundColumnRefExpression &bcr = expr->Cast<BoundColumnRefExpression>();
-@@ -1277,8 +1248,8 @@ private:
- 					if (column_map.find(MappableColumnBinding(lookup_binding)) == column_map.end() &&
- 					    !proj.children.empty()) {
- 						auto child_bindings = proj.children[0]->GetColumnBindings();
--						if (lookup_binding.column_index < child_bindings.size()) {
--							lookup_binding = child_bindings[lookup_binding.column_index];
-+						if (lookup_binding.column_index.index < child_bindings.size()) {
-+							lookup_binding = child_bindings[lookup_binding.column_index.index];
- 						}
- 					}
- 					const unique_ptr<ColStruct> &desc = FindColumnBinding(lookup_binding, "projection");
-@@ -1289,10 +1260,10 @@ private:
- 					// Build unique CTE column name; append _N suffix on collision.
- 					string base = alias.empty() ? col_name : alias;
- 					string deduped = base;
--					string unique_name = "t" + to_string(table_index) + "_" + deduped;
-+					string unique_name = "t" + to_string(table_index.index) + "_" + deduped;
- 					for (size_t suffix = i; seen_names.count(unique_name); suffix++) {
- 						deduped = base + "_" + to_string(suffix);
--						unique_name = "t" + to_string(table_index) + "_" + deduped;
-+						unique_name = "t" + to_string(table_index.index) + "_" + deduped;
- 					}
- 					seen_names.insert(unique_name);
- 					if (alias.empty()) {
-@@ -1310,10 +1281,10 @@ private:
- 					string expr_str = ExpressionToAliasedString(expr);
- 					expressions.emplace_back(expr_str);
- 					string scalar_alias = expr->HasAlias() ? expr->GetAlias() : "scalar_" + std::to_string(i);
--					string unique_name = "t" + to_string(table_index) + "_" + scalar_alias;
-+					string unique_name = "t" + to_string(table_index.index) + "_" + scalar_alias;
- 					for (size_t suffix = i; seen_names.count(unique_name); suffix++) {
- 						scalar_alias = "scalar_" + to_string(i) + "_" + to_string(suffix);
--						unique_name = "t" + to_string(table_index) + "_" + scalar_alias;
-+						unique_name = "t" + to_string(table_index.index) + "_" + scalar_alias;
- 					}
- 					seen_names.insert(unique_name);
- 					auto new_col = make_uniq<ColStruct>(table_index, expr_str, std::move(scalar_alias));
-@@ -1328,7 +1299,7 @@ private:
- 		//----------------------------------------------------------------------
- 		case LogicalOperatorType::LOGICAL_UNNEST: {
- 			const LogicalUnnest &unnest = op->Cast<LogicalUnnest>();
--			const idx_t table_index = unnest.unnest_index;
-+			const TableIndex table_index = unnest.unnest_index;
- 
- 			vector<string> expressions;
- 			vector<string> cte_column_names;
-@@ -1347,7 +1318,7 @@ private:
- 				expressions.push_back(expr_str);
- 				auto col_struct = make_uniq<ColStruct>(table_index, "unnest_" + std::to_string(i), "");
- 				cte_column_names.push_back(col_struct->ToUniqueColumnName());
--				column_map[MappableColumnBinding(ColumnBinding(table_index, i))] = std::move(col_struct);
-+				column_map[MappableColumnBinding(MakeBinding(table_index, i))] = std::move(col_struct);
- 			}
- 
- 			return make_uniq<AstProjectNode>(std::move(expressions), std::move(cte_column_names), table_index);
-@@ -1356,8 +1327,8 @@ private:
- 		//----------------------------------------------------------------------
- 		case LogicalOperatorType::LOGICAL_AGGREGATE_AND_GROUP_BY: {
- 			const LogicalAggregate &agg = op->Cast<LogicalAggregate>();
--			const idx_t group_table_index = agg.group_index;
--			const idx_t agg_table_index = agg.aggregate_index;
-+			const TableIndex group_table_index = agg.group_index;
-+			const TableIndex agg_table_index = agg.aggregate_index;
- 			vector<string> group_names;
- 			vector<string> agg_expressions;
- 			vector<string> cte_column_names;
-@@ -1371,14 +1342,14 @@ private:
- 					auto it = column_map.find(MappableColumnBinding(bcr.binding));
- 					if (it == column_map.end()) {
- 						throw InternalException("LPTS: GROUP BY column ref (%llu,%llu) not in column_map",
--						                        (unsigned long long)bcr.binding.table_index,
--						                        (unsigned long long)bcr.binding.column_index);
-+						                        (unsigned long long)bcr.binding.table_index.index,
-+						                        (unsigned long long)bcr.binding.column_index.index);
- 					}
- 					const unique_ptr<ColStruct> &desc = it->second;
- 					group_names.push_back(desc->ToUniqueColumnName());
- 					auto new_col = MakeDedupedColumn(group_table_index, desc->column_name, desc->alias, seen_names, i);
- 					cte_column_names.push_back(new_col->ToUniqueColumnName());
--					column_map[MappableColumnBinding(ColumnBinding(group_table_index, i))] = std::move(new_col);
-+					column_map[MappableColumnBinding(MakeBinding(group_table_index, i))] = std::move(new_col);
- 				} else {
- 					// Non-column GROUP BY expression (COALESCE, CASE, function, etc.)
- 					string expr_str = ExpressionToAliasedString(g);
-@@ -1386,7 +1357,7 @@ private:
- 					group_names.push_back(expr_str);
- 					auto new_col = MakeDedupedColumn(group_table_index, expr_str, std::move(alias), seen_names, i);
- 					cte_column_names.push_back(new_col->ToUniqueColumnName());
--					column_map[MappableColumnBinding(ColumnBinding(group_table_index, i))] = std::move(new_col);
-+					column_map[MappableColumnBinding(MakeBinding(group_table_index, i))] = std::move(new_col);
- 				}
- 			}
- 
-@@ -1462,7 +1433,7 @@ private:
- 				agg_expressions.push_back(agg_str.str());
- 				auto new_col = MakeDedupedColumn(agg_table_index, agg_str.str(), std::move(agg_alias), seen_names, i);
- 				cte_column_names.push_back(new_col->ToUniqueColumnName());
--				column_map[MappableColumnBinding(ColumnBinding(agg_table_index, i))] = std::move(new_col);
-+				column_map[MappableColumnBinding(MakeBinding(agg_table_index, i))] = std::move(new_col);
- 			}
- 
- 			// Remap source bindings → aggregate group output bindings.
-@@ -1479,7 +1450,7 @@ private:
- 					continue;
- 				}
- 				BoundColumnRefExpression &bcr = g->Cast<BoundColumnRefExpression>();
--				ColumnBinding new_cb(group_table_index, i);
-+				ColumnBinding new_cb = MakeBinding(group_table_index, i);
- 				if (bcr.binding == new_cb) {
- 					continue;
- 				}
-@@ -1503,11 +1474,11 @@ private:
- 				child_bindings.insert(child_bindings.end(), bindings.begin(), bindings.end());
- 			}
- 			for (const auto &cond : join_op.conditions) {
--				RegisterChildBindingFallbacks(*cond.left, child_bindings);
--				RegisterChildBindingFallbacks(*cond.right, child_bindings);
--				string lhs = ExpressionToAliasedString(cond.left);
--				string rhs = ExpressionToAliasedString(cond.right);
--				string cmp = ExpressionTypeToOperator(cond.comparison);
-+				RegisterChildBindingFallbacks(cond.GetLHS(), child_bindings);
-+				RegisterChildBindingFallbacks(cond.GetRHS(), child_bindings);
-+				string lhs = ExpressionToAliasedString(cond.GetLHS());
-+				string rhs = ExpressionToAliasedString(cond.GetRHS());
-+				string cmp = ExpressionTypeToOperator(cond.GetComparisonType());
- 				conditions.push_back("(" + lhs + " " + cmp + " " + rhs + ")");
- 			}
- 
-@@ -1517,12 +1488,12 @@ private:
- 			// The right side is wrapped in SELECT DISTINCT at SQL generation time
- 			// to prevent left-row duplication when the RHS has repeated values.
- 			if (join_op.join_type == JoinType::MARK) {
--				LPTS_DEBUG_PRINT("[LPTS-AST] MARK join detected: mark_index=" + std::to_string(join_op.mark_index) +
-+				LPTS_DEBUG_PRINT("[LPTS-AST] MARK join detected: mark_index=" + std::to_string(join_op.mark_index.index) +
- 				                 " conditions=" + std::to_string(join_op.conditions.size()));
--				ColumnBinding mark_cb(join_op.mark_index, 0);
-+				ColumnBinding mark_cb(join_op.mark_index, ProjectionIndex(0));
- 				string mark_expr;
- 				if (!join_op.conditions.empty()) {
--					mark_expr = "(" + ExpressionToAliasedString(join_op.conditions[0].right) + " IS NOT NULL)";
-+					mark_expr = "(" + ExpressionToAliasedString(join_op.conditions[0].GetRHS()) + " IS NOT NULL)";
- 				} else {
- 					mark_expr = "true";
- 				}
-@@ -1543,7 +1514,7 @@ private:
- 			if (sql_join_type == JoinType::MARK) {
- 				sql_join_type = JoinType::LEFT;
- 				// Extract the mark expression we registered in column_map
--				ColumnBinding mark_cb(join_op.mark_index, 0);
-+				ColumnBinding mark_cb(join_op.mark_index, ProjectionIndex(0));
- 				auto it = column_map.find(MappableColumnBinding(mark_cb));
- 				if (it != column_map.end()) {
- 					mark_expr = it->second->column_name; // contains the IS NOT NULL expression
-@@ -1589,7 +1560,7 @@ private:
- 		//----------------------------------------------------------------------
- 		case LogicalOperatorType::LOGICAL_UNION: {
- 			const LogicalSetOperation &set_op = op->Cast<LogicalSetOperation>();
--			const idx_t table_index = set_op.table_index;
-+			const TableIndex table_index = set_op.table_index;
- 			vector<string> cte_column_names;
- 			const auto &lhs_bindings = op->children[0]->GetColumnBindings();
- 			const auto &union_bindings = op->GetColumnBindings();
-@@ -1605,7 +1576,7 @@ private:
- 		case LogicalOperatorType::LOGICAL_EXCEPT:
- 		case LogicalOperatorType::LOGICAL_INTERSECT: {
- 			const LogicalSetOperation &set_op = op->Cast<LogicalSetOperation>();
--			const idx_t table_index = set_op.table_index;
-+			const TableIndex table_index = set_op.table_index;
- 			vector<string> cte_column_names;
- 			const auto &lhs_bindings = op->children[0]->GetColumnBindings();
- 			const auto &setop_bindings = op->GetColumnBindings();
-@@ -1694,10 +1665,10 @@ private:
- 			// expressions. Serialize it as a one-row subquery with a dummy column;
- 			// parent projections will replace the dummy with their constants.
- 			const LogicalDummyScan &dummy = op->Cast<LogicalDummyScan>();
--			const idx_t table_index = dummy.table_index;
-+			const TableIndex table_index = dummy.table_index;
- 			vector<string> column_names = {"1"};
--			vector<string> cte_column_names = {"t" + std::to_string(table_index) + "_dummy"};
--			column_map[MappableColumnBinding(ColumnBinding(table_index, 0))] =
-+			vector<string> cte_column_names = {"t" + std::to_string(table_index.index) + "_dummy"};
-+			column_map[MappableColumnBinding(MakeBinding(table_index, 0))] =
- 			    make_uniq<ColStruct>(table_index, "1", "");
- 			return make_uniq<AstGetNode>("", "", "(SELECT 1)", table_index, std::move(column_names),
- 			                             std::move(cte_column_names), vector<string>());
-@@ -1720,7 +1691,8 @@ private:
- 			// Emit a real zero-row subquery. Using a fake table name here leaks
- 			// through when the empty result is nested inside a larger plan.
- 			vector<string> filters = {"false"};
--			return make_uniq<AstGetNode>("", "", "(SELECT 1)", 0, std::move(column_names), std::move(cte_column_names),
-+			return make_uniq<AstGetNode>("", "", "(SELECT 1)", TableIndex(0), std::move(column_names),
-+			                             std::move(cte_column_names),
- 			                             std::move(filters));
- 		}
- 
-@@ -1731,10 +1703,10 @@ private:
- 			// We emit the values as a (VALUES ...) subquery so GetNode::ToQuery() renders it
- 			// as: SELECT c0 FROM (VALUES (v1), (v2), ...) _tf(c0)
- 			const LogicalColumnDataGet &chunk_get = op->Cast<LogicalColumnDataGet>();
--			const idx_t table_index = chunk_get.table_index;
-+			const TableIndex table_index = chunk_get.table_index;
- 			const auto &types = chunk_get.chunk_types;
- 
--			LPTS_DEBUG_PRINT("[LPTS-AST] CHUNK_GET: table_index=" + std::to_string(table_index) + " types=" +
-+			LPTS_DEBUG_PRINT("[LPTS-AST] CHUNK_GET: table_index=" + std::to_string(table_index.index) + " types=" +
- 			                 std::to_string(types.size()) + " rows=" + std::to_string(chunk_get.collection->Count()));
- 
- 			// Synthetic column names c0, c1, … for the VALUES columns.
-@@ -1745,7 +1717,7 @@ private:
- 				auto col_struct = make_uniq<ColStruct>(table_index, col_name, "");
- 				cte_column_names.push_back(col_struct->ToUniqueColumnName());
- 				column_names.push_back(col_name);
--				column_map[MappableColumnBinding(ColumnBinding(table_index, i))] = std::move(col_struct);
-+				column_map[MappableColumnBinding(MakeBinding(table_index, i))] = std::move(col_struct);
- 			}
- 
- 			// Materialize VALUES from the collection.
-@@ -1779,7 +1751,7 @@ private:
- 			// EXPRESSION_GET backs VALUES clauses. Emit it as a VALUES table function
- 			// so constant relation joins can round-trip through SQL.
- 			const LogicalExpressionGet &expr_get = op->Cast<LogicalExpressionGet>();
--			const idx_t table_index = expr_get.table_index;
-+			const TableIndex table_index = expr_get.table_index;
- 
- 			vector<string> column_names;
- 			vector<string> cte_column_names;
-@@ -1788,7 +1760,7 @@ private:
- 				auto col_struct = make_uniq<ColStruct>(table_index, col_name, "");
- 				cte_column_names.push_back(col_struct->ToUniqueColumnName());
- 				column_names.push_back(col_name);
--				column_map[MappableColumnBinding(ColumnBinding(table_index, i))] = std::move(col_struct);
-+				column_map[MappableColumnBinding(MakeBinding(table_index, i))] = std::move(col_struct);
- 			}
- 
- 			std::ostringstream values_str;
-@@ -1817,11 +1789,11 @@ private:
- 			// CTE_REF is a scan of a materialized CTE body (used when a WITH clause CTE
- 			// is referenced more than once). The actual body CTE name is resolved in Phase 2.
- 			const LogicalCTERef &cte_ref = op->Cast<LogicalCTERef>();
--			const idx_t table_index = cte_ref.table_index;
--			const idx_t cte_index = cte_ref.cte_index;
-+			const TableIndex table_index = cte_ref.table_index;
-+			const TableIndex cte_index = cte_ref.cte_index;
- 
--			LPTS_DEBUG_PRINT("[LPTS-AST] CTE_REF: table_index=" + std::to_string(table_index) + " cte_index=" +
--			                 std::to_string(cte_index) + " columns=" + std::to_string(cte_ref.bound_columns.size()));
-+			LPTS_DEBUG_PRINT("[LPTS-AST] CTE_REF: table_index=" + std::to_string(table_index.index) + " cte_index=" +
-+			                 std::to_string(cte_index.index) + " columns=" + std::to_string(cte_ref.bound_columns.size()));
- 
- 			// Register output columns using the materialized body's actual output names when available.
- 			// DuckDB can prune the body to the columns referenced by the outer query, while bound_columns
-@@ -1833,7 +1805,7 @@ private:
- 					string col_name = StripTablePrefix(body_cols_it->second[i]);
- 					auto col_struct = make_uniq<ColStruct>(table_index, std::move(col_name), "");
- 					cte_column_names.push_back(col_struct->ToUniqueColumnName());
--					column_map[MappableColumnBinding(ColumnBinding(table_index, i))] = std::move(col_struct);
-+					column_map[MappableColumnBinding(MakeBinding(table_index, i))] = std::move(col_struct);
- 				}
- 				return make_uniq<AstCteRefNode>(cte_index, std::move(cte_column_names));
- 			}
-@@ -1842,7 +1814,7 @@ private:
- 				const string &col_name = cte_ref.bound_columns[i];
- 				auto col_struct = make_uniq<ColStruct>(table_index, col_name, "");
- 				cte_column_names.push_back(col_struct->ToUniqueColumnName());
--				column_map[MappableColumnBinding(ColumnBinding(table_index, i))] = std::move(col_struct);
-+				column_map[MappableColumnBinding(MakeBinding(table_index, i))] = std::move(col_struct);
- 			}
- 
- 			return make_uniq<AstCteRefNode>(cte_index, std::move(cte_column_names));
-@@ -1854,7 +1826,7 @@ private:
- 			// AstMaterializedCteNode preserves the ordering so Phase 2 can flatten the body
- 			// first and make the body CTE name available for CteRef resolution.
- 			const LogicalMaterializedCTE &mat_cte = op->Cast<LogicalMaterializedCTE>();
--			LPTS_DEBUG_PRINT("[LPTS-AST] MATERIALIZED_CTE: table_index=" + std::to_string(mat_cte.table_index) +
-+			LPTS_DEBUG_PRINT("[LPTS-AST] MATERIALIZED_CTE: table_index=" + std::to_string(mat_cte.table_index.index) +
- 			                 " ctename='" + mat_cte.ctename + "'");
- 			return make_uniq<AstMaterializedCteNode>(mat_cte.table_index);
- 		}
-@@ -1865,21 +1837,21 @@ private:
- 		// the right subtree is traversed. We just collect them here and build the node.
- 		case LogicalOperatorType::LOGICAL_DELIM_GET: {
- 			const LogicalDelimGet &dg = op->Cast<LogicalDelimGet>();
--			const idx_t table_index = dg.table_index;
-+			const TableIndex table_index = dg.table_index;
- 
--			LPTS_DEBUG_PRINT("[LPTS-AST] DELIM_GET: table_index=" + std::to_string(table_index) +
-+			LPTS_DEBUG_PRINT("[LPTS-AST] DELIM_GET: table_index=" + std::to_string(table_index.index) +
- 			                 " cols=" + std::to_string(dg.chunk_types.size()));
- 
- 			vector<string> cte_column_names;
- 			for (size_t i = 0; i < dg.chunk_types.size(); i++) {
--				auto it = column_map.find(MappableColumnBinding(ColumnBinding(table_index, i)));
-+				auto it = column_map.find(MappableColumnBinding(MakeBinding(table_index, i)));
- 				if (it != column_map.end()) {
- 					cte_column_names.push_back(it->second->ToUniqueColumnName());
- 				} else {
- 					// Fallback: parent DELIM_JOIN should have pre-registered these.
- 					auto col_struct = make_uniq<ColStruct>(table_index, "c" + std::to_string(i), "");
- 					cte_column_names.push_back(col_struct->ToUniqueColumnName());
--					column_map[MappableColumnBinding(ColumnBinding(table_index, i))] = std::move(col_struct);
-+					column_map[MappableColumnBinding(MakeBinding(table_index, i))] = std::move(col_struct);
- 				}
- 			}
- 
-@@ -1906,7 +1878,7 @@ private:
- 
- 			// Collect ALL DELIM_GET table_indices from the inner subtree.
- 			// There can be more than one when the Deliminator keeps multiple inner joins.
--			vector<idx_t> delim_tis;
-+			vector<TableIndex> delim_tis;
- 			CollectDelimGetTableIndices(op->children[inner_child_idx].get(), delim_tis);
- 
- 			LPTS_DEBUG_PRINT("[LPTS-AST] DELIM_JOIN: join_type=" + EnumUtil::ToString(dj.join_type) +
-@@ -1922,16 +1894,16 @@ private:
- 			// matching rows (via SELECT DISTINCT from the outer CTE), so any left row
- 			// that appears in the RIGHT CTE is a match, and IS NOT NULL holds.
- 			if (dj.join_type == JoinType::MARK) {
--				ColumnBinding mark_cb(dj.mark_index, 0);
-+				ColumnBinding mark_cb(dj.mark_index, ProjectionIndex(0));
- 				string mark_expr = "true";
- 				if (!dj.conditions.empty()) {
- 					// Try to build the RHS expression for the IS NOT NULL check.
- 					// Print the binding before attempting the lookup so we can diagnose failures.
--					if (dj.conditions[0].right->GetExpressionClass() == ExpressionClass::BOUND_COLUMN_REF) {
--						auto &bcr = dj.conditions[0].right->Cast<BoundColumnRefExpression>();
--						LPTS_DEBUG_PRINT("[LPTS-AST] DELIM_JOIN MARK: cond[0].right binding=(" +
--						                 std::to_string(bcr.binding.table_index) + "," +
--						                 std::to_string(bcr.binding.column_index) + ")");
-+					if (dj.conditions[0].GetRHS().GetExpressionClass() == ExpressionClass::BOUND_COLUMN_REF) {
-+						auto &bcr = dj.conditions[0].GetRHS().Cast<BoundColumnRefExpression>();
-+					LPTS_DEBUG_PRINT("[LPTS-AST] DELIM_JOIN MARK: cond[0].right binding=(" +
-+					                 std::to_string(bcr.binding.table_index.index) + "," +
-+					                 std::to_string(bcr.binding.column_index.index) + ")");
- 						auto it = column_map.find(MappableColumnBinding(bcr.binding));
- 						if (it != column_map.end()) {
- 							mark_expr = "(" + it->second->ToUniqueColumnName() + " IS NOT NULL)";
-@@ -1939,11 +1911,11 @@ private:
- 							LPTS_DEBUG_PRINT("[LPTS-AST] DELIM_JOIN MARK: cond[0].right binding NOT in column_map");
- 						}
- 					}
--					if (dj.conditions[0].left->GetExpressionClass() == ExpressionClass::BOUND_COLUMN_REF) {
--						auto &bcr = dj.conditions[0].left->Cast<BoundColumnRefExpression>();
--						LPTS_DEBUG_PRINT("[LPTS-AST] DELIM_JOIN MARK: cond[0].left binding=(" +
--						                 std::to_string(bcr.binding.table_index) + "," +
--						                 std::to_string(bcr.binding.column_index) + ")");
-+					if (dj.conditions[0].GetLHS().GetExpressionClass() == ExpressionClass::BOUND_COLUMN_REF) {
-+						auto &bcr = dj.conditions[0].GetLHS().Cast<BoundColumnRefExpression>();
-+					LPTS_DEBUG_PRINT("[LPTS-AST] DELIM_JOIN MARK: cond[0].left binding=(" +
-+					                 std::to_string(bcr.binding.table_index.index) + "," +
-+					                 std::to_string(bcr.binding.column_index.index) + ")");
- 						auto it2 = column_map.find(MappableColumnBinding(bcr.binding));
- 						if (it2 == column_map.end()) {
- 							LPTS_DEBUG_PRINT("[LPTS-AST] DELIM_JOIN MARK: cond[0].left binding NOT in column_map");
-@@ -1951,7 +1923,7 @@ private:
- 					}
- 				}
- 				LPTS_DEBUG_PRINT("[LPTS-AST] DELIM_JOIN MARK: registering mark column mark_index=" +
--				                 std::to_string(dj.mark_index) + " expr='" + mark_expr + "'");
-+				                 std::to_string(dj.mark_index.index) + " expr='" + mark_expr + "'");
- 				column_map[MappableColumnBinding(mark_cb)] = make_uniq<ColStruct>(dj.mark_index, mark_expr, "_mark");
- 			}
- 
-@@ -1962,25 +1934,25 @@ private:
- 				child_bindings.insert(child_bindings.end(), bindings.begin(), bindings.end());
- 			}
- 			for (const auto &cond : dj.conditions) {
--				RegisterChildBindingFallbacks(*cond.left, child_bindings);
--				RegisterChildBindingFallbacks(*cond.right, child_bindings);
--				if (cond.left->GetExpressionClass() == ExpressionClass::BOUND_COLUMN_REF) {
--					auto &bcr = cond.left->Cast<BoundColumnRefExpression>();
--					LPTS_DEBUG_PRINT(
--					    "[LPTS-AST] DELIM_JOIN cond.left binding=(" + std::to_string(bcr.binding.table_index) + "," +
--					    std::to_string(bcr.binding.column_index) +
--					    ") in_map=" + std::to_string(column_map.count(MappableColumnBinding(bcr.binding))));
-+				RegisterChildBindingFallbacks(cond.GetLHS(), child_bindings);
-+				RegisterChildBindingFallbacks(cond.GetRHS(), child_bindings);
-+				if (cond.GetLHS().GetExpressionClass() == ExpressionClass::BOUND_COLUMN_REF) {
-+					auto &bcr = cond.GetLHS().Cast<BoundColumnRefExpression>();
-+					LPTS_DEBUG_PRINT("[LPTS-AST] DELIM_JOIN cond.left binding=(" +
-+					                 std::to_string(bcr.binding.table_index.index) + "," +
-+					                 std::to_string(bcr.binding.column_index.index) + ") in_map=" +
-+					                 std::to_string(column_map.count(MappableColumnBinding(bcr.binding))));
- 				}
--				if (cond.right->GetExpressionClass() == ExpressionClass::BOUND_COLUMN_REF) {
--					auto &bcr = cond.right->Cast<BoundColumnRefExpression>();
--					LPTS_DEBUG_PRINT(
--					    "[LPTS-AST] DELIM_JOIN cond.right binding=(" + std::to_string(bcr.binding.table_index) + "," +
--					    std::to_string(bcr.binding.column_index) +
--					    ") in_map=" + std::to_string(column_map.count(MappableColumnBinding(bcr.binding))));
-+				if (cond.GetRHS().GetExpressionClass() == ExpressionClass::BOUND_COLUMN_REF) {
-+					auto &bcr = cond.GetRHS().Cast<BoundColumnRefExpression>();
-+					LPTS_DEBUG_PRINT("[LPTS-AST] DELIM_JOIN cond.right binding=(" +
-+					                 std::to_string(bcr.binding.table_index.index) + "," +
-+					                 std::to_string(bcr.binding.column_index.index) + ") in_map=" +
-+					                 std::to_string(column_map.count(MappableColumnBinding(bcr.binding))));
- 				}
--				string lhs = ExpressionToAliasedString(cond.left);
--				string rhs = ExpressionToAliasedString(cond.right);
--				string cmp = ExpressionTypeToOperator(cond.comparison);
-+				string lhs = ExpressionToAliasedString(cond.GetLHS());
-+				string rhs = ExpressionToAliasedString(cond.GetRHS());
-+				string cmp = ExpressionTypeToOperator(cond.GetComparisonType());
- 				conditions.push_back("(" + lhs + " " + cmp + " " + rhs + ")");
- 			}
- 
-@@ -1991,7 +1963,7 @@ private:
- 			JoinType sql_join_type = dj.join_type;
- 			if (sql_join_type == JoinType::MARK) {
- 				sql_join_type = JoinType::LEFT;
--				ColumnBinding mark_cb(dj.mark_index, 0);
-+				ColumnBinding mark_cb(dj.mark_index, ProjectionIndex(0));
- 				auto it = column_map.find(MappableColumnBinding(mark_cb));
- 				if (it != column_map.end()) {
- 					mark_col_expr = it->second->column_name; // the IS NOT NULL expression
-@@ -2140,11 +2112,11 @@ private:
- 	/// Maps LogicalMaterializedCTE::table_index → (lpts_cte_name, lpts_cte_column_list)
- 	/// of the last CTE generated for the body. Populated when flattening AstMaterializedCteNode;
- 	/// consumed when flattening AstCteRefNode.
--	unordered_map<idx_t, pair<string, vector<string>>> cte_index_to_body_info;
-+	unordered_map<TableIndex, pair<string, vector<string>>> cte_index_to_body_info;
- 
- 	/// Maps AstDelimGetNode::table_index → name of the outer left CTE to SELECT DISTINCT from.
- 	/// Populated when flattening AstDelimJoinNode (before the right subtree); consumed by AstDelimGetNode.
--	unordered_map<idx_t, string> delim_get_source_cte;
-+	unordered_map<TableIndex, string> delim_get_source_cte;
- 
- 	/// Compute the CTE name for a given node type and index.
- 	static string CteName(const AstNode &node, size_t index) {
-@@ -2177,7 +2149,7 @@ private:
- 		if (type == "MaterializedCte") {
- 			const AstMaterializedCteNode &mat = static_cast<const AstMaterializedCteNode &>(ast_node);
- 			LPTS_DEBUG_PRINT("[LPTS-CTE] MaterializedCte: flattening body (cte_table_index=" +
--			                 std::to_string(mat.cte_table_index) + ")");
-+			                 std::to_string(mat.cte_table_index.index) + ")");
- 			unique_ptr<CteNode> body_last = FlattenNode(*ast_node.children[0]);
- 			cte_index_to_body_info[mat.cte_table_index] = {body_last->cte_name, body_last->cte_column_list};
- 			cte_nodes.push_back(std::move(body_last));
-@@ -2193,7 +2165,7 @@ private:
- 			auto it = cte_index_to_body_info.find(cte_ref_node.cte_table_index);
- 			if (it == cte_index_to_body_info.end()) {
- 				throw InternalException("LPTS: CteRef references unknown materialized CTE index %llu",
--				                        (unsigned long long)cte_ref_node.cte_table_index);
-+				                        (unsigned long long)cte_ref_node.cte_table_index.index);
- 			}
- 			const string &body_lpts_name = it->second.first;
- 			const vector<string> &body_lpts_cols = it->second.second;
-@@ -2220,8 +2192,8 @@ private:
- 			cte_nodes.push_back(std::move(left_cte));
- 
- 			// 2. Register the outer CTE as the source for ALL DELIM_GETs in the inner subtree.
--			for (const idx_t dti : dj.delim_table_indices) {
--				LPTS_DEBUG_PRINT("[LPTS-CTE] DelimJoin: registering delim_ti=" + std::to_string(dti) + " -> '" +
-+			for (const TableIndex dti : dj.delim_table_indices) {
-+				LPTS_DEBUG_PRINT("[LPTS-CTE] DelimJoin: registering delim_ti=" + std::to_string(dti.index) + " -> '" +
- 				                 left_cte_name + "'");
- 				delim_get_source_cte[dti] = left_cte_name;
- 			}
-@@ -2246,7 +2218,7 @@ private:
- 			auto it = delim_get_source_cte.find(dg.table_index);
- 			if (it == delim_get_source_cte.end()) {
- 				throw InternalException("LPTS: DelimGet table_index=%llu not registered by parent DelimJoin",
--				                        (unsigned long long)dg.table_index);
-+				                        (unsigned long long)dg.table_index.index);
- 			}
- 			const string &source_cte_name = it->second;
- 			const size_t my_index = node_count++;
-@@ -2280,7 +2252,7 @@ private:
- 			string schema_out = (dialect == SqlDialect::POSTGRES) ? "" : get.schema;
- 			string input_cte_name = children_names.empty() ? string() : children_names[0];
- 			return make_uniq<GetNode>(my_index, get.cte_column_names, catalog_out, schema_out, get.table_name,
--			                          get.table_index, get.table_filters, get.column_names, input_cte_name,
-+			                          get.table_index.index, get.table_filters, get.column_names, input_cte_name,
- 			                          get.table_function_output_count);
- 		}
- 
-@@ -2293,7 +2265,7 @@ private:
- 		if (type == "Project") {
- 			const AstProjectNode &proj = static_cast<const AstProjectNode &>(ast_node);
- 			return make_uniq<ProjectNode>(my_index, proj.cte_column_names, children_names[0], proj.expressions,
--			                              proj.table_index);
-+			                              proj.table_index.index);
- 		}
- 
- 		if (type == "Aggregate") {
+diff --git a/third_party/lpts b/third_party/lpts
+--- a/third_party/lpts
++++ b/third_party/lpts
+@@ -1 +1 @@
+-Subproject commit 8f31c24ef619c46571be785dde5dbf70fb7fadf6
++Subproject commit 8f31c24ef619c46571be785dde5dbf70fb7fadf6-dirty

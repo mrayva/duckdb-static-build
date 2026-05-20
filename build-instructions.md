@@ -192,34 +192,33 @@ Expected artifact:
 What the build script verifies today:
 - the artifact exists
 - the matching DuckDB binary can `LOAD` it with `-unsigned`
+- the scripted build installs a tracked DuckLake patch snapshot before configure so loadable OpenIVM runs reproduce the validated `ducklake_scan` behavior
 
 What is not currently green:
 - the full upstream OpenIVM SQL suite
-- several incremental-refresh correctness cases
 - several DuckLake-specific tests
 
 Current measured result on the validated host-side build:
-- core suite (`ivm_*.test` + `mv_*.test`): `28 passed`, `1 failed`
-- full upstream suite (`test/sql/*.test`): `30 passed`, `13 failed`
+- core suite (`ivm_*.test` + `mv_*.test`): `29 passed`, `0 failed`
+- full upstream suite (`test/sql/*.test`): `32 passed`, `11 failed`
 
 What is now validated:
 1. `CREATE MATERIALIZED VIEW ...` creates OpenIVM catalog state
 2. `_duckdb_ivm_views` and related metadata tables are created
-3. `PRAGMA ivm('view_name')` works for a substantial subset of views
-4. core inner-join refresh correctness is fixed
+3. `PRAGMA ivm('view_name')` works across the full core suite
+4. all core incremental-refresh correctness tests are green
 5. `ivm_concurrency.test` passes in the repo-local validator
+6. DuckLake `ducklake_scan` serialization/registration is fixed for the loadable profile
 
 Main remaining failures:
-1. one cost-model mismatch in `ivm_auto_refresh.test`
-2. several DuckLake-specific failures remain in the full suite
+1. DuckLake-specific failures remain in the full suite
 
 Current DuckLake failure buckets:
 1. correctness mismatches in:
    `ducklake_aggregate.test`, `ducklake_chained.test`, `ducklake_cte.test`,
    `ducklake_deltas.test`, `ducklake_distinct.test`, `ducklake_filter.test`,
-   `ducklake_projection.test`, `ducklake_union.test`, `ducklake_v1_features.test`
-2. `DuckLakeScan` serialization gaps in:
-   `ducklake_inner_join.test`, `ducklake_window.test`, `ducklake_window_delta.test`
+   `ducklake_inner_join.test`, `ducklake_projection.test`, `ducklake_union.test`,
+   `ducklake_v1_features.test`, `ducklake_window_delta.test`
 
 Functional validation command:
 

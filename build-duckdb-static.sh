@@ -83,6 +83,17 @@ sanitize_dirty_fetchcontent_deps() {
     fi
 }
 
+install_ducklake_patch_snapshot() {
+    local patch_src="$BUILD_SCRIPT_DIR/patches/ducklake-current-duckdb.patch"
+    local patch_dst="$DUCKDB_DIR/.github/patches/extensions/ducklake/fix.patch"
+    if [ ! -f "$patch_src" ]; then
+        return 0
+    fi
+    mkdir -p "$(dirname "$patch_dst")"
+    cp "$patch_src" "$patch_dst"
+    log_success "DuckLake extension patch snapshot installed"
+}
+
 # Parse arguments
 while [[ $# -gt 0 ]]; do
   case $1 in
@@ -2244,6 +2255,7 @@ PATCH_B64
 fi
 
 log_success "Extension patch files created"
+install_ducklake_patch_snapshot
 
 # Step 5: Install vcpkg dependencies
 if [ "$SKIP_VCPKG" = false ]; then

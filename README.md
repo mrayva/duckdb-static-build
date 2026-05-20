@@ -67,23 +67,26 @@ The loadable profile builds into `<duckdb-dir>/build/release-static-openivm-load
 This is now the only supported OpenIVM integration path in this repo. Upstream DuckDB or OpenIVM refreshes may still require patch refreshes.
 
 Functional OpenIVM validation is materially working. The loadable artifact builds and loads, and the runtime now executes `CREATE MATERIALIZED VIEW` side effects correctly:
-- core suite (`ivm_*.test` + `mv_*.test`): `28 passed`, `1 failed`
-- full suite (`test/sql/*.test`): `30 passed`, `13 failed`
+- core suite (`ivm_*.test` + `mv_*.test`): `29 passed`, `0 failed`
+- full suite (`test/sql/*.test`): `32 passed`, `11 failed`
 
 What is now working:
 - `CREATE MATERIALIZED VIEW ...` creates OpenIVM catalog state
 - `_duckdb_ivm_*` metadata tables are created
-- `PRAGMA ivm('view_name')` works for a substantial subset of views
-- inner-join refresh correctness is fixed for the core suite
+- `PRAGMA ivm('view_name')` works across the full core suite
+- all core incremental-refresh correctness tests are green
 - `ivm_concurrency.test` passes in the repo-local validator
+- DuckLake `ducklake_scan` serialization/registration is fixed for loadable OpenIVM builds
 
 What is still failing:
-- one cost-model mismatch in `ivm_auto_refresh.test`
-- several DuckLake-specific tests in the full suite
+- DuckLake-specific correctness tests in the full suite
 
 Current DuckLake failure buckets:
-- correctness mismatches in aggregate/projection/filter/union/chained/cte/distinct/delta cases
-- `DuckLakeScan` serialization gaps in `ducklake_inner_join.test`, `ducklake_window.test`, and `ducklake_window_delta.test`
+- correctness mismatches in:
+  `ducklake_aggregate.test`, `ducklake_chained.test`, `ducklake_cte.test`,
+  `ducklake_deltas.test`, `ducklake_distinct.test`, `ducklake_filter.test`,
+  `ducklake_inner_join.test`, `ducklake_projection.test`, `ducklake_union.test`,
+  `ducklake_v1_features.test`, `ducklake_window_delta.test`
 
 Use the repo-local validator to reproduce the current status:
 
@@ -100,6 +103,8 @@ Use `full` instead of `core` to run the entire upstream `test/sql/*.test` set.
 |------|-------------|
 | `build-duckdb-static.sh` | Automated build script |
 | `build-instructions.md` | Full build/runbook (clean env + troubleshooting) |
+| `patches/ducklake-current-duckdb.patch` | DuckLake extension patch snapshot used for loadable OpenIVM validation |
+| `patches/openivm-current-duckdb.patch` | OpenIVM compatibility patch for the current DuckDB snapshot |
 | `scripts/validate-openivm-functional.sh` | OpenIVM functional validator |
 | `README.md` | Summary |
 
