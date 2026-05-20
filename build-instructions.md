@@ -199,19 +199,27 @@ What is not currently green:
 - several DuckLake-specific tests
 
 Current measured result on the validated host-side build:
-- core suite (`ivm_*.test` + `mv_*.test`): `27 passed`, `2 failed`
-- full upstream suite (`test/sql/*.test`): `29 passed`, `14 failed`
+- core suite (`ivm_*.test` + `mv_*.test`): `28 passed`, `1 failed`
+- full upstream suite (`test/sql/*.test`): `30 passed`, `13 failed`
 
 What is now validated:
 1. `CREATE MATERIALIZED VIEW ...` creates OpenIVM catalog state
 2. `_duckdb_ivm_views` and related metadata tables are created
 3. `PRAGMA ivm('view_name')` works for a substantial subset of views
 4. core inner-join refresh correctness is fixed
+5. `ivm_concurrency.test` passes in the repo-local validator
 
 Main remaining failures:
 1. one cost-model mismatch in `ivm_auto_refresh.test`
-2. `ivm_concurrency.test` is not fully measurable by the repo-local validator because it uses `concurrentloop`
-3. several DuckLake-specific failures remain in the full suite
+2. several DuckLake-specific failures remain in the full suite
+
+Current DuckLake failure buckets:
+1. correctness mismatches in:
+   `ducklake_aggregate.test`, `ducklake_chained.test`, `ducklake_cte.test`,
+   `ducklake_deltas.test`, `ducklake_distinct.test`, `ducklake_filter.test`,
+   `ducklake_projection.test`, `ducklake_union.test`, `ducklake_v1_features.test`
+2. `DuckLakeScan` serialization gaps in:
+   `ducklake_inner_join.test`, `ducklake_window.test`, `ducklake_window_delta.test`
 
 Functional validation command:
 

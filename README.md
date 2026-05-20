@@ -67,19 +67,23 @@ The loadable profile builds into `<duckdb-dir>/build/release-static-openivm-load
 This is now the only supported OpenIVM integration path in this repo. Upstream DuckDB or OpenIVM refreshes may still require patch refreshes.
 
 Functional OpenIVM validation is materially working. The loadable artifact builds and loads, and the runtime now executes `CREATE MATERIALIZED VIEW` side effects correctly:
-- core suite (`ivm_*.test` + `mv_*.test`): `27 passed`, `2 failed`
-- full suite (`test/sql/*.test`): `29 passed`, `14 failed`
+- core suite (`ivm_*.test` + `mv_*.test`): `28 passed`, `1 failed`
+- full suite (`test/sql/*.test`): `30 passed`, `13 failed`
 
 What is now working:
 - `CREATE MATERIALIZED VIEW ...` creates OpenIVM catalog state
 - `_duckdb_ivm_*` metadata tables are created
 - `PRAGMA ivm('view_name')` works for a substantial subset of views
 - inner-join refresh correctness is fixed for the core suite
+- `ivm_concurrency.test` passes in the repo-local validator
 
 What is still failing:
 - one cost-model mismatch in `ivm_auto_refresh.test`
-- `ivm_concurrency.test` in the repo-local runner, because it uses `concurrentloop`, which the current validator does not implement
 - several DuckLake-specific tests in the full suite
+
+Current DuckLake failure buckets:
+- correctness mismatches in aggregate/projection/filter/union/chained/cte/distinct/delta cases
+- `DuckLakeScan` serialization gaps in `ducklake_inner_join.test`, `ducklake_window.test`, and `ducklake_window_delta.test`
 
 Use the repo-local validator to reproduce the current status:
 

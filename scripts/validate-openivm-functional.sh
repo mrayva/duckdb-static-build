@@ -47,9 +47,10 @@ require_file "$LIBDUCKDB_DIR/libduckdb.so"
 require_file "$OPENIVM_TEST_DIR"
 require_file "$DUCKDB_DIR/src/include/duckdb.hpp"
 
-cat > "$RUNNER_CPP" <<'EOF'
+cat > "$RUNNER_CPP" <<'CPP'
 #include "duckdb.hpp"
 #include "duckdb/main/config.hpp"
+
 #include <algorithm>
 #include <filesystem>
 #include <fstream>
@@ -57,6 +58,8 @@ cat > "$RUNNER_CPP" <<'EOF'
 #include <memory>
 #include <stdexcept>
 #include <string>
+#include <thread>
+#include <unordered_map>
 #include <vector>
 
 namespace fs = std::filesystem;
@@ -66,6 +69,12 @@ struct Failure {
     int line;
     std::string phase;
     std::string message;
+};
+
+struct ExecContext {
+    std::string dbpath;
+    int thread_id = -1;
+    std::unordered_map<std::string, int> vars;
 };
 
 static std::string Trim(const std::string &s) {
@@ -90,6 +99,25 @@ static std::string ReplaceAll(std::string s, const std::string &from, const std:
     return s;
 }
 
+static std::vector<std::string> SplitWS(const std::string &s) {
+    std::vector<std::string> parts;
+    std::string current;
+    for (char c : s) {
+        if (c == ' ' || c == '\t' || c == '\r' || c == '\n') {
+            if (!current.empty()) {
+                parts.push_back(current);
+                current.clear();
+            }
+        } else {
+            current.push_back(c);
+        }
+    }
+    if (!current.empty()) {
+        parts.push_back(current);
+    }
+    return parts;
+}
+
 struct Runner {
     std::string openivm_ext_path;
     std::vector<Failure> failures;
@@ -97,14 +125,26 @@ struct Runner {
     std::unique_ptr<duckdb::DuckDB> db;
     std::unique_ptr<duckdb::Connection> con;
 
-    void OpenDatabase(const std::string &dbpath) {
+    static void EnsureParentDir(const std::string &path) {
+        if (path == ":memory:") {
+            return;
+        }
+        auto parent = fs::path(path).parent_path();
+        if (!parent.empty()) {
+            fs::create_directories(parent);
+        }
+    }
+
+    void OpenDatabaseHandle(const std::string &dbpath, std::unique_ptr<duckdb::DuckDB> &db_handle,
+                            std::unique_ptr<duckdb::Connection> &con_handle) {
         duckdb::DBConfig config;
         config.SetOptionByName("allow_unsigned_extensions", duckdb::Value(true));
         config.SetOptionByName("allow_community_extensions", duckdb::Value(true));
-        db = std::make_unique<duckdb::DuckDB>(dbpath, &config);
-        con = std::make_unique<duckdb::Connection>(*db);
+        EnsureParentDir(dbpath);
+        db_handle = std::make_unique<duckdb::DuckDB>(dbpath, &config);
+        con_handle = std::make_unique<duckdb::Connection>(*db_handle);
         for (const auto &ext : loaded_exts) {
-            auto res = con->Query(ext);
+            auto res = con_handle->Query(ext);
             if (!res || res->HasError()) {
                 throw std::runtime_error("Failed to load extension on reopen: " +
                                          (res ? res->GetError() : std::string("null result")));
@@ -112,15 +152,12 @@ struct Runner {
         }
     }
 
-    static void EnsureParentDir(const std::string &path) {
-        auto parent = fs::path(path).parent_path();
-        if (!parent.empty()) {
-            fs::create_directories(parent);
-        }
+    void OpenDatabase(const std::string &dbpath) {
+        OpenDatabaseHandle(dbpath, db, con);
     }
 
-    bool ExecSQL(const std::string &sql, std::string &error) {
-        auto res = con->Query(sql);
+    bool ExecSQL(duckdb::Connection &connection, const std::string &sql, std::string &error) {
+        auto res = connection.Query(sql);
         if (!res) {
             error = "null result";
             return false;
@@ -132,7 +169,7 @@ struct Runner {
         return true;
     }
 
-    bool LoadRequirement(const std::string &name, std::string &error) {
+    bool LoadRequirement(duckdb::Connection &connection, const std::string &name, std::string &error) {
         std::string stmt;
         if (name == "openivm") {
             stmt = "LOAD '" + openivm_ext_path + "'";
@@ -142,10 +179,11 @@ struct Runner {
         if (std::find(loaded_exts.begin(), loaded_exts.end(), stmt) == loaded_exts.end()) {
             loaded_exts.push_back(stmt);
         }
-        return ExecSQL(stmt, error);
+        return ExecSQL(connection, stmt, error);
     }
 
-    bool HandleInstallStatement(const std::string &sql, std::string &error, bool &handled) {
+    bool HandleInstallStatement(duckdb::Connection &connection, const std::string &sql, std::string &error,
+                                bool &handled) {
         handled = false;
         auto trimmed = Trim(sql);
         if (!StartsWith(trimmed, "INSTALL ") || trimmed.find('\n') != std::string::npos) {
@@ -160,7 +198,7 @@ struct Runner {
             return true;
         }
         handled = true;
-        return LoadRequirement(ext, error);
+        return LoadRequirement(connection, ext, error);
     }
 
     static std::vector<std::string> ReadLines(const std::string &path) {
@@ -176,8 +214,17 @@ struct Runner {
         return lines;
     }
 
+    static std::string ExpandVars(std::string s, const std::string &test_dir,
+                                  const std::unordered_map<std::string, int> &vars) {
+        s = ReplaceAll(std::move(s), "__TEST_DIR__", test_dir);
+        for (const auto &kv : vars) {
+            s = ReplaceAll(std::move(s), "${" + kv.first + "}", std::to_string(kv.second));
+        }
+        return s;
+    }
+
     static std::string CollectSQL(const std::vector<std::string> &lines, size_t &i, const std::string &test_dir,
-                                  bool stop_on_separator) {
+                                  const std::unordered_map<std::string, int> &vars, bool stop_on_separator) {
         std::string sql;
         for (; i < lines.size(); i++) {
             auto trimmed = Trim(lines[i]);
@@ -187,20 +234,21 @@ struct Runner {
             if (stop_on_separator && trimmed == "----") {
                 break;
             }
-            sql += ReplaceAll(lines[i], "__TEST_DIR__", test_dir);
+            sql += ExpandVars(lines[i], test_dir, vars);
             sql += '\n';
         }
         return sql;
     }
 
     static std::vector<std::string> CollectExpected(const std::vector<std::string> &lines, size_t &i,
-                                                    const std::string &test_dir) {
+                                                    const std::string &test_dir,
+                                                    const std::unordered_map<std::string, int> &vars) {
         std::vector<std::string> expected;
         for (; i < lines.size(); i++) {
             if (Trim(lines[i]).empty()) {
                 break;
             }
-            expected.push_back(ReplaceAll(lines[i], "__TEST_DIR__", test_dir));
+            expected.push_back(ExpandVars(lines[i], test_dir, vars));
         }
         return expected;
     }
@@ -220,38 +268,94 @@ struct Runner {
         return out;
     }
 
-    bool RunTestFile(const std::string &path) {
-        std::string test_name = fs::path(path).stem().string();
-        std::string test_dir = "/tmp/openivm-functional/" + test_name;
-        fs::remove_all(test_dir);
-        fs::create_directories(test_dir);
-        loaded_exts.clear();
-        OpenDatabase(":memory:");
+    static bool EvalOnlyIf(const std::string &expr, int thread_id) {
+        if (thread_id < 0) {
+            return false;
+        }
+        if (StartsWith(expr, "threadid>=")) {
+            return thread_id >= std::stoi(expr.substr(std::string("threadid>=").size()));
+        }
+        if (StartsWith(expr, "threadid<=")) {
+            return thread_id <= std::stoi(expr.substr(std::string("threadid<=").size()));
+        }
+        if (StartsWith(expr, "threadid=")) {
+            return thread_id == std::stoi(expr.substr(std::string("threadid=").size()));
+        }
+        if (StartsWith(expr, "threadid>")) {
+            return thread_id > std::stoi(expr.substr(std::string("threadid>").size()));
+        }
+        if (StartsWith(expr, "threadid<")) {
+            return thread_id < std::stoi(expr.substr(std::string("threadid<").size()));
+        }
+        return false;
+    }
 
-        auto lines = ReadLines(path);
-        for (size_t i = 0; i < lines.size(); i++) {
+    static size_t FindMatchingEndloop(const std::vector<std::string> &lines, size_t start) {
+        int depth = 0;
+        for (size_t i = start; i < lines.size(); i++) {
+            auto line = Trim(lines[i]);
+            if (StartsWith(line, "loop ") || StartsWith(line, "concurrentloop ")) {
+                depth++;
+            } else if (line == "endloop") {
+                depth--;
+                if (depth == 0) {
+                    return i;
+                }
+            }
+        }
+        return lines.size();
+    }
+
+    bool ExecuteRange(const std::vector<std::string> &lines, size_t begin, size_t end, const std::string &path,
+                      const std::string &test_dir, ExecContext &ctx, std::unique_ptr<duckdb::DuckDB> &db_handle,
+                      std::unique_ptr<duckdb::Connection> &con_handle, Failure &failure) {
+        bool has_guard = false;
+        bool guard_value = true;
+
+        for (size_t i = begin; i < end; i++) {
             std::string line = Trim(lines[i]);
             if (line.empty() || StartsWith(line, "#")) {
                 continue;
             }
 
+            if (StartsWith(line, "onlyif ")) {
+                bool pred = EvalOnlyIf(Trim(line.substr(7)), ctx.thread_id);
+                if (has_guard) {
+                    guard_value = guard_value && pred;
+                } else {
+                    has_guard = true;
+                    guard_value = pred;
+                }
+                continue;
+            }
+
+            bool run_current = !has_guard || guard_value;
+            has_guard = false;
+            guard_value = true;
+
             if (StartsWith(line, "require ")) {
+                if (!run_current) {
+                    continue;
+                }
                 std::string req = Trim(line.substr(8));
                 std::string err;
-                if (!LoadRequirement(req, err)) {
-                    failures.push_back(Failure{path, int(i + 1), "require", err});
+                if (!LoadRequirement(*con_handle, req, err)) {
+                    failure = Failure{path, int(i + 1), "require", err};
                     return false;
                 }
                 continue;
             }
 
             if (StartsWith(line, "load ")) {
-                std::string dbpath = ReplaceAll(Trim(line.substr(5)), "__TEST_DIR__", test_dir);
-                EnsureParentDir(dbpath);
+                if (!run_current) {
+                    continue;
+                }
+                ctx.dbpath = ExpandVars(Trim(line.substr(5)), test_dir, ctx.vars);
+                EnsureParentDir(ctx.dbpath);
                 try {
-                    OpenDatabase(dbpath);
+                    OpenDatabaseHandle(ctx.dbpath, db_handle, con_handle);
                 } catch (std::exception &ex) {
-                    failures.push_back(Failure{path, int(i + 1), "load", ex.what()});
+                    failure = Failure{path, int(i + 1), "load", ex.what()};
                     return false;
                 }
                 continue;
@@ -259,18 +363,22 @@ struct Runner {
 
             if (StartsWith(line, "statement ok")) {
                 i++;
-                std::string sql = CollectSQL(lines, i, test_dir, false);
+                int sql_line = int(i + 1);
+                std::string sql = CollectSQL(lines, i, test_dir, ctx.vars, false);
+                if (!run_current) {
+                    continue;
+                }
                 std::string err;
                 bool handled_install = false;
-                if (!HandleInstallStatement(sql, err, handled_install)) {
-                    failures.push_back(Failure{path, int(i + 1), "statement ok", err + "\nSQL:\n" + sql});
+                if (!HandleInstallStatement(*con_handle, sql, err, handled_install)) {
+                    failure = Failure{path, sql_line, "statement ok", err + "\nSQL:\n" + sql};
                     return false;
                 }
                 if (handled_install) {
                     continue;
                 }
-                if (!ExecSQL(sql, err)) {
-                    failures.push_back(Failure{path, int(i + 1), "statement ok", err + "\nSQL:\n" + sql});
+                if (!ExecSQL(*con_handle, sql, err)) {
+                    failure = Failure{path, sql_line, "statement ok", err + "\nSQL:\n" + sql};
                     return false;
                 }
                 continue;
@@ -279,13 +387,16 @@ struct Runner {
             if (StartsWith(line, "statement error")) {
                 i++;
                 int sql_line = int(i + 1);
-                std::string sql = CollectSQL(lines, i, test_dir, true);
+                std::string sql = CollectSQL(lines, i, test_dir, ctx.vars, true);
                 if (i >= lines.size() || Trim(lines[i]) != "----") {
-                    failures.push_back(Failure{path, sql_line, "statement error", "missing ---- separator"});
+                    failure = Failure{path, sql_line, "statement error", "missing ---- separator"};
                     return false;
                 }
                 i++;
-                auto expected = CollectExpected(lines, i, test_dir);
+                auto expected = CollectExpected(lines, i, test_dir, ctx.vars);
+                if (!run_current) {
+                    continue;
+                }
                 std::string expected_msg;
                 for (size_t k = 0; k < expected.size(); k++) {
                     if (k) {
@@ -294,15 +405,15 @@ struct Runner {
                     expected_msg += expected[k];
                 }
                 std::string err;
-                if (ExecSQL(sql, err)) {
-                    failures.push_back(Failure{path, sql_line, "statement error",
-                                               "expected error but statement succeeded\nSQL:\n" + sql});
+                if (ExecSQL(*con_handle, sql, err)) {
+                    failure = Failure{path, sql_line, "statement error",
+                                      "expected error but statement succeeded\nSQL:\n" + sql};
                     return false;
                 }
                 if (!expected_msg.empty() && err.find(expected_msg) == std::string::npos) {
-                    failures.push_back(Failure{path, sql_line, "statement error",
-                                               "error mismatch\nExpected substring: " + expected_msg +
-                                                   "\nActual: " + err + "\nSQL:\n" + sql});
+                    failure = Failure{path, sql_line, "statement error",
+                                      "error mismatch\nExpected substring: " + expected_msg +
+                                          "\nActual: " + err + "\nSQL:\n" + sql};
                     return false;
                 }
                 continue;
@@ -311,18 +422,21 @@ struct Runner {
             if (StartsWith(line, "query ")) {
                 i++;
                 int sql_line = int(i + 1);
-                std::string sql = CollectSQL(lines, i, test_dir, true);
+                std::string sql = CollectSQL(lines, i, test_dir, ctx.vars, true);
                 if (i >= lines.size() || Trim(lines[i]) != "----") {
-                    failures.push_back(Failure{path, sql_line, "query", "missing ---- separator"});
+                    failure = Failure{path, sql_line, "query", "missing ---- separator"};
                     return false;
                 }
                 i++;
-                auto expected = CollectExpected(lines, i, test_dir);
-                auto res = con->Query(sql);
+                auto expected = CollectExpected(lines, i, test_dir, ctx.vars);
+                if (!run_current) {
+                    continue;
+                }
+                auto res = con_handle->Query(sql);
                 if (!res || res->HasError()) {
-                    failures.push_back(Failure{path, sql_line, "query",
-                                               std::string("query failed: ") +
-                                                   (res ? res->GetError() : "null result") + "\nSQL:\n" + sql});
+                    failure = Failure{path, sql_line, "query",
+                                      std::string("query failed: ") +
+                                          (res ? res->GetError() : "null result") + "\nSQL:\n" + sql};
                     return false;
                 }
                 auto actual = FlattenResult(*res);
@@ -335,13 +449,141 @@ struct Runner {
                     for (const auto &row : actual) {
                         msg += row + "\n";
                     }
-                    failures.push_back(Failure{path, sql_line, "query", msg});
+                    failure = Failure{path, sql_line, "query", msg};
                     return false;
                 }
                 continue;
             }
 
-            failures.push_back(Failure{path, int(i + 1), "parse", "unsupported directive: " + line});
+            if (StartsWith(line, "loop ")) {
+                size_t block_end = FindMatchingEndloop(lines, i);
+                if (block_end >= lines.size()) {
+                    failure = Failure{path, int(i + 1), "parse", "unterminated loop"};
+                    return false;
+                }
+                auto parts = SplitWS(line);
+                if (parts.size() != 4) {
+                    failure = Failure{path, int(i + 1), "parse", "unsupported loop syntax: " + line};
+                    return false;
+                }
+                if (run_current) {
+                    const std::string var_name = parts[1];
+                    int start = std::stoi(parts[2]);
+                    int finish = std::stoi(parts[3]);
+                    for (int value = start; value < finish; value++) {
+                        ctx.vars[var_name] = value;
+                        if (!ExecuteRange(lines, i + 1, block_end, path, test_dir, ctx, db_handle, con_handle,
+                                          failure)) {
+                            return false;
+                        }
+                    }
+                    ctx.vars.erase(var_name);
+                }
+                i = block_end;
+                continue;
+            }
+
+            if (StartsWith(line, "concurrentloop ")) {
+                size_t block_end = FindMatchingEndloop(lines, i);
+                if (block_end >= lines.size()) {
+                    failure = Failure{path, int(i + 1), "parse", "unterminated concurrentloop"};
+                    return false;
+                }
+                auto parts = SplitWS(line);
+                if (parts.size() != 4 || parts[1] != "threadid") {
+                    failure = Failure{path, int(i + 1), "parse", "unsupported concurrentloop syntax: " + line};
+                    return false;
+                }
+                if (run_current) {
+                    int start = std::stoi(parts[2]);
+                    int finish = std::stoi(parts[3]);
+                    struct ThreadOutcome {
+                        bool ok = true;
+                        Failure failure;
+                    };
+                    std::vector<ThreadOutcome> outcomes(size_t(std::max(0, finish - start)));
+                    std::vector<std::thread> threads;
+                    threads.reserve(outcomes.size());
+                    for (int thread_id = start; thread_id < finish; thread_id++) {
+                        size_t outcome_idx = size_t(thread_id - start);
+                        threads.emplace_back([&, thread_id, outcome_idx]() {
+                            ExecContext child_ctx = ctx;
+                            child_ctx.thread_id = thread_id;
+                            std::unique_ptr<duckdb::DuckDB> thread_db;
+                            std::unique_ptr<duckdb::Connection> thread_con;
+                            try {
+                                thread_con = std::make_unique<duckdb::Connection>(*db_handle);
+                                for (const auto &ext : loaded_exts) {
+                                    auto res = thread_con->Query(ext);
+                                    if (!res || res->HasError()) {
+                                        throw std::runtime_error(
+                                            "Failed to load extension on thread connection: " +
+                                            (res ? res->GetError() : std::string("null result")));
+                                    }
+                                }
+                            } catch (std::exception &ex) {
+                                outcomes[outcome_idx].ok = false;
+                                outcomes[outcome_idx].failure = Failure{path, int(i + 1), "concurrentloop", ex.what()};
+                                return;
+                            }
+                            Failure local_failure;
+                            if (!ExecuteRange(lines, i + 1, block_end, path, test_dir, child_ctx, thread_db,
+                                              thread_con, local_failure)) {
+                                outcomes[outcome_idx].ok = false;
+                                outcomes[outcome_idx].failure = std::move(local_failure);
+                            }
+                        });
+                    }
+                    for (auto &thread : threads) {
+                        thread.join();
+                    }
+                    for (auto &outcome : outcomes) {
+                        if (!outcome.ok) {
+                            failure = std::move(outcome.failure);
+                            return false;
+                        }
+                    }
+                    con_handle = std::make_unique<duckdb::Connection>(*db_handle);
+                    for (const auto &ext : loaded_exts) {
+                        auto res = con_handle->Query(ext);
+                        if (!res || res->HasError()) {
+                            failure = Failure{path, int(i + 1), "concurrentloop",
+                                              "failed to reload extension on main connection: " +
+                                                  (res ? res->GetError() : std::string("null result"))};
+                            return false;
+                        }
+                    }
+                }
+                i = block_end;
+                continue;
+            }
+
+            if (line == "endloop") {
+                failure = Failure{path, int(i + 1), "parse", "unexpected endloop"};
+                return false;
+            }
+
+            failure = Failure{path, int(i + 1), "parse", "unsupported directive: " + line};
+            return false;
+        }
+        return true;
+    }
+
+    bool RunTestFile(const std::string &path) {
+        std::string test_name = fs::path(path).stem().string();
+        std::string test_dir = "/tmp/openivm-functional/" + test_name;
+        fs::remove_all(test_dir);
+        fs::create_directories(test_dir);
+        loaded_exts.clear();
+
+        ExecContext ctx;
+        ctx.dbpath = test_dir + "/main.duckdb";
+        OpenDatabase(ctx.dbpath);
+
+        auto lines = ReadLines(path);
+        Failure failure;
+        if (!ExecuteRange(lines, 0, lines.size(), path, test_dir, ctx, db, con, failure)) {
+            failures.push_back(std::move(failure));
             return false;
         }
         return true;
@@ -373,7 +615,7 @@ int main(int argc, char **argv) {
     std::cerr << "SUMMARY passed=" << passed << " failed=" << runner.failures.size() << "\n";
     return runner.failures.empty() ? 0 : 1;
 }
-EOF
+CPP
 
 g++ -std=c++17 -O2 -I"$DUCKDB_DIR/src/include" "$RUNNER_CPP" \
     -L"$LIBDUCKDB_DIR" -lduckdb -Wl,-rpath,"$LIBDUCKDB_DIR" -o "$RUNNER_BIN"
