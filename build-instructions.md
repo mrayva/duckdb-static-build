@@ -103,7 +103,8 @@ On success, you should see:
 - Size around ~149-150MB
 - `All 24 extensions loaded successfully!`
 
-With `--with-spatial`, expect 25 loaded extensions and a larger binary.
+With `--with-spatial`, expect 25 loaded extensions on the currently validated non-tip snapshot.
+On current DuckDB tip, expect 24 loaded extensions for the same matrix because `jemalloc` is compiled into core and no longer appears in `duckdb_extensions()`.
 With `--with-openivm-loadable`, expect the default static extension count plus a separate `openivm.duckdb_extension` artifact.
 
 Current known-good verification matrix:
@@ -199,7 +200,7 @@ What is not currently green:
 - several DuckLake-specific tests
 
 Current measured result on the validated host-side build:
-- core suite (`ivm_*.test` + `mv_*.test`): `29 passed`, `0 failed`
+- core suite on normal DuckDB tables (`ivm_*.test` + `mv_*.test`): `29 passed`, `0 failed`
 - full upstream suite (`test/sql/*.test`): `32 passed`, `11 failed`
 
 What is now validated:
@@ -209,6 +210,10 @@ What is now validated:
 4. all core incremental-refresh correctness tests are green
 5. `ivm_concurrency.test` passes in the repo-local validator
 6. DuckLake `ducklake_scan` serialization/registration is fixed for the loadable profile
+
+Support boundary:
+1. supported and validated: loadable OpenIVM on normal DuckDB tables
+2. experimental and not part of the validated matrix: DuckLake-backed OpenIVM refresh
 
 Main remaining failures:
 1. DuckLake-specific failures remain in the full suite
@@ -258,6 +263,8 @@ Run:
 ```
 
 Then inspect missing extension logs in `<duckdb-dir>/build/release-static`.
+
+On current DuckDB tip, `jemalloc` no longer appears in `duckdb_extensions()` because upstream moved it into core allocator plumbing. A tip build can therefore be correct even if the runtime-loaded extension count is one lower than older snapshots.
 
 ### Network-related clone/fetch failures
 

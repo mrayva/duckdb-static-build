@@ -1,6 +1,6 @@
 # DuckDB Static Build Kit
 
-Build DuckDB with 24 statically linked core extensions.
+Build DuckDB with 24 statically linked core features/extensions on validated snapshots.
 Optionally include `spatial`, and optionally build `openivm` as a regular loadable extension.
 
 ## Quick Start
@@ -23,9 +23,10 @@ Optionally include `spatial`, and optionally build `openivm` as a regular loadab
 
 - Binary: `<duckdb-dir>/build/release-static/duckdb`
 - Size: typically ~149-150MB
-- 24 statically linked extensions loaded at runtime
-- Add 1 loaded extension for `--with-spatial`
+- 24 statically linked core features/extensions on the currently validated non-tip snapshot
+- Add 1 runtime-loaded extension for `--with-spatial` on that validated snapshot
 - `--with-openivm-loadable` keeps the default static extension count unchanged and also builds `openivm.duckdb_extension`
+- On current DuckDB tip, `jemalloc` is compiled into core and no longer appears in `duckdb_extensions()`, so the full built-in plus `spatial` matrix reports `24` loaded extensions rather than `25`
 
 Current known-good verification matrix:
 - `--skip-vcpkg --with-spatial`
@@ -35,7 +36,7 @@ Current known-good verification matrix:
 
 | Category | Extensions |
 |----------|------------|
-| Core | autocomplete, icu, json, parquet, core_functions, jemalloc, shell |
+| Core | autocomplete, icu, json, parquet, core_functions, shell |
 | Benchmarks | tpcds, tpch |
 | Search | fts, vss |
 | Database Connectors | sqlite_scanner, postgres_scanner, mysql_scanner |
@@ -44,6 +45,10 @@ Current known-good verification matrix:
 | Table Formats | iceberg, ducklake, delta |
 | Catalogs | unity_catalog |
 | Networking | inet |
+
+`jemalloc` note:
+- Older validated snapshots exposed `jemalloc` through the extension startup count.
+- Current DuckDB tip moved `jemalloc` into core allocator plumbing, so it is compiled in but not listed by `duckdb_extensions()`.
 
 ## Spatial Status
 
@@ -66,8 +71,8 @@ The loadable profile builds into `<duckdb-dir>/build/release-static-openivm-load
 
 This is now the only supported OpenIVM integration path in this repo. Upstream DuckDB or OpenIVM refreshes may still require patch refreshes.
 
-Functional OpenIVM validation is materially working. The loadable artifact builds and loads, and the runtime now executes `CREATE MATERIALIZED VIEW` side effects correctly:
-- core suite (`ivm_*.test` + `mv_*.test`): `29 passed`, `0 failed`
+Functional OpenIVM validation is materially working for normal DuckDB tables. The loadable artifact builds and loads, and the runtime now executes `CREATE MATERIALIZED VIEW` side effects correctly:
+- core suite on normal DuckDB tables (`ivm_*.test` + `mv_*.test`): `29 passed`, `0 failed`
 - full suite (`test/sql/*.test`): `32 passed`, `11 failed`
 
 What is now working:
@@ -77,6 +82,10 @@ What is now working:
 - all core incremental-refresh correctness tests are green
 - `ivm_concurrency.test` passes in the repo-local validator
 - DuckLake `ducklake_scan` serialization/registration is fixed for loadable OpenIVM builds
+
+Support boundary:
+- supported and validated: loadable OpenIVM on normal DuckDB tables
+- experimental and not part of the validated matrix: DuckLake-backed OpenIVM refresh
 
 What is still failing:
 - DuckLake-specific correctness tests in the full suite
