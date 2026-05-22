@@ -90,6 +90,12 @@ Support boundary:
 What is still failing:
 - DuckLake-specific correctness tests in the full suite
 
+Known DuckLake root cause:
+- the current DuckLake refresh compiler is incomplete for `SIMPLE_PROJECTION`
+- simple views such as `SELECT id, name FROM dl.main.employees` currently refresh through full base-table scans rather than `ducklake_table_insertions(...)` / `ducklake_table_deletions(...)`
+- that causes the generated `+1` and `-1` arms to cancel instead of consuming actual change rows
+- until that refresh path is rewritten, DuckLake-backed OpenIVM should be treated as experimental only
+
 Current DuckLake failure buckets:
 - correctness mismatches in:
   `ducklake_aggregate.test`, `ducklake_chained.test`, `ducklake_cte.test`,
