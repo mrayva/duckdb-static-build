@@ -2,10 +2,9 @@
 set -euo pipefail
 
 # DuckDB Static Build Script
-# Builds DuckDB with 24 statically-linked core features/extensions on validated snapshots
-# Optionally adds the spatial extension for a larger build
-# Optionally adds ila/openivm as an experimental extension
-# Optional active mode re-enables OpenIVM runtime hooks and test discovery
+# Builds DuckDB with the current validated built-in extension set
+# Optionally adds the spatial extension
+# Optionally builds ila/openivm as a regular loadable extension
 # Usage: ./build-duckdb-static.sh [options]
 #   Options:
 #     --vcpkg-dir DIR    Path to vcpkg installation (default: ~/vcpkg)
@@ -81,21 +80,6 @@ sanitize_dirty_fetchcontent_deps() {
     if [ "$removed_any" = true ]; then
         log_success "Removed dirty FetchContent dependency checkouts"
     fi
-}
-
-install_ducklake_patch_snapshot() {
-    local patch_src="$BUILD_SCRIPT_DIR/patches/ducklake-current-duckdb.patch"
-    local patch_dst="$DUCKDB_DIR/.github/patches/extensions/ducklake/fix.patch"
-    if [ "${OPENIVM_DUCKLAKE_EXPERIMENTAL:-false}" != "true" ]; then
-        log_info "Skipping DuckLake extension patch snapshot (experimental path disabled)"
-        return 0
-    fi
-    if [ ! -f "$patch_src" ]; then
-        return 0
-    fi
-    mkdir -p "$(dirname "$patch_dst")"
-    cp "$patch_src" "$patch_dst"
-    log_success "DuckLake extension patch snapshot installed"
 }
 
 # Parse arguments
@@ -389,17 +373,18 @@ index 081124a..f0a2df6 100644
 +target_link_libraries(${TARGET_NAME}_extension ${MYSQL_LIBRARIES})
 PATCH_EOF
 
-if [ "${DELTA_RUSTLS_PATCH_EXPERIMENTAL:-false}" = "true" ]; then
 cat > .github/patches/extensions/delta/rustls.patch << 'PATCH_EOF'
 diff --git a/CMakeLists.txt b/CMakeLists.txt
-index 6fb27dd..f76513c 100644
+index ff33ba9..f2e3361 100644
 --- a/CMakeLists.txt
 +++ b/CMakeLists.txt
-@@ -174,10 +174,6 @@ ExternalProject_Add(
-   COMMAND ${CMAKE_COMMAND} -E make_directory
-     "${CMAKE_BINARY_DIR}/rust/src/delta_kernel/benchmarks/workloads"
-   COMMAND ${CMAKE_COMMAND} -E touch
-     "${CMAKE_BINARY_DIR}/rust/src/delta_kernel/benchmarks/workloads/.done"
+@@ -162,13 +162,9 @@ ExternalProject_Add(
+   # Build debug build
+   BUILD_COMMAND
+     ${CMAKE_COMMAND} -E env ${RUST_UNSET_ENV_VARS} ${RUST_ENV_VARS} cargo build
+-    --package delta_kernel_ffi --workspace --profile=${CARGO_PROFILE} --all-features
++    --package delta_kernel_ffi --profile=${CARGO_PROFILE} --no-default-features --features "default-engine-rustls,tracing,test-ffi"
+     ${RUST_PLATFORM_PARAM}
 -  # Build DATs
 -  COMMAND
 -    ${CMAKE_COMMAND} -E env ${RUST_UNSET_ENV_VARS} ${RUST_ENV_VARS} cargo build
@@ -409,7 +394,6 @@ index 6fb27dd..f76513c 100644
    BUILD_BYPRODUCTS "${DELTA_KERNEL_FFI_HEADER_C}"
    BUILD_BYPRODUCTS "${DELTA_KERNEL_FFI_HEADER_CXX}"
 PATCH_EOF
-fi
 
 if [ "$WITH_ROBUST_RPT" = true ]; then
     mkdir -p .github/patches/extensions/robust
@@ -2259,7 +2243,6 @@ PATCH_B64
 fi
 
 log_success "Extension patch files created"
-install_ducklake_patch_snapshot
 
 # Step 5: Install vcpkg dependencies
 if [ "$SKIP_VCPKG" = false ]; then
@@ -2316,48 +2299,19 @@ if [ "$WITH_OPENIVM_LOADABLE" = true ]; then
     log_info "Applying OpenIVM compatibility patch for current DuckDB APIs..."
     git -C "$OPENIVM_LOCAL_DIR" apply "$BUILD_SCRIPT_DIR/patches/openivm-current-duckdb.patch"
     log_info "Disabling OpenIVM native benchmark/tool targets for static builds..."
-    python3 - "$OPENIVM_LOCAL_DIR" <<'PY'
+    python3 - "$OPENIVM_LOCAL_DIR/CMakeLists.txt" <<'PY'
 from pathlib import Path
 import re
-import sys
-
-root = Path(sys.argv[1])
-
-def replace_if_present(path: Path, pattern: str, replacement: str = "\n") -> int:
-    if not path.exists():
-        return 0
-    text = path.read_text()
-    new_text, count = re.subn(pattern, replacement, text, flags=re.S)
-    if count:
-        path.write_text(new_text)
-    return count
-
-# Older OpenIVM revisions kept native benchmark/tool targets directly in the
-# root CMakeLists. Newer revisions moved the remaining problematic target into
-# bundled LPTS. Strip whichever form is present without assuming a single exact
-# upstream layout.
-root_removed = replace_if_present(
-    root / "CMakeLists.txt",
-    r"\n# Test and benchmark tools - only build for native platforms\nif\(NOT EMSCRIPTEN AND NOT WIN32\)\n.*?\nendif\(\)\n",
-)
-lpts_removed = replace_if_present(
-    root / "third_party" / "lpts" / "CMakeLists.txt",
-    r"\nif\(NOT EMSCRIPTEN AND NOT WIN32\)\n\s*add_executable\(lpts_sqlstorm_benchmark.*?\nendif\(\)\n",
-)
-
-if root_removed == 0 and lpts_removed == 0:
-    print("warning: no OpenIVM benchmark/tool targets needed stripping")
+path = Path(__import__("sys").argv[1])
+text = path.read_text()
+pattern = r"\n# Test and benchmark tools - only build for native platforms\nif\(NOT EMSCRIPTEN AND NOT WIN32\)\n.*?\nendif\(\)\n"
+new_text, count = re.subn(pattern, "\n", text, flags=re.S)
+if count != 1:
+    raise SystemExit("failed to strip OpenIVM native tool targets")
+path.write_text(new_text)
 PY
     log_info "Applying OpenIVM runtime patch..."
-    if ! git -C "$OPENIVM_LOCAL_DIR" apply "$BUILD_SCRIPT_DIR/patches/openivm-active-runtime.patch"; then
-        if grep -q "loader.RegisterFunction(ivm_func);" "$OPENIVM_LOCAL_DIR/src/openivm_extension.cpp" && \
-           ! grep -q "Keep static startup inert" "$OPENIVM_LOCAL_DIR/src/openivm_extension.cpp"; then
-            log_warning "OpenIVM runtime patch already present upstream; continuing"
-        else
-            log_error "OpenIVM runtime patch no longer applies cleanly"
-            exit 1
-        fi
-    fi
+    git -C "$OPENIVM_LOCAL_DIR" apply "$BUILD_SCRIPT_DIR/patches/openivm-active-runtime.patch"
     log_success "OpenIVM source prepared at $OPENIVM_LOCAL_DIR"
 fi
 
@@ -2503,18 +2457,9 @@ log_success "Binary created: $BINARY_SIZE"
 
 log_info "Checking extensions..."
 EXTENSION_COUNT=$(./duckdb -c "SELECT COUNT(*) FROM duckdb_extensions() WHERE loaded=true;" 2>/dev/null | grep -o '[0-9]\+' | tail -1)
-RUNTIME_EXPECTED_EXTENSIONS="$EXPECTED_EXTENSIONS"
-JEMALLOC_VISIBLE_IN_EXTENSIONS=$(./duckdb -c "SELECT COUNT(*) FROM duckdb_extensions() WHERE extension_name='jemalloc';" 2>/dev/null | grep -o '[0-9]\+' | tail -1 || true)
-JEMALLOC_RUNTIME_NOTE=""
 
-if [ "${JEMALLOC_VISIBLE_IN_EXTENSIONS:-0}" = "0" ] && [ "$EXPECTED_EXTENSIONS" -ge 24 ]; then
-    # On current DuckDB tip, jemalloc moved into core and no longer appears in duckdb_extensions().
-    RUNTIME_EXPECTED_EXTENSIONS=$((EXPECTED_EXTENSIONS - 1))
-    JEMALLOC_RUNTIME_NOTE="jemalloc is compiled into core and is not counted in duckdb_extensions() on this DuckDB snapshot"
-fi
-
-if [ "$EXTENSION_COUNT" = "$RUNTIME_EXPECTED_EXTENSIONS" ]; then
-    log_success "All $RUNTIME_EXPECTED_EXTENSIONS runtime-loaded extensions are available!"
+if [ "$EXTENSION_COUNT" = "$EXPECTED_EXTENSIONS" ]; then
+    log_success "All $EXPECTED_EXTENSIONS extensions loaded successfully!"
     
     echo ""
     echo -e "${GREEN}========================================${NC}"
@@ -2522,10 +2467,7 @@ if [ "$EXTENSION_COUNT" = "$RUNTIME_EXPECTED_EXTENSIONS" ]; then
     echo -e "${GREEN}========================================${NC}"
     echo -e "Binary location: ${BLUE}$BUILD_DIR/duckdb${NC}"
     echo -e "Binary size: ${BLUE}$BINARY_SIZE${NC}"
-    echo -e "Runtime-loaded extensions: ${BLUE}$RUNTIME_EXPECTED_EXTENSIONS${NC}"
-    if [ -n "$JEMALLOC_RUNTIME_NOTE" ]; then
-        echo -e "Allocator note: ${BLUE}$JEMALLOC_RUNTIME_NOTE${NC}"
-    fi
+    echo -e "Extensions: ${BLUE}$EXPECTED_EXTENSIONS statically linked${NC}"
     echo -e "Build time: ${BLUE}$BUILD_TIME seconds${NC}"
     echo ""
     echo "Extensions loaded:"
@@ -2533,10 +2475,7 @@ if [ "$EXTENSION_COUNT" = "$RUNTIME_EXPECTED_EXTENSIONS" ]; then
         awk '/│/ && !/extension_name/ && !/varchar/ {gsub(/│/,""); gsub(/^ +| +$/,""); if (length($0) > 0) print "  - " $0}'
     echo ""
 else
-    log_warning "Expected $RUNTIME_EXPECTED_EXTENSIONS runtime-loaded extensions, found $EXTENSION_COUNT"
-    if [ -n "$JEMALLOC_RUNTIME_NOTE" ]; then
-        log_info "$JEMALLOC_RUNTIME_NOTE"
-    fi
+    log_warning "Expected $EXPECTED_EXTENSIONS extensions, found $EXTENSION_COUNT"
     echo ""
     echo "Loaded extensions:"
     ./duckdb -c "SELECT extension_name, loaded FROM duckdb_extensions() WHERE installed=true ORDER BY extension_name;"
@@ -2556,8 +2495,6 @@ if [ "$WITH_OPENIVM_LOADABLE" = true ]; then
     fi
     ./duckdb -unsigned -c "LOAD '$OPENIVM_LOADABLE_PATH'; SELECT extension_name, loaded FROM duckdb_extensions() WHERE extension_name='openivm';" >/dev/null
     log_success "OpenIVM loadable extension built and loadable at $OPENIVM_LOADABLE_PATH"
-    log_warning "This verifies build/load only. Functional validation is separate:"
-    log_warning "  $BUILD_SCRIPT_DIR/scripts/validate-openivm-functional.sh $BUILD_DIR core"
 fi
 
 echo ""

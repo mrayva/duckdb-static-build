@@ -103,15 +103,14 @@ On success, you should see:
 - Size around ~149-150MB
 - `All 24 extensions loaded successfully!`
 
-With `--with-spatial`, expect 25 loaded extensions on the currently validated non-tip snapshot.
-On current DuckDB tip, expect 24 loaded extensions for the same matrix because `jemalloc` is compiled into core and no longer appears in `duckdb_extensions()`.
+With `--with-spatial`, expect 25 loaded extensions and a larger binary.
 With `--with-openivm-loadable`, expect the default static extension count plus a separate `openivm.duckdb_extension` artifact.
 
 Current known-good verification matrix:
 - `--clean`
 - `--skip-vcpkg`
 - `--with-spatial`
-- `--with-openivm-loadable` for build/load validation only
+- `--with-openivm-loadable`
 
 Current preferred non-static OpenIVM profile:
 - `--with-openivm-loadable`
@@ -172,9 +171,15 @@ gdal[geos] proj geos expat sqlite3[rtree] curl openssl zlib libmariadb
 ## 9. OpenIVM Extension
 
 - `--with-openivm-loadable`
-This is the preferred non-static integration path. It builds the regular `openivm.duckdb_extension` artifact using the same patched OpenIVM source tree, while leaving DuckDB's static extension set unchanged.
+This is the supported non-static integration path. It builds the regular `openivm.duckdb_extension` artifact using the patched OpenIVM source tree, while leaving DuckDB's static extension set unchanged.
 
 The integration still relies on a maintained local patch because OpenIVM and its bundled `lpts` subtree need API-drift fixes for current DuckDB.
+
+Supported OpenIVM baseline:
+- normal DuckDB tables: validated
+- current tip non-DuckLake core suite: `29 passed, 0 failed`
+- DuckLake-backed refresh: experimental
+- current tip build: build-valid and core-functional on the non-DuckLake path
 
 Loadable-profile recipe:
 
@@ -190,60 +195,9 @@ CCACHE_DISABLE=1 ./build-duckdb-static.sh \
 Expected artifact:
 - `<duckdb-dir>/build/release-static-openivm-loadable/extension/openivm/openivm.duckdb_extension`
 
-What the build script verifies today:
-- the artifact exists
-- the matching DuckDB binary can `LOAD` it with `-unsigned`
-- the scripted build installs a tracked DuckLake patch snapshot before configure so loadable OpenIVM runs reproduce the validated `ducklake_scan` behavior
-
-What is not currently green:
-- the full upstream OpenIVM SQL suite
-- several DuckLake-specific tests
-
-Current measured result on the validated host-side build:
-- core suite on normal DuckDB tables (`ivm_*.test` + `mv_*.test`): `29 passed`, `0 failed`
-- full upstream suite (`test/sql/*.test`): `32 passed`, `11 failed`
-
-What is now validated:
-1. `CREATE MATERIALIZED VIEW ...` creates OpenIVM catalog state
-2. `_duckdb_ivm_views` and related metadata tables are created
-3. `PRAGMA ivm('view_name')` works across the full core suite
-4. all core incremental-refresh correctness tests are green
-5. `ivm_concurrency.test` passes in the repo-local validator
-6. DuckLake `ducklake_scan` serialization/registration is fixed for the loadable profile
-
-Support boundary:
-1. supported and validated: loadable OpenIVM on normal DuckDB tables
-2. experimental and not part of the validated matrix: DuckLake-backed OpenIVM refresh
-
-Main remaining failures:
-1. DuckLake-specific failures remain in the full suite
-
-Known DuckLake root cause:
-1. the current DuckLake refresh compiler is incomplete for `SIMPLE_PROJECTION`
-2. simple DuckLake-backed views are still refreshed from full base-table scans instead of `ducklake_table_insertions(...)` / `ducklake_table_deletions(...)`
-3. this causes the generated `+1` and `-1` refresh arms to cancel out rather than consume actual change rows
-4. until that SQL generation path is fixed, DuckLake-backed OpenIVM remains experimental by design
-
-Current DuckLake failure buckets:
-1. correctness mismatches in:
-   `ducklake_aggregate.test`, `ducklake_chained.test`, `ducklake_cte.test`,
-   `ducklake_deltas.test`, `ducklake_distinct.test`, `ducklake_filter.test`,
-   `ducklake_inner_join.test`, `ducklake_projection.test`, `ducklake_union.test`,
-   `ducklake_v1_features.test`, `ducklake_window_delta.test`
-
-Functional validation command:
-
-```bash
-./scripts/validate-openivm-functional.sh \
-  /tmp/duckdb-clean/duckdbsrc/build/release-static-openivm-loadable core
-```
-
-To run the full OpenIVM upstream SQL suite:
-
-```bash
-./scripts/validate-openivm-functional.sh \
-  /tmp/duckdb-clean/duckdbsrc/build/release-static-openivm-loadable full
-```
+Current status note:
+- The non-DuckLake OpenIVM path is the supported tip baseline.
+- DuckLake-backed refresh remains an experimental path and is not part of the supported baseline.
 
 ## 10. Troubleshooting
 
@@ -269,8 +223,6 @@ Run:
 ```
 
 Then inspect missing extension logs in `<duckdb-dir>/build/release-static`.
-
-On current DuckDB tip, `jemalloc` no longer appears in `duckdb_extensions()` because upstream moved it into core allocator plumbing. A tip build can therefore be correct even if the runtime-loaded extension count is one lower than older snapshots.
 
 ### Network-related clone/fetch failures
 
