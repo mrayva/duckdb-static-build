@@ -95,6 +95,8 @@ The script performs these exact phases:
 16. Verifies runtime by counting loaded extensions from `duckdb_extensions()`.
 18. If `--with-openivm-loadable` is used, verifies that `extension/openivm/openivm.duckdb_extension` exists and can be loaded by the matching DuckDB binary with `-unsigned`.
 
+For the semi/anti metadata regression check, use `scripts/validate-openivm-meta.sh <duckdb-build-dir>`. That probe queries `_duckdb_ivm_views` directly through DuckDB SQL, outside sqllogic.
+
 ## 5. Output/Success Criteria
 
 On success, you should see:

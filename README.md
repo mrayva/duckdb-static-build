@@ -64,6 +64,8 @@ See [build-instructions.md](/home/mrayva/duckdbbld/build-instructions.md) for a 
 
 `--with-openivm-loadable` is the supported OpenIVM integration path in this repo. It prepares the patched OpenIVM source tree, builds `openivm.duckdb_extension` as a regular loadable extension, and keeps OpenIVM out of DuckDB's static startup set.
 
+For metadata regression checks, use the direct C++ probe in [`scripts/validate-openivm-meta.sh`](scripts/validate-openivm-meta.sh). It exercises `semi_anti_aux_meta_json` directly through DuckDB SQL and does not rely on sqllogic parsing.
+
 The supported baseline is:
 - OpenIVM loadable on normal DuckDB tables
 - core OpenIVM functionality validated on the current tip baseline (`29 passed, 0 failed`)
