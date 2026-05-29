@@ -2495,6 +2495,14 @@ if [ "$WITH_OPENIVM_LOADABLE" = true ]; then
     fi
     ./duckdb -unsigned -c "LOAD '$OPENIVM_LOADABLE_PATH'; SELECT extension_name, loaded FROM duckdb_extensions() WHERE extension_name='openivm';" >/dev/null
     log_success "OpenIVM loadable extension built and loadable at $OPENIVM_LOADABLE_PATH"
+
+    log_info "Step 10b: Verifying OpenIVM metadata with direct probe..."
+    if [ ! -x "$BUILD_SCRIPT_DIR/scripts/validate-openivm-meta.sh" ]; then
+        log_error "OpenIVM metadata probe not found or not executable at $BUILD_SCRIPT_DIR/scripts/validate-openivm-meta.sh"
+        exit 1
+    fi
+    "$BUILD_SCRIPT_DIR/scripts/validate-openivm-meta.sh" "$BUILD_DIR"
+    log_success "OpenIVM metadata probe passed"
 fi
 
 echo ""
