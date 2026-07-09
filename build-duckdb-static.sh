@@ -39,6 +39,8 @@ ROBUST_PATCH_EXCEPTION_SAFE_CLEANUP=false
 ROBUST_PATCH_PROBE_EMPTY_REGISTRY_CLEANUP=false
 ROBUST_PATCH_SKIP_COPY_OPTIMIZATION=false
 ROBUST_LOCAL_DIR=${ROBUST_LOCAL_DIR:-/tmp/robust-labs-robust}
+ICEBERG_SOURCE_DIR=${ICEBERG_SOURCE_DIR:-}
+ICEBERG_FALLBACK_DIR=${ICEBERG_FALLBACK_DIR:-/tmp/duckdb-iceberg-src}
 
 require_cmd() {
     local cmd="$1"
@@ -80,6 +82,162 @@ sanitize_dirty_fetchcontent_deps() {
     if [ "$removed_any" = true ]; then
         log_success "Removed dirty FetchContent dependency checkouts"
     fi
+}
+
+apply_patch_if_needed() {
+    local repo_dir="$1"
+    local patch_file="$2"
+    local label="$3"
+
+    if git -C "$repo_dir" apply --check "$patch_file" >/dev/null 2>&1; then
+        git -C "$repo_dir" apply "$patch_file"
+        log_success "$label applied"
+        return 0
+    fi
+
+    if git -C "$repo_dir" apply --reverse --check "$patch_file" >/dev/null 2>&1; then
+        log_success "$label already integrated upstream"
+        return 0
+    fi
+
+    log_warning "$label no longer matches upstream tree; skipping"
+    return 0
+}
+
+apply_patch_series_to_source_dir() {
+    local source_dir="$1"
+    local patch_dir="$2"
+    local label="$3"
+    local stamp_file="$source_dir/.duckdb_static_build_patch_series"
+    local patch_fingerprint
+    local patch_file
+    local patches=()
+
+    if [ ! -d "$patch_dir" ]; then
+        log_error "$label patch directory not found at $patch_dir"
+        exit 1
+    fi
+
+    while IFS= read -r patch_file; do
+        patches+=("$patch_file")
+    done < <(find "$patch_dir" -maxdepth 1 -type f -name '*.patch' | sort)
+
+    if [ ${#patches[@]} -eq 0 ]; then
+        log_error "No patch files found for $label in $patch_dir"
+        exit 1
+    fi
+
+    patch_fingerprint=$(cat "${patches[@]}" | sha256sum | awk '{print $1}')
+    if [ -f "$stamp_file" ] && [ "$(cat "$stamp_file")" = "$patch_fingerprint" ]; then
+        log_success "$label patch series already applied to $source_dir"
+        return 0
+    fi
+
+    for patch_file in "${patches[@]}"; do
+        if patch -d "$source_dir" -p1 --forward --dry-run < "$patch_file" >/dev/null 2>&1; then
+            patch -d "$source_dir" -p1 --forward < "$patch_file" >/dev/null
+        elif patch -d "$source_dir" -R -p1 --dry-run < "$patch_file" >/dev/null 2>&1; then
+            :
+        else
+            log_error "Failed to apply $label patch $(basename "$patch_file") to $source_dir"
+            exit 1
+        fi
+    done
+
+    echo "$patch_fingerprint" > "$stamp_file"
+    log_success "$label patch series applied to $source_dir"
+}
+
+patch_series_matches_source_dir() {
+    local source_dir="$1"
+    local patch_dir="$2"
+    local patch_file
+
+    while IFS= read -r patch_file; do
+        if patch -d "$source_dir" -p1 --forward --dry-run < "$patch_file" >/dev/null 2>&1; then
+            continue
+        fi
+        if patch -d "$source_dir" -R -p1 --dry-run < "$patch_file" >/dev/null 2>&1; then
+            continue
+        fi
+        return 1
+    done < <(find "$patch_dir" -maxdepth 1 -type f -name '*.patch' | sort)
+
+    return 0
+}
+
+ensure_local_archive_source() {
+    local repo_slug="$1"
+    local ref="$2"
+    local source_dir="$3"
+    local label="$4"
+    local force_refresh="${5:-false}"
+    local marker_file="$source_dir/.duckdb_static_build_ref"
+    local archive_url="https://github.com/${repo_slug}/archive/${ref}.tar.gz"
+    local archive_path="/tmp/${label}-${ref}.tar.gz"
+    local extract_dir
+    local archive_listing
+    local top_dir
+
+    if [ "$force_refresh" != true ] && [ -d "$source_dir" ] && [ -f "$marker_file" ] && [ "$(cat "$marker_file")" = "$ref" ]; then
+        log_success "Local source ready for $label at $source_dir"
+        return 0
+    fi
+
+    extract_dir=$(mktemp -d "/tmp/${label}-extract.XXXXXX")
+
+    if [ ! -f "$archive_path" ] || ! tar -tzf "$archive_path" >/dev/null 2>&1; then
+        rm -f "$archive_path"
+        log_info "Downloading source archive for $label at $ref..."
+        curl -fsSL --retry 3 --retry-delay 2 "$archive_url" -o "$archive_path"
+    else
+        log_info "Reusing cached source archive for $label at $archive_path"
+    fi
+
+    archive_listing="$extract_dir/archive.list"
+    tar -tzf "$archive_path" > "$archive_listing"
+    top_dir=$(head -1 "$archive_listing" | cut -d/ -f1)
+    if [ -z "$top_dir" ]; then
+        log_error "Failed to inspect archive layout for $label"
+        rm -rf "$extract_dir"
+        exit 1
+    fi
+
+    tar -xzf "$archive_path" -C "$extract_dir"
+    rm -rf "$source_dir"
+    mkdir -p "$(dirname "$source_dir")"
+    mv "$extract_dir/$top_dir" "$source_dir"
+    echo "$ref" > "$marker_file"
+    rm -rf "$extract_dir"
+    rm -f "$archive_path"
+
+    log_success "Local source ready for $label at $source_dir"
+}
+
+use_iceberg_source_dir() {
+    local source_dir="$1"
+    local label="$2"
+
+    if [ ! -d "$source_dir" ]; then
+        log_error "$label source directory not found at $source_dir"
+        exit 1
+    fi
+
+    cat > .github/config/extensions/iceberg.cmake <<EOF
+# Windows tests for iceberg currently not working
+IF (NOT WIN32)
+    set(LOAD_ICEBERG_TESTS "LOAD_TESTS")
+else ()
+    set(LOAD_ICEBERG_TESTS "")
+endif()
+if (NOT MINGW)
+    duckdb_extension_load(iceberg
+            #FIXME: restore autoloading tests \${LOAD_ICEBERG_TESTS}
+            SOURCE_DIR ${source_dir}
+            )
+endif()
+EOF
+    log_success "$label config patched to use SOURCE_DIR $source_dir"
 }
 
 # Parse arguments
@@ -146,7 +304,7 @@ log_error() {
 
 # Check prerequisites
 log_info "Checking prerequisites..."
-for cmd in git cmake make sed awk nproc python3; do
+for cmd in git cmake make sed awk nproc python3 curl tar patch; do
     require_cmd "$cmd"
 done
 for cmd in gcc g++ cargo rustc; do
@@ -184,9 +342,15 @@ cd "$DUCKDB_DIR"
 # Clean build if requested
 if [ "$CLEAN_BUILD" = true ]; then
     log_info "Cleaning previous build artifacts..."
-    rm -rf CMakeCache.txt CMakeFiles/ build*/ _deps/ duckdb duckdb_platform_* *.log \
+    rm -rf CMakeCache.txt CMakeFiles/ _deps/ duckdb duckdb_platform_* *.log \
         cmake_install.cmake DuckDB*.cmake DuckDBExports.cmake compile_commands.json \
         codegen/include/* codegen/src/*
+    shopt -s nullglob
+    for build_dir in build build-* build_*; do
+        [ -e "$build_dir" ] || continue
+        rm -rf "$build_dir"
+    done
+    shopt -u nullglob
     log_success "Build artifacts cleaned"
 fi
 
@@ -234,7 +398,7 @@ if [ "$WITH_ROBUST_RPT" = true ] && [ "$ROBUST_PATCH_CURRENT_COMPAT" = true ]; t
     cat >> extension/extension_config_local.cmake << EOF
 duckdb_extension_load(robust
     GIT_URL https://github.com/robust-labs/robust
-    GIT_TAG 5ec7800e000291e27f7433cb513ba606fc675fc1
+    GIT_TAG 0827cfa87e2a1ac52d0e8eba7fd6af9d0e84b3d8
     APPLY_PATCHES
 )
 EOF
@@ -243,7 +407,7 @@ if [ "$WITH_AGGJOIN" = true ]; then
     cat >> extension/extension_config_local.cmake << EOF
 duckdb_extension_load(aggjoin
     GIT_URL https://github.com/arselzer/duckdb_aggjoin
-    GIT_TAG 5f4b64ac879b13662142bd7624784a4ad709393c
+    GIT_TAG f7259a9255ecda3dee8402714048799e6900c72c
     APPLY_PATCHES
 )
 EOF
@@ -266,12 +430,52 @@ fi
 if [ -f .github/config/extensions/postgres_scanner.cmake ]; then
     sed -i '/DONT_LINK/d' .github/config/extensions/postgres_scanner.cmake
     ensure_include_after_git_tag .github/config/extensions/postgres_scanner.cmake "INCLUDE_DIR src/include"
+    ensure_include_after_git_tag .github/config/extensions/postgres_scanner.cmake "APPLY_PATCHES"
     log_success "postgres_scanner config patched"
 fi
 if [ -f .github/config/extensions/mysql_scanner.cmake ]; then
     sed -i '/DONT_LINK/d' .github/config/extensions/mysql_scanner.cmake
     ensure_include_after_git_tag .github/config/extensions/mysql_scanner.cmake "INCLUDE_DIR src/include"
+    ensure_include_after_git_tag .github/config/extensions/mysql_scanner.cmake "APPLY_PATCHES"
     log_success "mysql_scanner config patched"
+fi
+if [ -f .github/config/extensions/iceberg.cmake ]; then
+    ICEBERG_PATCH_DIR="$DUCKDB_DIR/.github/patches/extensions/iceberg"
+    ICEBERG_REFRESH_REF=""
+    CURRENT_ICEBERG_SOURCE_DIR=$(awk '/SOURCE_DIR/ {print $2; exit}' .github/config/extensions/iceberg.cmake)
+    ICEBERG_GIT_TAG=$(awk '/GIT_TAG/ {print $2; exit}' .github/config/extensions/iceberg.cmake)
+    if [ -n "$ICEBERG_GIT_TAG" ]; then
+        ICEBERG_REFRESH_REF="$ICEBERG_GIT_TAG"
+    elif [ -f "$ICEBERG_FALLBACK_DIR/.duckdb_static_build_ref" ]; then
+        ICEBERG_REFRESH_REF=$(cat "$ICEBERG_FALLBACK_DIR/.duckdb_static_build_ref")
+    fi
+    if [ -n "$ICEBERG_SOURCE_DIR" ]; then
+        apply_patch_series_to_source_dir "$ICEBERG_SOURCE_DIR" "$ICEBERG_PATCH_DIR" "duckdb-iceberg"
+        use_iceberg_source_dir "$ICEBERG_SOURCE_DIR" "duckdb-iceberg"
+    elif [ -n "$CURRENT_ICEBERG_SOURCE_DIR" ]; then
+        if [ "$CURRENT_ICEBERG_SOURCE_DIR" = "$ICEBERG_FALLBACK_DIR" ] && ! patch_series_matches_source_dir "$CURRENT_ICEBERG_SOURCE_DIR" "$ICEBERG_PATCH_DIR"; then
+            log_warning "duckdb-iceberg fallback source is stale or partially patched; refreshing from archive"
+            if [ -z "$ICEBERG_REFRESH_REF" ]; then
+                log_error "Could not determine iceberg ref needed to refresh fallback SOURCE_DIR $CURRENT_ICEBERG_SOURCE_DIR"
+                exit 1
+            fi
+            ensure_local_archive_source "duckdb/duckdb-iceberg" "$ICEBERG_REFRESH_REF" "$CURRENT_ICEBERG_SOURCE_DIR" "duckdb-iceberg" true
+        fi
+        apply_patch_series_to_source_dir "$CURRENT_ICEBERG_SOURCE_DIR" "$ICEBERG_PATCH_DIR" "duckdb-iceberg"
+        use_iceberg_source_dir "$CURRENT_ICEBERG_SOURCE_DIR" "duckdb-iceberg"
+    else
+        if [ -z "$ICEBERG_REFRESH_REF" ]; then
+            log_error "Could not determine iceberg GIT_TAG or SOURCE_DIR from .github/config/extensions/iceberg.cmake"
+            exit 1
+        fi
+        ensure_local_archive_source "duckdb/duckdb-iceberg" "$ICEBERG_REFRESH_REF" "$ICEBERG_FALLBACK_DIR" "duckdb-iceberg"
+        if ! patch_series_matches_source_dir "$ICEBERG_FALLBACK_DIR" "$ICEBERG_PATCH_DIR"; then
+            log_warning "duckdb-iceberg fallback source is stale or partially patched; refreshing from archive"
+            ensure_local_archive_source "duckdb/duckdb-iceberg" "$ICEBERG_REFRESH_REF" "$ICEBERG_FALLBACK_DIR" "duckdb-iceberg" true
+        fi
+        apply_patch_series_to_source_dir "$ICEBERG_FALLBACK_DIR" "$ICEBERG_PATCH_DIR" "duckdb-iceberg"
+        use_iceberg_source_dir "$ICEBERG_FALLBACK_DIR" "duckdb-iceberg"
+    fi
 fi
 if [ "$WITH_SPATIAL" = true ] && [ -f .github/config/extensions/spatial.cmake ]; then
     sed -i '/DONT_LINK/d' .github/config/extensions/spatial.cmake
@@ -282,7 +486,7 @@ if [ "$WITH_ROBUST_RPT" = true ]; then
     cat > .github/config/extensions/robust.cmake << 'EOF'
 duckdb_extension_load(robust
     GIT_URL ROBUST_GIT_URL_PLACEHOLDER
-    GIT_TAG 5ec7800e000291e27f7433cb513ba606fc675fc1
+    GIT_TAG 0827cfa87e2a1ac52d0e8eba7fd6af9d0e84b3d8
     APPLY_PATCHES
 )
 EOF
@@ -294,7 +498,7 @@ if [ "$WITH_AGGJOIN" = true ]; then
     cat > .github/config/extensions/aggjoin.cmake << 'EOF'
 duckdb_extension_load(aggjoin
     GIT_URL https://github.com/arselzer/duckdb_aggjoin
-    GIT_TAG 5f4b64ac879b13662142bd7624784a4ad709393c
+    GIT_TAG f7259a9255ecda3dee8402714048799e6900c72c
     APPLY_PATCHES
 )
 EOF
@@ -320,33 +524,209 @@ diff --git a/CMakeLists.txt b/CMakeLists.txt
 index d0e5371..e7478aa 100644
 --- a/CMakeLists.txt
 +++ b/CMakeLists.txt
-@@ -185,6 +185,10 @@ if(NOT EXISTS ${CMAKE_CURRENT_SOURCE_DIR}/postgres)
-   message(STATUS "Finished setting up PostgreSQL source code!")
+@@ -49,6 +49,14 @@ target_link_libraries(${LOADABLE_EXTENSION_NAME}
+     PostgreSQL::PostgreSQL
+     ${CURL_LIBRARIES})
+ set_property(TARGET ${EXTENSION_NAME} PROPERTY C_STANDARD 99)
++target_include_directories(
++    ${EXTENSION_NAME}
++    PRIVATE include database-connector/src/include ${OPENSSL_INCLUDE_DIR}
++            ${PostgreSQL_INCLUDE_DIRS})
++target_link_libraries(${EXTENSION_NAME}
++    OpenSSL::SSL
++    OpenSSL::Crypto
++    PostgreSQL::PostgreSQL)
+ set_property(TARGET ${LOADABLE_EXTENSION_NAME} PROPERTY C_STANDARD 99)
+ 
+ if(WIN32)
+PATCH_EOF
+
+cat > .github/patches/extensions/postgres_scanner/oauth_hook_compat.patch << 'PATCH_EOF'
+diff --git a/CMakeLists.txt b/CMakeLists.txt
+index b30ca04..5edb9b2 100644
+--- a/CMakeLists.txt
++++ b/CMakeLists.txt
+@@ -10,6 +10,7 @@ add_definitions(
+     -DHAVE_BIO_METH_NEW=1)
+ 
+ find_package(OpenSSL REQUIRED)
++include(CheckSymbolExists)
+ find_package(PostgreSQL REQUIRED)
+ 
+ if(NOT MSVC)
+@@ -19,6 +20,14 @@ if(NOT MSVC)
+         -Wno-sign-compare
+         -Wno-unused-variable)
  endif()
  
-+# Static extension build (added by build script)
-+build_static_extension(${TARGET_NAME} "" ${ALL_OBJECT_FILES}
-+                       ${LIBPG_SOURCES_FULLPATH})
++set(CMAKE_REQUIRED_INCLUDES ${PostgreSQL_INCLUDE_DIRS})
++check_symbol_exists(PQsetAuthDataHook "libpq-fe.h" HAVE_PQ_AUTH_DATA_HOOK)
++unset(CMAKE_REQUIRED_INCLUDES)
 +
- set(PARAMETERS "-no-warnings")
- build_loadable_extension(${TARGET_NAME} ${PARAMETERS} ${ALL_OBJECT_FILES}
-                          ${LIBPG_SOURCES_FULLPATH})
-@@ -208,3 +212,11 @@ if(WIN32)
-   target_link_libraries(${TARGET_NAME}_loadable_extension wsock32 ws2_32
-                         wldap32 secur32 crypt32)
- endif()
++if(HAVE_PQ_AUTH_DATA_HOOK)
++    add_compile_definitions(HAVE_PQ_AUTH_DATA_HOOK=1)
++endif()
 +
-+# Static binary includes/libs (added by build script)
-+target_include_directories(
-+  ${TARGET_NAME}_extension
-+  PRIVATE include src/include postgres/src/include postgres/src/backend
-+          postgres/src/interfaces/libpq ${OPENSSL_INCLUDE_DIR})
-+target_link_libraries(${TARGET_NAME}_extension ${OPENSSL_LIBRARIES})
-+set_property(TARGET ${TARGET_NAME}_extension PROPERTY C_STANDARD 99)
+ include_directories(
+     include
+     database-connector/src/include
+diff --git a/src/postgres_oauth.cpp b/src/postgres_oauth.cpp
+index 619532a..2317879 100644
+--- a/src/postgres_oauth.cpp
++++ b/src/postgres_oauth.cpp
+@@ -9,6 +9,8 @@ extern "C" {
+ #include "libpq-fe.h"
+ }
+ 
++#ifdef HAVE_PQ_AUTH_DATA_HOOK
++
+ namespace duckdb {
+ 
+ //! Previous hook in the chain (if any)
+@@ -107,3 +109,17 @@ OAuthTokenHolder SetThreadLocalOAuthTokenFromSessionOption(ClientContext &ctx) {
+ }
+ 
+ } // namespace duckdb
++
++#else
++
++namespace duckdb {
++
++OAuthTokenHolder::~OAuthTokenHolder() {
++}
++
++void PostgresInitOAuthHook() {
++}
++
++OAuthTokenHolder SetThreadLocalOAuthTokenFromSessionOption(ClientContext &) { return OAuthTokenHolder(); }
++} // namespace duckdb
++#endif
 PATCH_EOF
 
 mkdir -p .github/patches/extensions/delta
 mkdir -p .github/patches/extensions/mysql_scanner
+mkdir -p .github/patches/extensions/avro
+if [ -f .github/patches/extensions/avro/0004-logical-type-compat.patch ]; then
+    rm -f .github/patches/extensions/avro/logical_type_compat.patch
+    log_success "avro logical-type compat already present upstream"
+else
+cat > .github/patches/extensions/avro/logical_type_compat.patch << 'PATCH_EOF'
+diff --git a/CMakeLists.txt b/CMakeLists.txt
+--- a/CMakeLists.txt
++++ b/CMakeLists.txt
+@@ -31,6 +31,16 @@ else()
+   find_library(ZLIB_LIBRARY libz.a REQUIRED)
+ endif()
+ 
++include(CheckSymbolExists)
++
++set(CMAKE_REQUIRED_INCLUDES ${AVRO_INCLUDE_DIR})
++check_symbol_exists(avro_schema_logical_type "avro/schema.h" HAVE_AVRO_SCHEMA_LOGICAL_TYPE)
++unset(CMAKE_REQUIRED_INCLUDES)
++
++if(HAVE_AVRO_SCHEMA_LOGICAL_TYPE)
++  add_compile_definitions(HAVE_AVRO_SCHEMA_LOGICAL_TYPE=1)
++endif()
++
+ find_library(SNAPPY_LIBRARY snappy REQUIRED)
+ set(ALL_AVRO_LIBRARIES
+     ${AVRO_LIBRARY}
+diff --git a/src/avro_reader.cpp b/src/avro_reader.cpp
+--- a/src/avro_reader.cpp
++++ b/src/avro_reader.cpp
+@@ -19,8 +19,42 @@
+ 
+ namespace duckdb {
+ 
++#ifdef HAVE_AVRO_SCHEMA_LOGICAL_TYPE
++static const char *GetAvroLogicalType(avro_schema_t &avro_schema) {
++	return avro_schema_logical_type(avro_schema);
++}
++
++static int32_t GetAvroSchemaScale(avro_schema_t &avro_schema) {
++	return avro_schema_scale(avro_schema);
++}
++
++static int32_t GetAvroSchemaPrecision(avro_schema_t &avro_schema) {
++	return avro_schema_precision(avro_schema);
++}
++
++static int GetAvroSchemaAdjustToUTC(avro_schema_t &avro_schema) {
++	return avro_schema_adjust_to_utc(avro_schema);
++}
++#else
++static const char *GetAvroLogicalType(avro_schema_t &) {
++	return nullptr;
++}
++
++static int32_t GetAvroSchemaScale(avro_schema_t &) {
++	return 0;
++}
++
++static int32_t GetAvroSchemaPrecision(avro_schema_t &) {
++	return 0;
++}
++
++static int GetAvroSchemaAdjustToUTC(avro_schema_t &) {
++	return 0;
++}
++#endif
++
+ static LogicalType AvroLogicalTypeToLogicalType(avro_schema_t &avro_schema) {
+-	auto logical_type_raw = avro_schema_logical_type(avro_schema);
++	auto logical_type_raw = GetAvroLogicalType(avro_schema);
+ 	if (!logical_type_raw) {
+ 		return LogicalType::INVALID;
+ 	}
+@@ -39,15 +73,15 @@ static LogicalType AvroLogicalTypeToLogicalType(avro_schema_t &avro_schema) {
+ 		return LogicalType::DATE;
+ 	}
+ 	if (logical_type == "decimal") {
+-		auto scale = avro_schema_scale(avro_schema);
+-		auto precision = avro_schema_precision(avro_schema);
++		auto scale = GetAvroSchemaScale(avro_schema);
++		auto precision = GetAvroSchemaPrecision(avro_schema);
+ 		return LogicalType::DECIMAL(precision, scale);
+ 	}
+ 	if (logical_type == "time-micros") {
+ 		return LogicalType::TIME;
+ 	}
+ 	if (logical_type == "timestamp-micros") {
+-		auto adjust_to_utc = avro_schema_adjust_to_utc(avro_schema);
++		auto adjust_to_utc = GetAvroSchemaAdjustToUTC(avro_schema);
+ 		// -1 doesn't exist
+ 		if (adjust_to_utc > 0) {
+ 			return LogicalType::TIMESTAMP_TZ;
+@@ -55,7 +89,7 @@ static LogicalType AvroLogicalTypeToLogicalType(avro_schema_t &avro_schema) {
+ 		return LogicalType::TIMESTAMP;
+ 	}
+ 	if (logical_type == "timestamp-nanos") {
+-		auto adjust_to_utc = avro_schema_adjust_to_utc(avro_schema);
++		auto adjust_to_utc = GetAvroSchemaAdjustToUTC(avro_schema);
+ 		if (adjust_to_utc > 0) {
+ 			throw NotImplementedException("Avro timestamp-nanos with adjust_to_utc not supported");
+ 		}
+@@ -72,7 +106,7 @@ static LogicalType AvroLogicalTypeToLogicalType(avro_schema_t &avro_schema) {
+ 		return LogicalType::TIME;
+ 	}
+ 	if (logical_type == "timestamp-millis") {
+-		auto adjust_to_utc = avro_schema_adjust_to_utc(avro_schema);
++		auto adjust_to_utc = GetAvroSchemaAdjustToUTC(avro_schema);
+ 		if (adjust_to_utc > 0) {
+ 			return LogicalType::TIMESTAMP_TZ;
+ 		}
+@@ -88,7 +122,7 @@ static AvroType TransformSchema(avro_schema_t &avro_schema, unordered_set<string
+ 	auto duckdb_logical_type = AvroLogicalTypeToLogicalType(avro_schema);
+ 	bool has_logical_type = duckdb_logical_type != LogicalType::INVALID;
+ 
+-	auto raw_lt = avro_schema_logical_type(avro_schema);
++	auto raw_lt = GetAvroLogicalType(avro_schema);
+	bool is_millis = raw_lt && (string(raw_lt) == "timestamp-millis" || string(raw_lt) == "time-millis" ||
+	                            string(raw_lt) == "local-timestamp-millis");
+
+PATCH_EOF
+fi
+
 cat > .github/patches/extensions/mysql_scanner/static_build.patch << 'PATCH_EOF'
 diff --git a/CMakeLists.txt b/CMakeLists.txt
 index 081124a..f0a2df6 100644
@@ -2250,7 +2630,7 @@ if [ "$SKIP_VCPKG" = false ]; then
     cd "$VCPKG_DIR"
     
     log_info "Installing AWS SDK (~5 min)..."
-    ./vcpkg install aws-sdk-cpp[core,s3,transfer,config,sts,sso,identity-management]
+    ./vcpkg install --recurse aws-sdk-cpp[core,s3,transfer,config,sts,sso,identity-management,rds,cloudformation]
     
     log_info "Installing Azure SDK (~3 min)..."
     ./vcpkg install azure-storage-blobs-cpp azure-storage-files-datalake-cpp azure-identity-cpp
@@ -2288,8 +2668,8 @@ if [ "$WITH_OPENIVM_LOADABLE" = true ]; then
         git clone https://github.com/ila/openivm "$OPENIVM_LOCAL_DIR"
     fi
     git -C "$OPENIVM_LOCAL_DIR" fetch origin
-    git -C "$OPENIVM_LOCAL_DIR" checkout d933612f2603a957fa2b2592c5b447d8e2723a42
-    git -C "$OPENIVM_LOCAL_DIR" reset --hard d933612f2603a957fa2b2592c5b447d8e2723a42
+    git -C "$OPENIVM_LOCAL_DIR" checkout 974a7b29da0f9b8f876a05626da427cc4bcfa05d
+    git -C "$OPENIVM_LOCAL_DIR" reset --hard 974a7b29da0f9b8f876a05626da427cc4bcfa05d
     git -C "$OPENIVM_LOCAL_DIR" submodule sync --recursive
     # OpenIVM build only needs LPTS plus its DuckLake nested submodule.
     # Avoid pulling other nested LPTS submodules (duckdb clone, sqlstorm, skills).
@@ -2297,7 +2677,8 @@ if [ "$WITH_OPENIVM_LOADABLE" = true ]; then
     git -C "$OPENIVM_LOCAL_DIR/third_party/lpts" submodule update --init third_party/ducklake
     git -C "$OPENIVM_LOCAL_DIR/third_party/lpts" reset --hard HEAD
     log_info "Applying OpenIVM compatibility patch for current DuckDB APIs..."
-    git -C "$OPENIVM_LOCAL_DIR" apply "$BUILD_SCRIPT_DIR/patches/openivm-current-duckdb.patch"
+    apply_patch_if_needed "$OPENIVM_LOCAL_DIR" "$BUILD_SCRIPT_DIR/patches/openivm-current-duckdb.patch" \
+        "OpenIVM compatibility patch"
     log_info "Disabling OpenIVM native benchmark/tool targets for static builds..."
     python3 - "$OPENIVM_LOCAL_DIR/CMakeLists.txt" <<'PY'
 from pathlib import Path
@@ -2311,7 +2692,8 @@ if count != 1:
 path.write_text(new_text)
 PY
     log_info "Applying OpenIVM runtime patch..."
-    git -C "$OPENIVM_LOCAL_DIR" apply "$BUILD_SCRIPT_DIR/patches/openivm-active-runtime.patch"
+    apply_patch_if_needed "$OPENIVM_LOCAL_DIR" "$BUILD_SCRIPT_DIR/patches/openivm-active-runtime.patch" \
+        "OpenIVM runtime patch"
     log_success "OpenIVM source prepared at $OPENIVM_LOCAL_DIR"
 fi
 
@@ -2359,6 +2741,7 @@ if [ "$WITH_OPENIVM_LOADABLE" = true ]; then
     DUCKDB_OPENIVM_DIRECTORY="$OPENIVM_LOCAL_DIR" cmake -S "$DUCKDB_DIR" -B "$BUILD_DIR" \
       -DCMAKE_BUILD_TYPE=Release \
       -DCMAKE_TOOLCHAIN_FILE="$VCPKG_DIR/scripts/buildsystems/vcpkg.cmake" \
+      -DVCPKG_BUILD=1 \
       -DVCPKG_MANIFEST_MODE=OFF \
       -DCMAKE_EXE_LINKER_FLAGS="-Wl,--allow-multiple-definition" \
       -DCMAKE_SHARED_LINKER_FLAGS="-Wl,--allow-multiple-definition" \
@@ -2368,6 +2751,7 @@ else
     cmake -S "$DUCKDB_DIR" -B "$BUILD_DIR" \
       -DCMAKE_BUILD_TYPE=Release \
       -DCMAKE_TOOLCHAIN_FILE="$VCPKG_DIR/scripts/buildsystems/vcpkg.cmake" \
+      -DVCPKG_BUILD=1 \
       -DVCPKG_MANIFEST_MODE=OFF \
       -DCMAKE_EXE_LINKER_FLAGS="-Wl,--allow-multiple-definition" \
       -DCMAKE_SHARED_LINKER_FLAGS="-Wl,--allow-multiple-definition" \

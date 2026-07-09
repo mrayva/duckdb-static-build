@@ -26,12 +26,16 @@ Optionally include `spatial`, and optionally build `openivm` as a regular loadab
 - Current tip baseline: 23 runtime-loaded built-in extensions
 - Add 1 loaded extension for `--with-spatial` on current tip for 24 total runtime-loaded extensions
 - `--with-openivm-loadable` keeps the default static extension count unchanged and also builds `openivm.duckdb_extension`
+- Current tip static build: build-clean with the repo script and compat patches
 
 Current known-good verification matrix:
 - `--skip-vcpkg --with-spatial`
 - `--skip-vcpkg --with-openivm-loadable`
 
-## Extensions Included (24)
+Current known test boundary on DuckDB tip:
+- `./test/unittest --abort` still stops on the upstream remote-optimizer serialized-plan regression (`PLAN_STATEMENT` in `test_remote_optimizer.cpp`)
+
+## Extensions Included
 
 | Category | Extensions |
 |----------|------------|

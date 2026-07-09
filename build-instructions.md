@@ -103,9 +103,11 @@ On success, you should see:
 
 - Binary at `<duckdb-dir>/build/release-static/duckdb`
 - Size around ~149-150MB
-- `All 24 extensions loaded successfully!`
+- `23 runtime-loaded built-in extensions` on current DuckDB tip
+- `jemalloc` compiled into core allocator plumbing and not counted by `duckdb_extensions()`
+- `24 runtime-loaded built-in extensions` when `--with-spatial` is enabled
 
-With `--with-spatial`, expect 25 loaded extensions and a larger binary.
+With `--with-spatial`, expect 24 loaded extensions and a larger binary.
 With `--with-openivm-loadable`, expect the default static extension count plus a separate `openivm.duckdb_extension` artifact.
 
 Current known-good verification matrix:
@@ -113,6 +115,12 @@ Current known-good verification matrix:
 - `--skip-vcpkg`
 - `--with-spatial`
 - `--with-openivm-loadable`
+- current tip static release build completes successfully with the repo compat patches
+
+Current known test boundary on DuckDB tip:
+- `./test/unittest --abort` currently fails at `test/extension/test_remote_optimizer.cpp`
+- failure signature: remote optimizer serialized-plan path throws `Not implemented Error: PLAN_STATEMENT`
+- treat the tip baseline as build-clean, not full-`unittest`-clean
 
 Current preferred non-static OpenIVM profile:
 - `--with-openivm-loadable`
@@ -181,7 +189,7 @@ Supported OpenIVM baseline:
 - normal DuckDB tables: validated
 - current tip non-DuckLake core suite: `29 passed, 0 failed`
 - DuckLake-backed refresh: experimental
-- current tip build: build-valid and core-functional on the non-DuckLake path
+- current tip build: build-clean and core-functional on the non-DuckLake path
 
 Loadable-profile recipe:
 
