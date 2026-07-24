@@ -34,6 +34,7 @@ c++ -std=c++17 -O0 -g \
     -I"$DUCKDB_DIR/third_party/vergesort" \
     "$PROBE_SRC" \
     "$BUILD_DIR/src/libduckdb_static.a" \
+    "$BUILD_DIR/extension/libdummy_static_extension_loader.a" \
     -ldl -lpthread -lssl -lcrypto -lm -lc -lresolv \
     -o "$PROBE_BIN"
 

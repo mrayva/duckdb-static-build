@@ -8,12 +8,6 @@
 
 using namespace duckdb;
 
-namespace duckdb {
-void ExtensionHelper::LoadAllExtensions(DuckDB &) {
-	// No-op for the standalone regression probe.
-}
-} // namespace duckdb
-
 static void Run(Connection &con, const std::string &sql) {
 	auto res = con.Query(sql);
 	if (!res || res->HasError()) {
@@ -93,17 +87,17 @@ int main(int argc, char **argv) {
 	ExpectRows(con,
 	           "metadata summary",
 	           "SELECT view_name, type, semi_anti_aux_meta_json IS NULL, length(semi_anti_aux_meta_json) "
-	           "FROM _duckdb_ivm_views WHERE view_name IN ('mv_saj_semi','mv_exists_semi') ORDER BY view_name",
+	           "FROM openivm_views WHERE view_name IN ('mv_saj_semi','mv_exists_semi') ORDER BY view_name",
 	           2);
 
 	ExpectRows(con,
 	           "direct saj json",
-	           "SELECT semi_anti_aux_meta_json FROM _duckdb_ivm_views WHERE view_name = 'mv_saj_semi'",
+	           "SELECT semi_anti_aux_meta_json FROM openivm_views WHERE view_name = 'mv_saj_semi'",
 	           1);
 
 	ExpectRows(con,
 	           "direct exists json",
-	           "SELECT semi_anti_aux_meta_json FROM _duckdb_ivm_views WHERE view_name = 'mv_exists_semi'",
+	           "SELECT semi_anti_aux_meta_json FROM openivm_views WHERE view_name = 'mv_exists_semi'",
 	           1);
 
 	return 0;

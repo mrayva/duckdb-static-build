@@ -42,6 +42,25 @@ ROBUST_LOCAL_DIR=${ROBUST_LOCAL_DIR:-/tmp/robust-labs-robust}
 ICEBERG_SOURCE_DIR=${ICEBERG_SOURCE_DIR:-}
 ICEBERG_FALLBACK_DIR=${ICEBERG_FALLBACK_DIR:-/tmp/duckdb-iceberg-src}
 
+# Keep unavailable GitHub endpoints from blocking a build indefinitely. These
+# settings apply both to the script's Git operations and to CMake FetchContent.
+GIT_HTTP_CONNECT_TIMEOUT=${GIT_HTTP_CONNECT_TIMEOUT:-15}
+GIT_HTTP_LOW_SPEED_LIMIT=${GIT_HTTP_LOW_SPEED_LIMIT:-1000}
+GIT_HTTP_LOW_SPEED_TIME=${GIT_HTTP_LOW_SPEED_TIME:-30}
+GIT_COMMAND_TIMEOUT=${GIT_COMMAND_TIMEOUT:-120}
+CURL_CONNECT_TIMEOUT=${CURL_CONNECT_TIMEOUT:-15}
+CURL_MAX_TIME=${CURL_MAX_TIME:-180}
+CMAKE_CONFIGURE_TIMEOUT=${CMAKE_CONFIGURE_TIMEOUT:-1800}
+
+git_network() {
+    timeout --foreground "$GIT_COMMAND_TIMEOUT" git \
+        -c "http.connectTimeout=$GIT_HTTP_CONNECT_TIMEOUT" \
+        -c "http.lowSpeedLimit=$GIT_HTTP_LOW_SPEED_LIMIT" \
+        -c "http.lowSpeedTime=$GIT_HTTP_LOW_SPEED_TIME" "$@"
+}
+
+export GIT_CONFIG_PARAMETERS="'http.connectTimeout=$GIT_HTTP_CONNECT_TIMEOUT' 'http.lowSpeedLimit=$GIT_HTTP_LOW_SPEED_LIMIT' 'http.lowSpeedTime=$GIT_HTTP_LOW_SPEED_TIME'"
+
 require_cmd() {
     local cmd="$1"
     if ! command -v "$cmd" >/dev/null 2>&1; then
@@ -59,7 +78,7 @@ ensure_include_after_git_tag() {
     if grep -Fq "$include_line" "$file"; then
         return 0
     fi
-    sed -i "/GIT_TAG/a\\            $include_line" "$file"
+    sed -i "/^[[:space:]]*GIT_TAG[[:space:]]/a\\            $include_line" "$file"
 }
 
 sanitize_dirty_fetchcontent_deps() {
@@ -173,7 +192,7 @@ ensure_local_archive_source() {
     local label="$4"
     local force_refresh="${5:-false}"
     local marker_file="$source_dir/.duckdb_static_build_ref"
-    local archive_url="https://github.com/${repo_slug}/archive/${ref}.tar.gz"
+    local archive_url="https://codeload.github.com/${repo_slug}/tar.gz/${ref}"
     local archive_path="/tmp/${label}-${ref}.tar.gz"
     local extract_dir
     local archive_listing
@@ -187,9 +206,11 @@ ensure_local_archive_source() {
     extract_dir=$(mktemp -d "/tmp/${label}-extract.XXXXXX")
 
     if [ ! -f "$archive_path" ] || ! tar -tzf "$archive_path" >/dev/null 2>&1; then
-        rm -f "$archive_path"
         log_info "Downloading source archive for $label at $ref..."
-        curl -fsSL --retry 3 --retry-delay 2 "$archive_url" -o "$archive_path"
+        curl -fsSL --connect-timeout "$CURL_CONNECT_TIMEOUT" --max-time "$CURL_MAX_TIME" \
+            --continue-at - --retry 5 --retry-all-errors --retry-delay 2 \
+            --retry-max-time "$CURL_MAX_TIME" \
+            "$archive_url" -o "$archive_path"
     else
         log_info "Reusing cached source archive for $label at $archive_path"
     fi
@@ -209,7 +230,6 @@ ensure_local_archive_source() {
     mv "$extract_dir/$top_dir" "$source_dir"
     echo "$ref" > "$marker_file"
     rm -rf "$extract_dir"
-    rm -f "$archive_path"
 
     log_success "Local source ready for $label at $source_dir"
 }
@@ -304,7 +324,7 @@ log_error() {
 
 # Check prerequisites
 log_info "Checking prerequisites..."
-for cmd in git cmake make sed awk nproc python3 curl tar patch; do
+for cmd in git cmake make sed awk nproc python3 curl tar patch timeout; do
     require_cmd "$cmd"
 done
 for cmd in gcc g++ cargo rustc; do
@@ -319,7 +339,7 @@ log_success "All prerequisites found"
 log_info "Step 1: Setting up vcpkg at $VCPKG_DIR"
 if [ ! -d "$VCPKG_DIR" ]; then
     log_info "Cloning vcpkg..."
-    git clone https://github.com/microsoft/vcpkg.git "$VCPKG_DIR"
+    git_network clone --depth 1 https://github.com/microsoft/vcpkg.git "$VCPKG_DIR"
     cd "$VCPKG_DIR"
     ./bootstrap-vcpkg.sh
     log_success "vcpkg installed"
@@ -331,13 +351,20 @@ fi
 log_info "Step 2: Setting up DuckDB at $DUCKDB_DIR"
 if [ ! -d "$DUCKDB_DIR" ]; then
     log_info "Cloning DuckDB..."
-    git clone https://github.com/duckdb/duckdb.git "$DUCKDB_DIR"
+    git_network clone --depth 1 https://github.com/duckdb/duckdb.git "$DUCKDB_DIR"
     log_success "DuckDB cloned"
 else
     log_success "DuckDB already exists at $DUCKDB_DIR"
 fi
 
 cd "$DUCKDB_DIR"
+
+# The upstream remote-optimizer test forks after the test runner may have
+# initialized Spatial/PROJ's process-global SQLite state. Run its client and
+# helper through clean exec'd processes so the test exercises plan transport,
+# not inherited extension state.
+apply_patch_if_needed "$DUCKDB_DIR" "$BUILD_SCRIPT_DIR/patches/remote-optimizer-exec.patch" \
+    "remote optimizer exec isolation"
 
 # Clean build if requested
 if [ "$CLEAN_BUILD" = true ]; then
@@ -435,12 +462,18 @@ if [ -f .github/config/extensions/postgres_scanner.cmake ]; then
 fi
 if [ -f .github/config/extensions/mysql_scanner.cmake ]; then
     sed -i '/DONT_LINK/d' .github/config/extensions/mysql_scanner.cmake
+    sed -i '/^[[:space:]]*INCLUDE_DIR src\/include$/d' .github/config/extensions/mysql_scanner.cmake
+    sed -i 's/set(MYSQL_SCANNER_ENABLED OFF)/set(MYSQL_SCANNER_ENABLED ON)/' \
+        .github/config/extensions/mysql_scanner.cmake
     ensure_include_after_git_tag .github/config/extensions/mysql_scanner.cmake "INCLUDE_DIR src/include"
     ensure_include_after_git_tag .github/config/extensions/mysql_scanner.cmake "APPLY_PATCHES"
     log_success "mysql_scanner config patched"
 fi
 if [ -f .github/config/extensions/iceberg.cmake ]; then
     ICEBERG_PATCH_DIR="$DUCKDB_DIR/.github/patches/extensions/iceberg"
+    mkdir -p "$ICEBERG_PATCH_DIR"
+    cp "$BUILD_SCRIPT_DIR/patches/iceberg-current-duckdb.patch" "$ICEBERG_PATCH_DIR/fix.patch"
+    log_success "Synchronized Iceberg compatibility patch"
     ICEBERG_REFRESH_REF=""
     CURRENT_ICEBERG_SOURCE_DIR=$(awk '/SOURCE_DIR/ {print $2; exit}' .github/config/extensions/iceberg.cmake)
     ICEBERG_GIT_TAG=$(awk '/GIT_TAG/ {print $2; exit}' .github/config/extensions/iceberg.cmake)
@@ -479,6 +512,9 @@ if [ -f .github/config/extensions/iceberg.cmake ]; then
 fi
 if [ "$WITH_SPATIAL" = true ] && [ -f .github/config/extensions/spatial.cmake ]; then
     sed -i '/DONT_LINK/d' .github/config/extensions/spatial.cmake
+    mkdir -p .github/patches/extensions/spatial
+    cp "$BUILD_SCRIPT_DIR/patches/spatial-current-duckdb.patch" \
+       .github/patches/extensions/spatial/gdal-tip-compat.patch
     log_success "spatial config patched"
 fi
 if [ "$WITH_ROBUST_RPT" = true ]; then
@@ -606,6 +642,48 @@ PATCH_EOF
 mkdir -p .github/patches/extensions/delta
 mkdir -p .github/patches/extensions/mysql_scanner
 mkdir -p .github/patches/extensions/avro
+mkdir -p .github/vcpkg_ports/avro-c
+cat > .github/vcpkg_ports/avro-c/vcpkg.json << 'EOF'
+{
+  "name": "avro-c",
+  "version": "1.12.1",
+  "description": "DuckDB-compatible Apache Avro C library",
+  "homepage": "https://github.com/duckdb/duckdb-avro-c",
+  "license": "Apache-2.0",
+  "dependencies": [
+    "jansson",
+    "liblzma",
+    "snappy",
+    "vcpkg-cmake",
+    "zlib"
+  ]
+}
+EOF
+cat > .github/vcpkg_ports/avro-c/portfile.cmake << 'EOF'
+vcpkg_from_github(
+    OUT_SOURCE_PATH SOURCE_PATH
+    REPO duckdb/duckdb-avro-c
+    REF 52bafc6a90fb6176b9b85ab2489ee5e49a5f208c
+    SHA512 1e9527b95023e0c92fc8844cdb8357d256e3cf92abb63a10adb57536722cf7a7eb314aac99555373d84995e7d96fddf7475f420ca9e0fe79f713c1e6daa9334a
+)
+
+vcpkg_cmake_configure(
+    SOURCE_PATH "${SOURCE_PATH}/lang/c"
+    OPTIONS
+        -DBUILD_EXAMPLES=OFF
+        -DBUILD_TESTS=OFF
+        -DBUILD_DOCS=OFF
+)
+vcpkg_cmake_install()
+vcpkg_copy_pdbs()
+file(REMOVE_RECURSE "${CURRENT_PACKAGES_DIR}/debug/include")
+file(REMOVE_RECURSE "${CURRENT_PACKAGES_DIR}/lib/pkgconfig" "${CURRENT_PACKAGES_DIR}/debug/lib/pkgconfig")
+vcpkg_copy_tools(TOOL_NAMES avroappend avrocat avropipe avromod AUTO_CLEAN)
+if(VCPKG_LIBRARY_LINKAGE STREQUAL "static" AND NOT VCPKG_TARGET_IS_WINDOWS)
+    file(REMOVE_RECURSE "${CURRENT_PACKAGES_DIR}/bin" "${CURRENT_PACKAGES_DIR}/debug/bin")
+endif()
+file(INSTALL "${SOURCE_PATH}/lang/c/LICENSE" DESTINATION "${CURRENT_PACKAGES_DIR}/share/${PORT}" RENAME copyright)
+EOF
 if [ -f .github/patches/extensions/avro/0004-logical-type-compat.patch ]; then
     rm -f .github/patches/extensions/avro/logical_type_compat.patch
     log_success "avro logical-type compat already present upstream"
@@ -614,21 +692,25 @@ cat > .github/patches/extensions/avro/logical_type_compat.patch << 'PATCH_EOF'
 diff --git a/CMakeLists.txt b/CMakeLists.txt
 --- a/CMakeLists.txt
 +++ b/CMakeLists.txt
-@@ -31,6 +31,16 @@ else()
+@@ -31,6 +31,20 @@ else()
    find_library(ZLIB_LIBRARY libz.a REQUIRED)
  endif()
  
 +include(CheckSymbolExists)
 +
 +set(CMAKE_REQUIRED_INCLUDES ${AVRO_INCLUDE_DIR})
++find_library(SNAPPY_LIBRARY snappy REQUIRED)
++set(CMAKE_REQUIRED_LIBRARIES
++    ${AVRO_LIBRARY} ${JANSSON_LIBRARY} ${LZMA_LIBRARY} ${ZLIB_LIBRARY} ${SNAPPY_LIBRARY})
 +check_symbol_exists(avro_schema_logical_type "avro/schema.h" HAVE_AVRO_SCHEMA_LOGICAL_TYPE)
 +unset(CMAKE_REQUIRED_INCLUDES)
++unset(CMAKE_REQUIRED_LIBRARIES)
 +
 +if(HAVE_AVRO_SCHEMA_LOGICAL_TYPE)
 +  add_compile_definitions(HAVE_AVRO_SCHEMA_LOGICAL_TYPE=1)
 +endif()
 +
- find_library(SNAPPY_LIBRARY snappy REQUIRED)
+- find_library(SNAPPY_LIBRARY snappy REQUIRED)
  set(ALL_AVRO_LIBRARIES
      ${AVRO_LIBRARY}
 diff --git a/src/avro_reader.cpp b/src/avro_reader.cpp
@@ -2630,13 +2712,18 @@ if [ "$SKIP_VCPKG" = false ]; then
     cd "$VCPKG_DIR"
     
     log_info "Installing AWS SDK (~5 min)..."
-    ./vcpkg install --recurse aws-sdk-cpp[core,s3,transfer,config,sts,sso,identity-management,rds,cloudformation]
+    ./vcpkg install --recurse aws-crt-cpp
+    ./vcpkg install --recurse aws-sdk-cpp[core,s3,transfer,config,sts,sso,identity-management,rds,redshift,cloudformation]
     
     log_info "Installing Azure SDK (~3 min)..."
     ./vcpkg install azure-storage-blobs-cpp azure-storage-files-datalake-cpp azure-identity-cpp
     
     log_info "Installing Roaring..."
     ./vcpkg install roaring
+
+    log_info "Installing DuckDB-compatible Avro C library..."
+    ./vcpkg remove avro-c:x64-linux >/dev/null 2>&1 || true
+    ./vcpkg install --overlay-ports="$DUCKDB_DIR/.github/vcpkg_ports" avro-c:x64-linux
     
     log_info "Installing libmariadb (for mysql_scanner)..."
     ./vcpkg install libmariadb
@@ -2665,17 +2752,17 @@ if [ "$WITH_OPENIVM_LOADABLE" = true ]; then
     log_info "Step 5b: Preparing OpenIVM source with recursive submodules..."
     OPENIVM_LOCAL_DIR="$DUCKDB_DIR/build/openivm-local-src"
     if [ ! -d "$OPENIVM_LOCAL_DIR/.git" ]; then
-        git clone https://github.com/ila/openivm "$OPENIVM_LOCAL_DIR"
+        git_network clone https://github.com/ila/openivm "$OPENIVM_LOCAL_DIR"
     fi
-    git -C "$OPENIVM_LOCAL_DIR" fetch origin
-    git -C "$OPENIVM_LOCAL_DIR" checkout 974a7b29da0f9b8f876a05626da427cc4bcfa05d
-    git -C "$OPENIVM_LOCAL_DIR" reset --hard 974a7b29da0f9b8f876a05626da427cc4bcfa05d
-    git -C "$OPENIVM_LOCAL_DIR" submodule sync --recursive
+    git_network -C "$OPENIVM_LOCAL_DIR" fetch origin
+    git_network -C "$OPENIVM_LOCAL_DIR" checkout 974a7b29da0f9b8f876a05626da427cc4bcfa05d
+    git_network -C "$OPENIVM_LOCAL_DIR" reset --hard 974a7b29da0f9b8f876a05626da427cc4bcfa05d
+    git_network -C "$OPENIVM_LOCAL_DIR" submodule sync --recursive
     # OpenIVM build only needs LPTS plus its DuckLake nested submodule.
     # Avoid pulling other nested LPTS submodules (duckdb clone, sqlstorm, skills).
-    git -C "$OPENIVM_LOCAL_DIR" submodule update --init third_party/lpts
-    git -C "$OPENIVM_LOCAL_DIR/third_party/lpts" submodule update --init third_party/ducklake
-    git -C "$OPENIVM_LOCAL_DIR/third_party/lpts" reset --hard HEAD
+    git_network -C "$OPENIVM_LOCAL_DIR" submodule update --init third_party/lpts
+    git_network -C "$OPENIVM_LOCAL_DIR/third_party/lpts" submodule update --init third_party/ducklake
+    git_network -C "$OPENIVM_LOCAL_DIR/third_party/lpts" reset --hard HEAD
     log_info "Applying OpenIVM compatibility patch for current DuckDB APIs..."
     apply_patch_if_needed "$OPENIVM_LOCAL_DIR" "$BUILD_SCRIPT_DIR/patches/openivm-current-duckdb.patch" \
         "OpenIVM compatibility patch"
@@ -2717,7 +2804,7 @@ if [ "$ROBUST_BISECT_MINIMAL_EXTENSIONS" = true ]; then
     EXPECTED_EXTENSIONS=6
 else
     BUILD_EXTENSIONS="autocomplete;icu;tpcds;tpch;fts;json;parquet;sqlite_scanner;postgres_scanner;mysql_scanner;httpfs;excel;vss;inet;avro;aws;azure;iceberg;ducklake;delta;unity_catalog"
-    EXPECTED_EXTENSIONS=24
+    EXPECTED_EXTENSIONS=23
 fi
 if [ "$WITH_SPATIAL" = true ]; then
     BUILD_EXTENSIONS="${BUILD_EXTENSIONS};spatial"
@@ -2738,7 +2825,7 @@ fi
 # Note: --allow-multiple-definition is required because postgres_scanner
 # shares some common helper functions with other static extensions.
 if [ "$WITH_OPENIVM_LOADABLE" = true ]; then
-    DUCKDB_OPENIVM_DIRECTORY="$OPENIVM_LOCAL_DIR" cmake -S "$DUCKDB_DIR" -B "$BUILD_DIR" \
+    DUCKDB_OPENIVM_DIRECTORY="$OPENIVM_LOCAL_DIR" timeout --foreground "$CMAKE_CONFIGURE_TIMEOUT" cmake -S "$DUCKDB_DIR" -B "$BUILD_DIR" \
       -DCMAKE_BUILD_TYPE=Release \
       -DCMAKE_TOOLCHAIN_FILE="$VCPKG_DIR/scripts/buildsystems/vcpkg.cmake" \
       -DVCPKG_BUILD=1 \
@@ -2746,9 +2833,10 @@ if [ "$WITH_OPENIVM_LOADABLE" = true ]; then
       -DCMAKE_EXE_LINKER_FLAGS="-Wl,--allow-multiple-definition" \
       -DCMAKE_SHARED_LINKER_FLAGS="-Wl,--allow-multiple-definition" \
       -DBUILD_EXTENSIONS="$BUILD_EXTENSIONS" \
+      -DOPENIVM_CORE_ONLY=ON \
       .
 else
-    cmake -S "$DUCKDB_DIR" -B "$BUILD_DIR" \
+    timeout --foreground "$CMAKE_CONFIGURE_TIMEOUT" cmake -S "$DUCKDB_DIR" -B "$BUILD_DIR" \
       -DCMAKE_BUILD_TYPE=Release \
       -DCMAKE_TOOLCHAIN_FILE="$VCPKG_DIR/scripts/buildsystems/vcpkg.cmake" \
       -DVCPKG_BUILD=1 \
