@@ -1,0 +1,58 @@
+diff --git a/CMakeLists.txt b/CMakeLists.txt
+index 6b2a950..d5302f1 100644
+--- a/CMakeLists.txt
++++ b/CMakeLists.txt
+@@ -122,8 +122,16 @@ set(RUST_UNSET_ENV_VARS --unset=CC --unset=CXX --unset=LD)
+ set(DELTA_KERNEL_LIBNAME
+     "${CMAKE_STATIC_LIBRARY_PREFIX}delta_kernel_ffi${CMAKE_STATIC_LIBRARY_SUFFIX}"
+ )
++string(TOLOWER "${CMAKE_BUILD_TYPE}" CMAKE_BUILD_TYPE_LOWER)
++if(CMAKE_BUILD_TYPE_LOWER STREQUAL "debug")
++  set(CARGO_PROFILE dev)
++  set(CMAKE_BUILD_TYPE_LOWER debug)
++else()
++  set(CARGO_PROFILE release)
++  set(CMAKE_BUILD_TYPE_LOWER release)
++endif()
+ set(DELTA_KERNEL_LIBPATH
+-    "${CMAKE_BINARY_DIR}/rust/src/delta_kernel/target/${RUST_PLATFORM_TARGET}/$<IF:$<CONFIG:Debug>,debug,release>/${DELTA_KERNEL_LIBNAME}"
++    "${CMAKE_BINARY_DIR}/rust/src/delta_kernel/target/${RUST_PLATFORM_TARGET}/${CMAKE_BUILD_TYPE_LOWER}/${DELTA_KERNEL_LIBNAME}"
+ )
+ set(DELTA_KERNEL_FFI_HEADER_PATH
+     "${CMAKE_BINARY_DIR}/rust/src/delta_kernel/target/ffi-headers")
+@@ -138,9 +146,6 @@ set(DELTA_KERNEL_FFI_HEADER_PATCHED
+     "${CMAKE_BINARY_DIR}/codegen/include/generated_delta_kernel_ffi.hpp"
+ )
+ 
+-# Cargo optimization/debug symbol flags
+-set(CARGO_PROFILE "$<IF:$<CONFIG:Debug>,dev,release>")
+-
+ # Add rust_example as a CMake target
+ ExternalProject_Add(
+   ${KERNEL_NAME}
+@@ -148,11 +153,11 @@ ExternalProject_Add(
+   GIT_TAG v0.21.0
+   # Prints the env variables passed to the cargo build to the terminal, useful
+   # in debugging because passing them through CMake is an error-prone mess
+-  CONFIGURE_COMMAND ${CMAKE_COMMAND} -E env ${RUST_UNSET_ENV_VARS}
+-                    ${RUST_ENV_VARS} env
++  CONFIGURE_COMMAND ${CMAKE_COMMAND} -E touch
++                    "${CMAKE_CURRENT_SOURCE_DIR}/rust/src/delta_kernel/ffi/build.rs"
+   UPDATE_COMMAND ""
+   BUILD_IN_SOURCE 1
+-  # Build debug build
++  # Build the FFI library with the same profile used by the C++ build.
+   BUILD_COMMAND
+     ${CMAKE_COMMAND} -E env ${RUST_UNSET_ENV_VARS} ${RUST_ENV_VARS} cargo build
+       --package delta_kernel_ffi --profile=${CARGO_PROFILE}
+@@ -164,10 +169,6 @@ ExternalProject_Add(
+     "${CMAKE_BINARY_DIR}/rust/src/delta_kernel/benchmarks/workloads"
+   COMMAND ${CMAKE_COMMAND} -E touch
+     "${CMAKE_BINARY_DIR}/rust/src/delta_kernel/benchmarks/workloads/.done"
+-  # Build DATs
+-  COMMAND
+-    ${CMAKE_COMMAND} -E env ${RUST_UNSET_ENV_VARS} ${RUST_ENV_VARS} cargo build
+-      --manifest-path=${CMAKE_BINARY_DIR}/rust/src/delta_kernel/acceptance/Cargo.toml
+   # Copy, patch, and generate the C++ FFI header into codegen/include/.
+   # See scripts/ffi/generate_delta_kernel_ffi_header and cbindgen#402 for details.
+   COMMAND

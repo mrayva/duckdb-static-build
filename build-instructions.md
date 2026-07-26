@@ -78,6 +78,7 @@ The script performs these exact phases:
 - removes `DONT_LINK` where needed (`fts`, `vss`, `postgres_scanner`)
 - injects required `INCLUDE_DIR` entries
 7. If `--with-openivm-loadable` is used, prepares OpenIVM source, marks it `DONT_LINK`, and builds it as a regular loadable extension instead of adding it to the static startup set.
+8. If `--with-duckdbsp` is used, checks out the pinned `mrayva/duckDBSP` tip-port commit, marks it `DONT_LINK`, and builds `dbsp.duckdb_extension` against the same DuckDB source tree.
 9. Optional dependency install (unless `--skip-vcpkg`):
 - AWS SDK components
 - Azure SDK components

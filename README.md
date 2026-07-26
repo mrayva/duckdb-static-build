@@ -1,7 +1,7 @@
 # DuckDB Static Build Kit
 
 Build DuckDB with the current validated built-in extension set.
-Optionally include `spatial`, and optionally build `openivm` as a regular loadable extension.
+Optionally include `spatial`, or build OpenIVM and DuckDBSP as regular loadable extensions.
 
 ## Quick Start
 
@@ -17,6 +17,9 @@ Optionally include `spatial`, and optionally build `openivm` as a regular loadab
 
 # Build openivm as a regular loadable extension
 ./build-duckdb-static.sh --duckdb-dir /tmp/duckdb-clean/duckdbsrc --with-openivm-loadable --clean
+
+# Build DuckDBSP as a regular loadable extension
+./build-duckdb-static.sh --duckdb-dir /tmp/duckdb-clean/duckdbsrc --with-duckdbsp --clean
 ```
 
 ## What This Produces
@@ -26,6 +29,7 @@ Optionally include `spatial`, and optionally build `openivm` as a regular loadab
 - Current tip baseline: 23 runtime-loaded built-in extensions
 - Add 1 loaded extension for `--with-spatial` on current tip for 24 total runtime-loaded extensions
 - `--with-openivm-loadable` keeps the default static extension count unchanged and also builds `openivm.duckdb_extension`
+- `--with-duckdbsp` keeps the default static extension count unchanged and also builds `dbsp.duckdb_extension` from the pinned fork commit
 - Current tip static build: build-clean with the repo script and compat patches
 
 Current known-good verification matrix:
@@ -76,6 +80,8 @@ The supported baseline is:
 - DuckLake-backed OpenIVM treated as experimental
 
 The loadable profile builds into `<duckdb-dir>/build/release-static-openivm-loadable/` and the produced `openivm.duckdb_extension` is loaded with `-unsigned`, because the local artifact is not signed.
+
+The DuckDBSP profile builds into `<duckdb-dir>/build/release-static-duckdbsp-loadable/` and produces `dbsp.duckdb_extension`. It uses the current tip compatibility path with the engine hook disabled; DuckDB storage and circuit checkpoints remain authoritative, while the fork's typed WAL journal is available for persistent recovery diagnostics.
 
 DuckLake-backed refresh remains outside the supported baseline.
 
