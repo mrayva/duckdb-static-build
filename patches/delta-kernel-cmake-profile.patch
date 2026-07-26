@@ -23,7 +23,7 @@ index 6b2a950..d5302f1 100644
 @@ -138,9 +146,6 @@ set(DELTA_KERNEL_FFI_HEADER_PATCHED
      "${CMAKE_BINARY_DIR}/codegen/include/generated_delta_kernel_ffi.hpp"
  )
- 
+
 -# Cargo optimization/debug symbol flags
 -set(CARGO_PROFILE "$<IF:$<CONFIG:Debug>,dev,release>")
 -
