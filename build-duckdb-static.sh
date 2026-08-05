@@ -4,7 +4,6 @@ set -euo pipefail
 # DuckDB Static Build Script
 # Builds DuckDB with the current validated built-in extension set
 # Optionally adds the spatial extension
-# Optionally builds ila/openivm and mrayva/duckDBSP as regular loadable extensions
 # Usage: ./build-duckdb-static.sh [options]
 #   Options:
 #     --vcpkg-dir DIR    Path to vcpkg installation (default: ~/vcpkg)
@@ -12,8 +11,6 @@ set -euo pipefail
 #     --skip-vcpkg       Skip vcpkg dependency installation
 #     --clean            Clean build before starting
 #     --with-spatial     Include spatial as a statically-linked extension
-#     --with-openivm-loadable Build ila/openivm as a regular loadable extension, not statically linked
-#     --with-duckdbsp       Build mrayva/duckDBSP as a regular loadable extension
 #     --help             Show this help
 
 # Colors for output
@@ -30,8 +27,6 @@ BUILD_SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 SKIP_VCPKG=false
 CLEAN_BUILD=false
 WITH_SPATIAL=false
-WITH_OPENIVM_LOADABLE=false
-WITH_DUCKDBSP=false
 WITH_ROBUST_RPT=false
 WITH_AGGJOIN=false
 COPY_TESTS=false
@@ -43,8 +38,6 @@ ROBUST_PATCH_SKIP_COPY_OPTIMIZATION=false
 ROBUST_LOCAL_DIR=${ROBUST_LOCAL_DIR:-/tmp/robust-labs-robust}
 ICEBERG_SOURCE_DIR=${ICEBERG_SOURCE_DIR:-}
 ICEBERG_FALLBACK_DIR=${ICEBERG_FALLBACK_DIR:-/tmp/duckdb-iceberg-src}
-DUCKDBSP_REPO_URL=${DUCKDBSP_REPO_URL:-https://github.com/mrayva/duckDBSP.git}
-DUCKDBSP_REF=${DUCKDBSP_REF:-859039d}
 
 # Keep unavailable GitHub endpoints from blocking a build indefinitely. These
 # settings apply both to the script's Git operations and to CMake FetchContent.
@@ -295,14 +288,6 @@ while [[ $# -gt 0 ]]; do
       WITH_SPATIAL=true
       shift
       ;;
-    --with-openivm-loadable)
-      WITH_OPENIVM_LOADABLE=true
-      shift
-      ;;
-    --with-duckdbsp)
-      WITH_DUCKDBSP=true
-      shift
-      ;;
     --help)
       grep '^#' "$0" | grep -v '#!/bin/bash' | sed 's/^# //'
       exit 0
@@ -547,16 +532,6 @@ duckdb_extension_load(aggjoin
 )
 EOF
     log_success "aggjoin config created"
-fi
-if [ "$WITH_OPENIVM_LOADABLE" = true ]; then
-    mkdir -p .github/config/extensions
-    cat > .github/config/extensions/openivm.cmake << 'EOF'
-duckdb_extension_load(openivm
-    SOURCE_DIR ${CMAKE_CURRENT_SOURCE_DIR}/build/openivm-local-src
-)
-EOF
-    perl -0pi -e 's/SOURCE_DIR \$\{CMAKE_CURRENT_SOURCE_DIR\}\/build\/openivm-local-src\n\)/SOURCE_DIR \$\{CMAKE_CURRENT_SOURCE_DIR\}\/build\/openivm-local-src\n    DONT_LINK\n)/' .github/config/extensions/openivm.cmake
-    log_success "openivm config created"
 fi
 # Step 4b: Create extension patch files
 log_info "Step 4b: Creating extension patch files..."
@@ -2755,70 +2730,9 @@ else
     log_warning "Skipping vcpkg dependency installation (--skip-vcpkg)"
 fi
 
-# Step 5b: Prepare OpenIVM source with recursive submodules
-OPENIVM_LOCAL_DIR=""
-if [ "$WITH_OPENIVM_LOADABLE" = true ]; then
-    log_info "Step 5b: Preparing OpenIVM source with recursive submodules..."
-    OPENIVM_LOCAL_DIR="$DUCKDB_DIR/build/openivm-local-src"
-    if [ ! -d "$OPENIVM_LOCAL_DIR/.git" ]; then
-        git_network clone https://github.com/ila/openivm "$OPENIVM_LOCAL_DIR"
-    fi
-    git_network -C "$OPENIVM_LOCAL_DIR" fetch origin
-    git_network -C "$OPENIVM_LOCAL_DIR" checkout 974a7b29da0f9b8f876a05626da427cc4bcfa05d
-    git_network -C "$OPENIVM_LOCAL_DIR" reset --hard 974a7b29da0f9b8f876a05626da427cc4bcfa05d
-    git_network -C "$OPENIVM_LOCAL_DIR" submodule sync --recursive
-    # OpenIVM build only needs LPTS plus its DuckLake nested submodule.
-    # Avoid pulling other nested LPTS submodules (duckdb clone, sqlstorm, skills).
-    git_network -C "$OPENIVM_LOCAL_DIR" submodule update --init third_party/lpts
-    git_network -C "$OPENIVM_LOCAL_DIR/third_party/lpts" submodule update --init third_party/ducklake
-    git_network -C "$OPENIVM_LOCAL_DIR/third_party/lpts" reset --hard HEAD
-    log_info "Applying OpenIVM compatibility patch for current DuckDB APIs..."
-    apply_patch_if_needed "$OPENIVM_LOCAL_DIR" "$BUILD_SCRIPT_DIR/patches/openivm-current-duckdb.patch" \
-        "OpenIVM compatibility patch"
-    python3 "$BUILD_SCRIPT_DIR/scripts/port-openivm-cast-api.py" "$OPENIVM_LOCAL_DIR"
-    log_info "Disabling OpenIVM native benchmark/tool targets for static builds..."
-    python3 - "$OPENIVM_LOCAL_DIR/CMakeLists.txt" <<'PY'
-from pathlib import Path
-import re
-path = Path(__import__("sys").argv[1])
-text = path.read_text()
-pattern = r"\n# Test and benchmark tools - only build for native platforms\nif\(NOT EMSCRIPTEN AND NOT WIN32\)\n.*?\nendif\(\)\n"
-new_text, count = re.subn(pattern, "\n", text, flags=re.S)
-if count != 1:
-    raise SystemExit("failed to strip OpenIVM native tool targets")
-path.write_text(new_text)
-PY
-    log_info "Applying OpenIVM runtime patch..."
-    apply_patch_if_needed "$OPENIVM_LOCAL_DIR" "$BUILD_SCRIPT_DIR/patches/openivm-active-runtime.patch" \
-        "OpenIVM runtime patch"
-    log_success "OpenIVM source prepared at $OPENIVM_LOCAL_DIR"
-fi
-
-# Step 5c: Prepare DuckDBSP source from the validated fork commit.
-DUCKDBSP_LOCAL_DIR=""
-if [ "$WITH_DUCKDBSP" = true ]; then
-    log_info "Step 5c: Preparing DuckDBSP source..."
-    DUCKDBSP_LOCAL_DIR="$DUCKDB_DIR/build/duckdbsp-local-src"
-    if [ ! -d "$DUCKDBSP_LOCAL_DIR/.git" ]; then
-        git_network clone "$DUCKDBSP_REPO_URL" "$DUCKDBSP_LOCAL_DIR"
-    fi
-    git_network -C "$DUCKDBSP_LOCAL_DIR" fetch origin
-    git_network -C "$DUCKDBSP_LOCAL_DIR" checkout "$DUCKDBSP_REF"
-    git_network -C "$DUCKDBSP_LOCAL_DIR" reset --hard "$DUCKDBSP_REF"
-    log_success "DuckDBSP source prepared at $DUCKDBSP_LOCAL_DIR ($DUCKDBSP_REF)"
-fi
-
 # Step 6: Configure build
 log_info "Step 6: Configuring CMake (fetches extensions)..."
-if [ "$WITH_OPENIVM_LOADABLE" = true ] && [ "$WITH_DUCKDBSP" = true ]; then
-    BUILD_DIR="$DUCKDB_DIR/build/release-static-openivm-duckdbsp-loadable"
-elif [ "$WITH_OPENIVM_LOADABLE" = true ]; then
-    BUILD_DIR="$DUCKDB_DIR/build/release-static-openivm-loadable"
-elif [ "$WITH_DUCKDBSP" = true ]; then
-    BUILD_DIR="$DUCKDB_DIR/build/release-static-duckdbsp-loadable"
-else
-    BUILD_DIR="$DUCKDB_DIR/build/release-static"
-fi
+BUILD_DIR="$DUCKDB_DIR/build/release-static"
 mkdir -p "$BUILD_DIR"
 cd "$BUILD_DIR"
 sanitize_dirty_fetchcontent_deps
@@ -2846,37 +2760,19 @@ if [ "$WITH_AGGJOIN" = true ]; then
     BUILD_EXTENSIONS="${BUILD_EXTENSIONS};aggjoin"
     EXPECTED_EXTENSIONS=$((EXPECTED_EXTENSIONS + 1))
 fi
-if [ "$WITH_OPENIVM_LOADABLE" = true ]; then
-    BUILD_EXTENSIONS="${BUILD_EXTENSIONS};openivm"
-fi
 # Note: --allow-multiple-definition is required because postgres_scanner
 # shares some common helper functions with other static extensions.
-if [ "$WITH_OPENIVM_LOADABLE" = true ]; then
-    DUCKDB_OPENIVM_DIRECTORY="$OPENIVM_LOCAL_DIR" timeout --foreground "$CMAKE_CONFIGURE_TIMEOUT" cmake -S "$DUCKDB_DIR" -B "$BUILD_DIR" \
-      -DCMAKE_BUILD_TYPE=Release \
-      -DCMAKE_TOOLCHAIN_FILE="$VCPKG_DIR/scripts/buildsystems/vcpkg.cmake" \
-      -DCMAKE_C_COMPILER_LAUNCHER= \
-      -DCMAKE_CXX_COMPILER_LAUNCHER= \
-      -DVCPKG_BUILD=1 \
-      -DVCPKG_MANIFEST_MODE=OFF \
-      -DCMAKE_EXE_LINKER_FLAGS="-Wl,--allow-multiple-definition" \
-      -DCMAKE_SHARED_LINKER_FLAGS="-Wl,--allow-multiple-definition" \
-      -DBUILD_EXTENSIONS="$BUILD_EXTENSIONS" \
-      -DOPENIVM_CORE_ONLY=ON \
-      .
-else
-    timeout --foreground "$CMAKE_CONFIGURE_TIMEOUT" cmake -S "$DUCKDB_DIR" -B "$BUILD_DIR" \
-      -DCMAKE_BUILD_TYPE=Release \
-      -DCMAKE_TOOLCHAIN_FILE="$VCPKG_DIR/scripts/buildsystems/vcpkg.cmake" \
-      -DCMAKE_C_COMPILER_LAUNCHER= \
-      -DCMAKE_CXX_COMPILER_LAUNCHER= \
-      -DVCPKG_BUILD=1 \
-      -DVCPKG_MANIFEST_MODE=OFF \
-      -DCMAKE_EXE_LINKER_FLAGS="-Wl,--allow-multiple-definition" \
-      -DCMAKE_SHARED_LINKER_FLAGS="-Wl,--allow-multiple-definition" \
-      -DBUILD_EXTENSIONS="$BUILD_EXTENSIONS" \
-      .
-fi
+timeout --foreground "$CMAKE_CONFIGURE_TIMEOUT" cmake -S "$DUCKDB_DIR" -B "$BUILD_DIR" \
+  -DCMAKE_BUILD_TYPE=Release \
+  -DCMAKE_TOOLCHAIN_FILE="$VCPKG_DIR/scripts/buildsystems/vcpkg.cmake" \
+  -DCMAKE_C_COMPILER_LAUNCHER= \
+  -DCMAKE_CXX_COMPILER_LAUNCHER= \
+  -DVCPKG_BUILD=1 \
+  -DVCPKG_MANIFEST_MODE=OFF \
+  -DCMAKE_EXE_LINKER_FLAGS="-Wl,--allow-multiple-definition" \
+  -DCMAKE_SHARED_LINKER_FLAGS="-Wl,--allow-multiple-definition" \
+  -DBUILD_EXTENSIONS="$BUILD_EXTENSIONS" \
+  .
 log_success "CMake configuration complete"
 
 cd "$BUILD_DIR"
@@ -2942,25 +2838,6 @@ END_TIME=$(date +%s)
 BUILD_TIME=$((END_TIME - START_TIME))
 log_success "Build completed in $BUILD_TIME seconds"
 
-if [ "$WITH_OPENIVM_LOADABLE" = true ]; then
-    log_info "Step 8b: Building OpenIVM as a loadable extension..."
-    cmake --build "$BUILD_DIR" -j"$NUM_CORES" --target openivm_loadable_extension
-    log_success "OpenIVM loadable extension built"
-fi
-if [ "$WITH_DUCKDBSP" = true ]; then
-    log_info "Step 8c: Building DuckDBSP against the same DuckDB source tree..."
-    DUCKDBSP_BUILD_DIR="$DUCKDB_DIR/build/duckdbsp-loadable"
-    timeout --foreground "$CMAKE_CONFIGURE_TIMEOUT" cmake -S "$DUCKDBSP_LOCAL_DIR" -B "$DUCKDBSP_BUILD_DIR" \
-      -DCMAKE_BUILD_TYPE=Release \
-      -DCMAKE_C_COMPILER_LAUNCHER= \
-      -DCMAKE_CXX_COMPILER_LAUNCHER= \
-      -DDUCKDB_SOURCE_DIR="$DUCKDB_DIR" \
-      -DDBSP_TIP_PORT=ON \
-      -DDBSP_ENGINE_HOOK=OFF
-    cmake --build "$DUCKDBSP_BUILD_DIR" -j"$NUM_CORES" --target dbsp_loadable_extension
-    log_success "DuckDBSP loadable extension built"
-fi
-
 # Step 9: Verify
 log_info "Step 9: Verifying build..."
 if [ ! -f "./duckdb" ]; then
@@ -3000,36 +2877,6 @@ fi
 if [ "$COPY_TESTS" = true ]; then
     log_info "Step 10: Running COPY repro validation..."
     run_copy_repro_validation
-fi
-
-if [ "$WITH_OPENIVM_LOADABLE" = true ]; then
-    log_info "Step 10: Verifying OpenIVM loadable extension..."
-    OPENIVM_LOADABLE_PATH="$BUILD_DIR/extension/openivm/openivm.duckdb_extension"
-    if [ ! -f "$OPENIVM_LOADABLE_PATH" ]; then
-        log_error "OpenIVM loadable extension not found at $OPENIVM_LOADABLE_PATH"
-        exit 1
-    fi
-    ./duckdb -unsigned -c "LOAD '$OPENIVM_LOADABLE_PATH'; SELECT extension_name, loaded FROM duckdb_extensions() WHERE extension_name='openivm';" >/dev/null
-    log_success "OpenIVM loadable extension built and loadable at $OPENIVM_LOADABLE_PATH"
-
-    log_info "Step 10b: Verifying OpenIVM metadata with direct probe..."
-    if [ ! -x "$BUILD_SCRIPT_DIR/scripts/validate-openivm-meta.sh" ]; then
-        log_error "OpenIVM metadata probe not found or not executable at $BUILD_SCRIPT_DIR/scripts/validate-openivm-meta.sh"
-        exit 1
-    fi
-    "$BUILD_SCRIPT_DIR/scripts/validate-openivm-meta.sh" "$BUILD_DIR"
-    log_success "OpenIVM metadata probe passed"
-fi
-
-if [ "$WITH_DUCKDBSP" = true ]; then
-    log_info "Step 10c: Verifying DuckDBSP loadable extension..."
-    DUCKDBSP_LOADABLE_PATH="$DUCKDBSP_BUILD_DIR/dbsp.duckdb_extension"
-    if [ ! -f "$DUCKDBSP_LOADABLE_PATH" ]; then
-        log_error "DuckDBSP loadable extension not found at $DUCKDBSP_LOADABLE_PATH"
-        exit 1
-    fi
-    ./duckdb -unsigned -c "LOAD '$DUCKDBSP_LOADABLE_PATH'; SELECT extension_name, loaded FROM duckdb_extensions() WHERE extension_name='dbsp';" >/dev/null
-    log_success "DuckDBSP loadable extension built and loadable at $DUCKDBSP_LOADABLE_PATH"
 fi
 
 echo ""
