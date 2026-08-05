@@ -1,7 +1,9 @@
 # DuckDB Static Build Kit
 
 Build DuckDB with the current validated built-in extension set.
-Optionally include `spatial`, or build OpenIVM and DuckDBSP as regular loadable extensions.
+Optionally include `spatial`.
+
+OpenIVM and DuckDBSP are built separately from `mrayva/openivm` and `mrayva/duckdbsp` and are no longer part of this repo.
 
 ## Quick Start
 
@@ -14,12 +16,6 @@ Optionally include `spatial`, or build OpenIVM and DuckDBSP as regular loadable 
 
 # Include spatial (requires GDAL/PROJ/GEOS/SQLite vcpkg deps)
 ./build-duckdb-static.sh --duckdb-dir /tmp/duckdb-clean/duckdbsrc --with-spatial --clean
-
-# Build openivm as a regular loadable extension
-./build-duckdb-static.sh --duckdb-dir /tmp/duckdb-clean/duckdbsrc --with-openivm-loadable --clean
-
-# Build DuckDBSP as a regular loadable extension
-./build-duckdb-static.sh --duckdb-dir /tmp/duckdb-clean/duckdbsrc --with-duckdbsp --clean
 ```
 
 ## What This Produces
@@ -28,13 +24,10 @@ Optionally include `spatial`, or build OpenIVM and DuckDBSP as regular loadable 
 - Size: typically ~149-150MB
 - Current tip baseline: 23 runtime-loaded built-in extensions
 - Add 1 loaded extension for `--with-spatial` on current tip for 24 total runtime-loaded extensions
-- `--with-openivm-loadable` keeps the default static extension count unchanged and also builds `openivm.duckdb_extension`
-- `--with-duckdbsp` keeps the default static extension count unchanged and also builds `dbsp.duckdb_extension` from the pinned fork commit
 - Current tip static build: build-clean with the repo script and compat patches
 
 Current known-good verification matrix:
 - `--skip-vcpkg --with-spatial`
-- `--skip-vcpkg --with-openivm-loadable`
 
 Current known test boundary on DuckDB tip:
 - `./test/unittest --abort` still stops on the upstream remote-optimizer serialized-plan regression (`PLAN_STATEMENT` in `test_remote_optimizer.cpp`)
@@ -68,22 +61,9 @@ If you use `--skip-vcpkg`, the spatial dependencies must already exist in `~/vcp
 
 See [build-instructions.md](/home/mrayva/duckdbbld/build-instructions.md) for a dedicated spatial section.
 
-## OpenIVM Status
+## OpenIVM and DuckDBSP
 
-`--with-openivm-loadable` is the supported OpenIVM integration path in this repo. It prepares the patched OpenIVM source tree, builds `openivm.duckdb_extension` as a regular loadable extension, and keeps OpenIVM out of DuckDB's static startup set.
-
-For metadata regression checks, use the direct C++ probe in [`scripts/validate-openivm-meta.sh`](scripts/validate-openivm-meta.sh). It exercises `semi_anti_aux_meta_json` directly through DuckDB SQL and does not rely on sqllogic parsing.
-
-The supported baseline is:
-- OpenIVM loadable on normal DuckDB tables
-- core OpenIVM functionality validated on the current tip baseline (`29 passed, 0 failed`)
-- DuckLake-backed OpenIVM treated as experimental
-
-The loadable profile builds into `<duckdb-dir>/build/release-static-openivm-loadable/` and the produced `openivm.duckdb_extension` is loaded with `-unsigned`, because the local artifact is not signed.
-
-The DuckDBSP profile builds into `<duckdb-dir>/build/release-static-duckdbsp-loadable/` and produces `dbsp.duckdb_extension`. It uses the current tip compatibility path with the engine hook disabled; DuckDB storage and circuit checkpoints remain authoritative, while the fork's typed WAL journal is available for persistent recovery diagnostics.
-
-DuckLake-backed refresh remains outside the supported baseline.
+OpenIVM and DuckDBSP are no longer built from this repo. They are built separately from their own repos, `mrayva/openivm` and `mrayva/duckdbsp`.
 
 ## Files
 

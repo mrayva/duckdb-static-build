@@ -41,16 +41,6 @@ CCACHE_DISABLE=1 ./build-duckdb-static.sh \
   --clean
 ```
 
-To build OpenIVM as a regular loadable extension instead of statically linking it:
-
-```bash
-CCACHE_DISABLE=1 ./build-duckdb-static.sh \
-  --duckdb-dir /tmp/duckdb-clean/duckdbsrc \
-  --vcpkg-dir "$HOME/vcpkg" \
-  --with-openivm-loadable \
-  --clean
-```
-
 ## 3. Permissions Needed In Restricted/Sandboxed Environments
 
 You may need to allow:
@@ -58,7 +48,6 @@ You may need to allow:
 1. Network access for:
 - `git clone` of DuckDB
 - FetchContent extension repos during CMake configure
-- OpenIVM source checkout when `--with-openivm-loadable` is used
 
 2. Temporary directory cleanup when `/tmp` is full:
 - `rm -rf /tmp/<old-build-dir>`
@@ -77,26 +66,20 @@ The script performs these exact phases:
 6. Patches selected extension config files:
 - removes `DONT_LINK` where needed (`fts`, `vss`, `postgres_scanner`)
 - injects required `INCLUDE_DIR` entries
-7. If `--with-openivm-loadable` is used, prepares OpenIVM source, marks it `DONT_LINK`, and builds it as a regular loadable extension instead of adding it to the static startup set.
-8. If `--with-duckdbsp` is used, checks out the pinned `mrayva/duckDBSP` tip-port commit, marks it `DONT_LINK`, and builds `dbsp.duckdb_extension` against the same DuckDB source tree.
-9. Optional dependency install (unless `--skip-vcpkg`):
+7. Optional dependency install (unless `--skip-vcpkg`):
 - AWS SDK components
 - Azure SDK components
 - roaring
 - libmariadb for `mysql_scanner`
 - Spatial dependencies when `--with-spatial` is used: GDAL, PROJ, GEOS, SQLite with RTREE, curl, OpenSSL, zlib, expat
-10. Configures out-of-source build at `<duckdb-dir>/build/release-static` with:
+8. Configures out-of-source build at `<duckdb-dir>/build/release-static` with:
 - vcpkg toolchain
 - `-DVCPKG_MANIFEST_MODE=OFF`
 - linker flag `--allow-multiple-definition`
-11. `--with-openivm-loadable` uses `<duckdb-dir>/build/release-static-openivm-loadable`.
-13. Merges global and extension-local `vcpkg_installed` trees.
-14. When `--with-spatial` is used, regenerates spatial's embedded `proj_db.c` from the matching vcpkg `proj.db`.
-15. Builds with `EXTENSION_STATIC_BUILD=1 make -j$(nproc)`.
-16. Verifies runtime by counting loaded extensions from `duckdb_extensions()`.
-18. If `--with-openivm-loadable` is used, verifies that `extension/openivm/openivm.duckdb_extension` exists and can be loaded by the matching DuckDB binary with `-unsigned`.
-
-For the semi/anti metadata regression check, use `scripts/validate-openivm-meta.sh <duckdb-build-dir>`. That probe queries `_duckdb_ivm_views` directly through DuckDB SQL, outside sqllogic.
+9. Merges global and extension-local `vcpkg_installed` trees.
+10. When `--with-spatial` is used, regenerates spatial's embedded `proj_db.c` from the matching vcpkg `proj.db`.
+11. Builds with `EXTENSION_STATIC_BUILD=1 make -j$(nproc)`.
+12. Verifies runtime by counting loaded extensions from `duckdb_extensions()`.
 
 ## 5. Output/Success Criteria
 
@@ -109,23 +92,17 @@ On success, you should see:
 - `24 runtime-loaded built-in extensions` when `--with-spatial` is enabled
 
 With `--with-spatial`, expect 24 loaded extensions and a larger binary.
-With `--with-openivm-loadable`, expect the default static extension count plus a separate `openivm.duckdb_extension` artifact.
 
 Current known-good verification matrix:
 - `--clean`
 - `--skip-vcpkg`
 - `--with-spatial`
-- `--with-openivm-loadable`
 - current tip static release build completes successfully with the repo compat patches
 
 Current known test boundary on DuckDB tip:
 - `./test/unittest --abort` currently fails at `test/extension/test_remote_optimizer.cpp`
 - failure signature: remote optimizer serialized-plan path throws `Not implemented Error: PLAN_STATEMENT`
 - treat the tip baseline as build-clean, not full-`unittest`-clean
-
-Current preferred non-static OpenIVM profile:
-- `--with-openivm-loadable`
-- This profile builds OpenIVM as a regular loadable extension and keeps it out of the static startup set.
 
 ## 6. Fast Rebuilds
 
@@ -179,36 +156,9 @@ If you pass `--skip-vcpkg`, these vcpkg packages must already be installed:
 gdal[geos] proj geos expat sqlite3[rtree] curl openssl zlib libmariadb
 ```
 
-## 9. OpenIVM Extension
+## 9. OpenIVM and DuckDBSP
 
-- `--with-openivm-loadable`
-This is the supported non-static integration path. It builds the regular `openivm.duckdb_extension` artifact using the patched OpenIVM source tree, while leaving DuckDB's static extension set unchanged.
-
-The integration still relies on a maintained local patch because OpenIVM and its bundled `lpts` subtree need API-drift fixes for current DuckDB.
-
-Supported OpenIVM baseline:
-- normal DuckDB tables: validated
-- current tip non-DuckLake core suite: `29 passed, 0 failed`
-- DuckLake-backed refresh: experimental
-- current tip build: build-clean and core-functional on the non-DuckLake path
-
-Loadable-profile recipe:
-
-```bash
-cd /home/mrayva/duckdbbld
-CCACHE_DISABLE=1 ./build-duckdb-static.sh \
-  --duckdb-dir /tmp/duckdb-clean/duckdbsrc \
-  --vcpkg-dir "$HOME/vcpkg" \
-  --with-openivm-loadable \
-  --clean
-```
-
-Expected artifact:
-- `<duckdb-dir>/build/release-static-openivm-loadable/extension/openivm/openivm.duckdb_extension`
-
-Current status note:
-- The non-DuckLake OpenIVM path is the supported tip baseline.
-- DuckLake-backed refresh remains an experimental path and is not part of the supported baseline.
+OpenIVM and DuckDBSP are no longer built from this repo. They are built separately from their own repos, `mrayva/openivm` and `mrayva/duckdbsp`.
 
 ## 10. Troubleshooting
 
