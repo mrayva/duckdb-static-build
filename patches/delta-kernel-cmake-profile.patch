@@ -37,7 +37,7 @@ index 6b2a950..d5302f1 100644
 -  CONFIGURE_COMMAND ${CMAKE_COMMAND} -E env ${RUST_UNSET_ENV_VARS}
 -                    ${RUST_ENV_VARS} env
 +  CONFIGURE_COMMAND ${CMAKE_COMMAND} -E touch
-+                    "${CMAKE_CURRENT_SOURCE_DIR}/rust/src/delta_kernel/ffi/build.rs"
++                    "${CMAKE_BINARY_DIR}/rust/src/delta_kernel/ffi/build.rs"
    UPDATE_COMMAND ""
    BUILD_IN_SOURCE 1
 -  # Build debug build

@@ -438,9 +438,7 @@ log_success "Extension configuration created"
 log_info "Step 4: Patching extension configs..."
 if [ -f .github/config/extensions/fts.cmake ]; then
     sed -i '/DONT_LINK/d' .github/config/extensions/fts.cmake
-    if ! grep -Fq "INCLUDE_DIR extension/fts/include" .github/config/extensions/fts.cmake; then
-        sed -i '/GIT_TAG/a\        INCLUDE_DIR extension/fts/include' .github/config/extensions/fts.cmake
-    fi
+    sed -i '/INCLUDE_DIR extension\/fts\/include/d' .github/config/extensions/fts.cmake
     log_success "FTS config patched"
 fi
 if [ -f .github/config/extensions/vss.cmake ]; then
@@ -674,27 +672,17 @@ cat > .github/patches/extensions/avro/logical_type_compat.patch << 'PATCH_EOF'
 diff --git a/CMakeLists.txt b/CMakeLists.txt
 --- a/CMakeLists.txt
 +++ b/CMakeLists.txt
-@@ -31,6 +31,19 @@ else()
-   find_library(ZLIB_LIBRARY libz.a REQUIRED)
+@@ -32,7 +32,10 @@
+ # Get avro-c include directory
+ set(AVRO_INCLUDE_DIR "${CMAKE_CURRENT_SOURCE_DIR}/third_party/avro-c/lang/c/src")
+
++# Vendored avro-c submodule always provides avro_schema_logical_type/scale/precision/adjust_to_utc
++add_compile_definitions(HAVE_AVRO_SCHEMA_LOGICAL_TYPE=1)
++
+ # Disable all UBSan checks for avro-static to work around multiple UB issues in avro-c
+ if(TARGET avro-static AND NOT MSVC)
+   target_compile_options(avro-static PRIVATE -fno-sanitize=undefined)
  endif()
- 
-+include(CheckSymbolExists)
-+
-+set(CMAKE_REQUIRED_INCLUDES ${AVRO_INCLUDE_DIR})
-+find_library(SNAPPY_LIBRARY snappy REQUIRED)
-+set(CMAKE_REQUIRED_LIBRARIES
-+    ${AVRO_LIBRARY} ${JANSSON_LIBRARY} ${LZMA_LIBRARY} ${ZLIB_LIBRARY} ${SNAPPY_LIBRARY})
-+check_symbol_exists(avro_schema_logical_type "avro/schema.h" HAVE_AVRO_SCHEMA_LOGICAL_TYPE)
-+unset(CMAKE_REQUIRED_INCLUDES)
-+unset(CMAKE_REQUIRED_LIBRARIES)
-+
-+if(HAVE_AVRO_SCHEMA_LOGICAL_TYPE)
-+  add_compile_definitions(HAVE_AVRO_SCHEMA_LOGICAL_TYPE=1)
-+endif()
-+
--find_library(SNAPPY_LIBRARY snappy REQUIRED)
- set(ALL_AVRO_LIBRARIES
-     ${AVRO_LIBRARY}
 diff --git a/src/avro_reader.cpp b/src/avro_reader.cpp
 --- a/src/avro_reader.cpp
 +++ b/src/avro_reader.cpp
@@ -817,27 +805,7 @@ index 081124a..f0a2df6 100644
 +target_link_libraries(${TARGET_NAME}_extension ${MYSQL_LIBRARIES})
 PATCH_EOF
 
-cat > .github/patches/extensions/delta/rustls.patch << 'PATCH_EOF'
-diff --git a/CMakeLists.txt b/CMakeLists.txt
-index ff33ba9..f2e3361 100644
---- a/CMakeLists.txt
-+++ b/CMakeLists.txt
-@@ -162,13 +162,9 @@ ExternalProject_Add(
-   # Build debug build
-   BUILD_COMMAND
-     ${CMAKE_COMMAND} -E env ${RUST_UNSET_ENV_VARS} ${RUST_ENV_VARS} cargo build
--    --package delta_kernel_ffi --workspace --profile=${CARGO_PROFILE} --all-features
-+    --package delta_kernel_ffi --profile=${CARGO_PROFILE} --no-default-features --features "default-engine-rustls,tracing,test-ffi"
-     ${RUST_PLATFORM_PARAM}
--  # Build DATs
--  COMMAND
--    ${CMAKE_COMMAND} -E env ${RUST_UNSET_ENV_VARS} ${RUST_ENV_VARS} cargo build
--    --manifest-path=${CMAKE_BINARY_DIR}/rust/src/delta_kernel/acceptance/Cargo.toml
-   # Define the byproducts, required for building with Ninja
-   BUILD_BYPRODUCTS "${DELTA_KERNEL_LIBPATH}"
-   BUILD_BYPRODUCTS "${DELTA_KERNEL_FFI_HEADER_C}"
-   BUILD_BYPRODUCTS "${DELTA_KERNEL_FFI_HEADER_CXX}"
-PATCH_EOF
+rm -f .github/patches/extensions/delta/rustls.patch
 cp "$BUILD_SCRIPT_DIR/patches/delta-kernel-cmake-profile.patch" \
    .github/patches/extensions/delta/cmake-profile.patch
 
