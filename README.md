@@ -29,9 +29,6 @@ OpenIVM and DuckDBSP are built separately from `mrayva/openivm` and `mrayva/duck
 Current known-good verification matrix:
 - `--skip-vcpkg --with-spatial`
 
-Current known test boundary on DuckDB tip:
-- `./test/unittest --abort` still stops on the upstream remote-optimizer serialized-plan regression (`PLAN_STATEMENT` in `test_remote_optimizer.cpp`)
-
 ## Extensions Included
 
 | Category | Extensions |

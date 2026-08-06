@@ -99,11 +99,6 @@ Current known-good verification matrix:
 - `--with-spatial`
 - current tip static release build completes successfully with the repo compat patches
 
-Current known test boundary on DuckDB tip:
-- `./test/unittest --abort` currently fails at `test/extension/test_remote_optimizer.cpp`
-- failure signature: remote optimizer serialized-plan path throws `Not implemented Error: PLAN_STATEMENT`
-- treat the tip baseline as build-clean, not full-`unittest`-clean
-
 ## 6. Fast Rebuilds
 
 If dependencies are already present:
