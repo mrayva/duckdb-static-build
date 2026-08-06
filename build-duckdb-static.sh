@@ -476,10 +476,17 @@ log_info "Step 4b: Creating extension patch files..."
 mkdir -p .github/patches/extensions/postgres_scanner
 cat > .github/patches/extensions/postgres_scanner/static_build.patch << 'PATCH_EOF'
 diff --git a/CMakeLists.txt b/CMakeLists.txt
-index d0e5371..e7478aa 100644
+index b30ca04..e465362 100644
 --- a/CMakeLists.txt
 +++ b/CMakeLists.txt
-@@ -49,6 +49,14 @@ target_link_libraries(${LOADABLE_EXTENSION_NAME}
+@@ -49,20 +49,28 @@ if(NOT WIN32 AND NOT APPLE)
+         "-Wl,-Bsymbolic"
+     )
+ endif()
+
+ target_link_libraries(${LOADABLE_EXTENSION_NAME}
+     OpenSSL::SSL
+     OpenSSL::Crypto
      PostgreSQL::PostgreSQL
      ${CURL_LIBRARIES})
  set_property(TARGET ${EXTENSION_NAME} PROPERTY C_STANDARD 99)
@@ -492,8 +499,15 @@ index d0e5371..e7478aa 100644
 +    OpenSSL::Crypto
 +    PostgreSQL::PostgreSQL)
  set_property(TARGET ${LOADABLE_EXTENSION_NAME} PROPERTY C_STANDARD 99)
- 
+
  if(WIN32)
+   target_link_libraries(${LOADABLE_EXTENSION_NAME}
+       wsock32
+       ws2_32
+       wldap32
+       secur32
+       crypt32)
+ endif()
 PATCH_EOF
 
 cat > .github/patches/extensions/postgres_scanner/oauth_hook_compat.patch << 'PATCH_EOF'
@@ -501,19 +515,27 @@ diff --git a/CMakeLists.txt b/CMakeLists.txt
 index b30ca04..5edb9b2 100644
 --- a/CMakeLists.txt
 +++ b/CMakeLists.txt
-@@ -10,6 +10,7 @@ add_definitions(
+@@ -3,29 +3,38 @@ set(TARGET_NAME postgres_scanner)
+ project(${TARGET_NAME})
+
+ add_definitions(
+     -DFRONTEND=1
+     -D_GNU_SOURCE=1
+     -DUSE_OPENSSL=1
+     -DHAVE_BIO_GET_DATA=1
      -DHAVE_BIO_METH_NEW=1)
- 
+
  find_package(OpenSSL REQUIRED)
 +include(CheckSymbolExists)
  find_package(PostgreSQL REQUIRED)
- 
+
  if(NOT MSVC)
-@@ -19,6 +20,14 @@ if(NOT MSVC)
+     add_compile_options(
+         -Wno-pedantic
          -Wno-sign-compare
          -Wno-unused-variable)
  endif()
- 
+
 +set(CMAKE_REQUIRED_INCLUDES ${PostgreSQL_INCLUDE_DIRS})
 +check_symbol_exists(PQsetAuthDataHook "libpq-fe.h" HAVE_PQ_AUTH_DATA_HOOK)
 +unset(CMAKE_REQUIRED_INCLUDES)
@@ -525,22 +547,50 @@ index b30ca04..5edb9b2 100644
  include_directories(
      include
      database-connector/src/include
+     ${OPENSSL_INCLUDE_DIR}
+     ${PostgreSQL_INCLUDE_DIRS})
+
+ if(WIN32)
+   include_directories(
+       vcpkg_ports/libpq/include/port/win32
+       vcpkg_ports/libpq/include/port/win32_msvc)
 diff --git a/src/postgres_oauth.cpp b/src/postgres_oauth.cpp
-index 619532a..2317879 100644
+index a9cc073..5e50add 100644
 --- a/src/postgres_oauth.cpp
 +++ b/src/postgres_oauth.cpp
-@@ -9,6 +9,8 @@ extern "C" {
+@@ -3,20 +3,22 @@
+
+ #include <cstdlib>
+ #include <cstring>
+ #include <mutex>
+ #include <string>
+
+ extern "C" {
  #include "libpq-fe.h"
  }
- 
+
 +#ifdef HAVE_PQ_AUTH_DATA_HOOK
 +
  namespace duckdb {
- 
+
  //! Previous hook in the chain (if any)
-@@ -107,3 +109,17 @@ OAuthTokenHolder SetThreadLocalOAuthTokenFromSessionOption(ClientContext &ctx) {
+ static PQauthDataHook_type prev_hook = nullptr;
+
+ struct OAuthTokenState {
+ 	char *token_copy;
+ };
+
+ //! Managed by SetThreadLocalOAuthTokenFromSessionOption
+@@ -101,10 +103,24 @@ void PostgresInitOAuthHook() {
+ OAuthTokenHolder SetThreadLocalOAuthTokenFromSessionOption(ClientContext &ctx) {
+ 	Value val;
+ 	if (ctx.TryGetCurrentSetting("pg_oauth_token", val) && !val.IsNull()) {
+ 		std::string token = StringValue::Get(val);
+ 		oauth_token = std::string(token.data(), token.length());
+ 	}
+ 	return OAuthTokenHolder();
  }
- 
+
  } // namespace duckdb
 +
 +#else
@@ -720,20 +770,27 @@ fi
 
 cat > .github/patches/extensions/mysql_scanner/static_build.patch << 'PATCH_EOF'
 diff --git a/CMakeLists.txt b/CMakeLists.txt
-index 081124a..f0a2df6 100644
+index 02a6321..cd06b8a 100644
 --- a/CMakeLists.txt
 +++ b/CMakeLists.txt
-@@ -12,6 +12,9 @@ include_directories(${MYSQL_INCLUDE_DIR})
- 
+@@ -6,17 +6,25 @@ set(libmariadb_DIR ${CMAKE_CURRENT_LIST_DIR}/vcpkg_ports/libmariadb)
+ find_package(libmariadb REQUIRED)
+ set(EXTENSION_NAME ${TARGET_NAME}_extension)
+
+ set(MYSQL_INCLUDE_DIR
+     ${CMAKE_BINARY_DIR}/vcpkg_installed/${VCPKG_TARGET_TRIPLET}/include/mysql)
+ include_directories(${MYSQL_INCLUDE_DIR})
+ include_directories(database-connector/src/include)
+
  add_subdirectory(src)
- 
+
 +# Static extension build (added by build script)
 +build_static_extension(${TARGET_NAME} "" ${ALL_OBJECT_FILES})
 +
  set(PARAMETERS "-no-warnings")
  build_loadable_extension(${TARGET_NAME} ${PARAMETERS} ${ALL_OBJECT_FILES})
- 
-@@ -19,3 +22,8 @@ build_loadable_extension(${TARGET_NAME} ${PARAMETERS} ${ALL_OBJECT_FILES})
+
+ # Loadable binary
  target_include_directories(${TARGET_NAME}_loadable_extension
                             PRIVATE include ${MYSQL_INCLUDE_DIR})
  target_link_libraries(${TARGET_NAME}_loadable_extension ${MYSQL_LIBRARIES})

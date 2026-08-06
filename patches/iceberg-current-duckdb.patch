@@ -1,6 +1,15 @@
+diff --git a/src/execution/operator/iceberg_update.cpp b/src/execution/operator/iceberg_update.cpp
+index 37e896c5..f080cd7b 100644
 --- a/src/execution/operator/iceberg_update.cpp
 +++ b/src/execution/operator/iceberg_update.cpp
-@@ -273,23 +273,24 @@
+@@ -269,33 +269,34 @@ void IcebergTableEntry::BindUpdateConstraints(Binder &binder, LogicalGet &get, L
+ 			if (col == physical_index) {
+ 				found = true;
+ 				break;
+ 			}
+ 		}
+ 		if (found) {
+ 			// already updated
  			continue;
  		}
  		// check if the column is already projected
@@ -31,3 +40,6 @@
  		get.AddColumnId(physical_index.index);
  		update.columns.push_back(physical_index);
  	}
+ }
+ 
+ } // namespace duckdb
