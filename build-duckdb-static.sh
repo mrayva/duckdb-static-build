@@ -390,6 +390,10 @@ duckdb_extension_load(iceberg)
 duckdb_extension_load(ducklake)
 duckdb_extension_load(delta APPLY_PATCHES)
 duckdb_extension_load(unity_catalog)
+duckdb_extension_load(quack LOAD_TESTS
+    GIT_URL https://github.com/duckdb/duckdb-quack
+    GIT_TAG 7e80f7ffcc98d0b3e81d0e1df8cc1c2da240a64b
+)
 EOF
 if [ "$WITH_SPATIAL" = true ]; then
     echo "duckdb_extension_load(spatial APPLY_PATCHES)" >> extension/extension_config_local.cmake
@@ -401,11 +405,27 @@ log_info "Step 4: Patching extension configs..."
 if [ -f .github/config/extensions/fts.cmake ]; then
     sed -i '/DONT_LINK/d' .github/config/extensions/fts.cmake
     sed -i '/INCLUDE_DIR extension\/fts\/include/d' .github/config/extensions/fts.cmake
+    ensure_include_after_git_tag .github/config/extensions/fts.cmake "INCLUDE_DIR extension/fts/include"
     log_success "FTS config patched"
 fi
 if [ -f .github/config/extensions/vss.cmake ]; then
     sed -i '/DONT_LINK/d' .github/config/extensions/vss.cmake
     log_success "VSS config patched"
+fi
+if [ -f .github/config/extensions/odbc_scanner.cmake ] && \
+    ! grep -A3 'duckdb_extension_load(odbc_scanner' .github/config/extensions/odbc_scanner.cmake | grep -q DONT_LINK; then
+    sed -i '/duckdb_extension_load(odbc_scanner/a\            DONT_LINK' \
+        .github/config/extensions/odbc_scanner.cmake
+    log_success "odbc_scanner retained as a loadable C-API extension"
+fi
+if [ -f .github/config/extensions/odbc_scanner.cmake ] && \
+    ! grep -A3 'duckdb_extension_load(odbc_scanner' .github/config/extensions/odbc_scanner.cmake | grep -q '^[[:space:]]*LOAD_TESTS'; then
+    sed -i '/duckdb_extension_load(odbc_scanner/a\            LOAD_TESTS' \
+        .github/config/extensions/odbc_scanner.cmake
+fi
+if [ -f .github/config/extensions/quack.cmake ] && \
+    ! grep -A3 'duckdb_extension_load(quack' .github/config/extensions/quack.cmake | grep -q '^[[:space:]]*LOAD_TESTS'; then
+    sed -i '/duckdb_extension_load(quack/a\    LOAD_TESTS' .github/config/extensions/quack.cmake
 fi
 if [ -f .github/config/extensions/postgres_scanner.cmake ]; then
     sed -i '/DONT_LINK/d' .github/config/extensions/postgres_scanner.cmake
@@ -425,8 +445,7 @@ fi
 if [ -f .github/config/extensions/iceberg.cmake ]; then
     ICEBERG_PATCH_DIR="$DUCKDB_DIR/.github/patches/extensions/iceberg"
     mkdir -p "$ICEBERG_PATCH_DIR"
-    cp "$BUILD_SCRIPT_DIR/patches/iceberg-current-duckdb.patch" "$ICEBERG_PATCH_DIR/fix.patch"
-    log_success "Synchronized Iceberg compatibility patch"
+    ICEBERG_COMPAT_PATCH_REQUIRED=true
     ICEBERG_REFRESH_REF=""
     CURRENT_ICEBERG_SOURCE_DIR=$(awk '/SOURCE_DIR/ {print $2; exit}' .github/config/extensions/iceberg.cmake)
     ICEBERG_GIT_TAG=$(awk '/GIT_TAG/ {print $2; exit}' .github/config/extensions/iceberg.cmake)
@@ -435,8 +454,25 @@ if [ -f .github/config/extensions/iceberg.cmake ]; then
     elif [ -f "$ICEBERG_FALLBACK_DIR/.duckdb_static_build_ref" ]; then
         ICEBERG_REFRESH_REF=$(cat "$ICEBERG_FALLBACK_DIR/.duckdb_static_build_ref")
     fi
+    ICEBERG_DETECT_SOURCE_DIR="$CURRENT_ICEBERG_SOURCE_DIR"
+    if [ -z "$ICEBERG_DETECT_SOURCE_DIR" ]; then
+        ICEBERG_DETECT_SOURCE_DIR="$ICEBERG_FALLBACK_DIR"
+    fi
+    if [ -f "$ICEBERG_DETECT_SOURCE_DIR/src/execution/operator/iceberg_update.cpp" ] && \
+        grep -Fq 'optional_idx column_id_index' "$ICEBERG_DETECT_SOURCE_DIR/src/execution/operator/iceberg_update.cpp"; then
+        ICEBERG_COMPAT_PATCH_REQUIRED=false
+    fi
+    if [ "$ICEBERG_COMPAT_PATCH_REQUIRED" = true ]; then
+        cp "$BUILD_SCRIPT_DIR/patches/iceberg-current-duckdb.patch" "$ICEBERG_PATCH_DIR/fix.patch"
+        log_success "Synchronized Iceberg compatibility patch"
+    else
+        rm -f "$ICEBERG_PATCH_DIR/fix.patch"
+        log_info "Skipping Iceberg compatibility patch; upstream source uses the matching legacy planner API"
+    fi
     if [ -n "$ICEBERG_SOURCE_DIR" ]; then
-        apply_patch_series_to_source_dir "$ICEBERG_SOURCE_DIR" "$ICEBERG_PATCH_DIR" "duckdb-iceberg"
+        if [ "$ICEBERG_COMPAT_PATCH_REQUIRED" = true ]; then
+            apply_patch_series_to_source_dir "$ICEBERG_SOURCE_DIR" "$ICEBERG_PATCH_DIR" "duckdb-iceberg"
+        fi
         use_iceberg_source_dir "$ICEBERG_SOURCE_DIR" "duckdb-iceberg"
     elif [ -n "$CURRENT_ICEBERG_SOURCE_DIR" ]; then
         if [ "$CURRENT_ICEBERG_SOURCE_DIR" = "$ICEBERG_FALLBACK_DIR" ] && ! patch_series_matches_source_dir "$CURRENT_ICEBERG_SOURCE_DIR" "$ICEBERG_PATCH_DIR"; then
@@ -446,8 +482,16 @@ if [ -f .github/config/extensions/iceberg.cmake ]; then
                 exit 1
             fi
             ensure_local_archive_source "duckdb/duckdb-iceberg" "$ICEBERG_REFRESH_REF" "$CURRENT_ICEBERG_SOURCE_DIR" "duckdb-iceberg" true
+            if grep -Fq 'optional_idx column_id_index' \
+                "$CURRENT_ICEBERG_SOURCE_DIR/src/execution/operator/iceberg_update.cpp"; then
+                ICEBERG_COMPAT_PATCH_REQUIRED=false
+                rm -f "$ICEBERG_PATCH_DIR/fix.patch"
+                log_info "Skipping Iceberg compatibility patch; refreshed source uses the matching legacy planner API"
+            fi
         fi
-        apply_patch_series_to_source_dir "$CURRENT_ICEBERG_SOURCE_DIR" "$ICEBERG_PATCH_DIR" "duckdb-iceberg"
+        if [ "$ICEBERG_COMPAT_PATCH_REQUIRED" = true ]; then
+            apply_patch_series_to_source_dir "$CURRENT_ICEBERG_SOURCE_DIR" "$ICEBERG_PATCH_DIR" "duckdb-iceberg"
+        fi
         use_iceberg_source_dir "$CURRENT_ICEBERG_SOURCE_DIR" "duckdb-iceberg"
     else
         if [ -z "$ICEBERG_REFRESH_REF" ]; then
@@ -455,16 +499,25 @@ if [ -f .github/config/extensions/iceberg.cmake ]; then
             exit 1
         fi
         ensure_local_archive_source "duckdb/duckdb-iceberg" "$ICEBERG_REFRESH_REF" "$ICEBERG_FALLBACK_DIR" "duckdb-iceberg"
+        if grep -Fq 'optional_idx column_id_index' \
+            "$ICEBERG_FALLBACK_DIR/src/execution/operator/iceberg_update.cpp"; then
+            ICEBERG_COMPAT_PATCH_REQUIRED=false
+            rm -f "$ICEBERG_PATCH_DIR/fix.patch"
+            log_info "Skipping Iceberg compatibility patch; pinned source uses the matching legacy planner API"
+        fi
         if ! patch_series_matches_source_dir "$ICEBERG_FALLBACK_DIR" "$ICEBERG_PATCH_DIR"; then
             log_warning "duckdb-iceberg fallback source is stale or partially patched; refreshing from archive"
             ensure_local_archive_source "duckdb/duckdb-iceberg" "$ICEBERG_REFRESH_REF" "$ICEBERG_FALLBACK_DIR" "duckdb-iceberg" true
         fi
-        apply_patch_series_to_source_dir "$ICEBERG_FALLBACK_DIR" "$ICEBERG_PATCH_DIR" "duckdb-iceberg"
+        if [ "$ICEBERG_COMPAT_PATCH_REQUIRED" = true ]; then
+            apply_patch_series_to_source_dir "$ICEBERG_FALLBACK_DIR" "$ICEBERG_PATCH_DIR" "duckdb-iceberg"
+        fi
         use_iceberg_source_dir "$ICEBERG_FALLBACK_DIR" "duckdb-iceberg"
     fi
 fi
 if [ "$WITH_SPATIAL" = true ] && [ -f .github/config/extensions/spatial.cmake ]; then
     sed -i '/DONT_LINK/d' .github/config/extensions/spatial.cmake
+    ensure_include_after_git_tag .github/config/extensions/spatial.cmake "APPLY_PATCHES"
     mkdir -p .github/patches/extensions/spatial
     cp "$BUILD_SCRIPT_DIR/patches/spatial-current-duckdb.patch" \
        .github/patches/extensions/spatial/gdal-tip-compat.patch
@@ -850,8 +903,8 @@ cd "$DUCKDB_DIR"
 # Create minimal vcpkg.json to avoid manifest mode issues
 echo '{"name":"duckdb","version":"1.0.0"}' > vcpkg.json
 
-BUILD_EXTENSIONS="autocomplete;icu;tpcds;tpch;fts;json;parquet;sqlite_scanner;postgres_scanner;mysql_scanner;httpfs;excel;vss;inet;avro;aws;azure;iceberg;ducklake;delta;unity_catalog"
-EXPECTED_EXTENSIONS=23
+BUILD_EXTENSIONS="autocomplete;icu;tpcds;tpch;fts;json;parquet;sqlite_scanner;postgres_scanner;mysql_scanner;httpfs;excel;vss;inet;avro;aws;azure;iceberg;ducklake;delta;unity_catalog;odbc_scanner;quack"
+EXPECTED_EXTENSIONS=24
 if [ "$WITH_SPATIAL" = true ]; then
     BUILD_EXTENSIONS="${BUILD_EXTENSIONS};spatial"
     EXPECTED_EXTENSIONS=$((EXPECTED_EXTENSIONS + 1))
@@ -868,6 +921,7 @@ timeout --foreground "$CMAKE_CONFIGURE_TIMEOUT" cmake -S "$DUCKDB_DIR" -B "$BUIL
   -DCMAKE_EXE_LINKER_FLAGS="-Wl,--allow-multiple-definition" \
   -DCMAKE_SHARED_LINKER_FLAGS="-Wl,--allow-multiple-definition" \
   -DBUILD_EXTENSIONS="$BUILD_EXTENSIONS" \
+  -DENABLE_C_API_TESTS="${ENABLE_C_API_TESTS:-OFF}" \
   .
 log_success "CMake configuration complete"
 
@@ -968,6 +1022,7 @@ else
     echo ""
     echo "Loaded extensions:"
     ./duckdb -c "SELECT extension_name, loaded FROM duckdb_extensions() WHERE installed=true ORDER BY extension_name;"
+    exit 1
 fi
 
 echo ""

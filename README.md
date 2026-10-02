@@ -21,9 +21,10 @@ OpenIVM and DuckDBSP are built separately from `mrayva/openivm` and `mrayva/duck
 ## What This Produces
 
 - Binary: `<duckdb-dir>/build/release-static/duckdb`
-- Size: typically ~149-150MB
-- Current tip baseline: 23 runtime-loaded built-in extensions
-- Add 1 loaded extension for `--with-spatial` on current tip for 24 total runtime-loaded extensions
+- Size: typically ~170MB with statically linked Quack
+- Current tip baseline: 24 runtime-loaded extensions, including statically linked Quack
+- ODBC is built as a loadable extension because its upstream implementation uses the C extension API and cannot be registered by the C++ static loader
+- Add 1 loaded extension for `--with-spatial` on current tip for 25 total runtime-loaded extensions
 - Current tip static build: build-clean with the repo script and compat patches
 
 Current known-good verification matrix:
@@ -36,12 +37,13 @@ Current known-good verification matrix:
 | Core | autocomplete, icu, json, parquet, core_functions, jemalloc, shell |
 | Benchmarks | tpcds, tpch |
 | Search | fts, vss |
-| Database Connectors | sqlite_scanner, postgres_scanner, mysql_scanner |
+| Database Connectors | sqlite_scanner, postgres_scanner, mysql_scanner, odbc_scanner (loadable) |
 | File Formats | excel, avro |
 | Cloud Storage | httpfs, aws, azure |
 | Table Formats | iceberg, ducklake, delta |
 | Catalogs | unity_catalog |
 | Networking | inet |
+| Remote Access | quack (statically linked) |
 
 On current DuckDB tip, `jemalloc` is compiled into core allocator plumbing and is not counted by `duckdb_extensions()`.
 
