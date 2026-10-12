@@ -21,8 +21,8 @@ OpenIVM and DuckDBSP are built separately from `mrayva/openivm` and `mrayva/duck
 ## What This Produces
 
 - Binary: `<duckdb-dir>/build/release-static/duckdb`
-- Size: typically ~170MB with statically linked Quack
-- Current tip baseline: 24 runtime-loaded extensions, including statically linked Quack
+- Size: 193MB in the current non-Spatial tip build, with statically linked Quack
+- Current tip baseline: 24 runtime-loaded extensions, including statically linked HTTPFS and Quack
 - ODBC is built as a loadable extension because its upstream implementation uses the C extension API and cannot be registered by the C++ static loader
 - Add 1 loaded extension for `--with-spatial` on current tip for 25 total runtime-loaded extensions
 - Current tip static build: build-clean with the repo script and compat patches

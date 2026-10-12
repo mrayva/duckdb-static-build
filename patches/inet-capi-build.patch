@@ -1,0 +1,60 @@
+--- a/CMakeLists.txt
++++ b/CMakeLists.txt
+@@ -4,7 +4,9 @@
+ option(DUCKDB_WASM_EXTENSION "Whether compiling for Wasm target" OFF)
+ 
+ set(EXTENSION_NAME inet)
+-set(DUCKDB_EXTENSION_API_VERSION_UNSTABLE 1)
++if(NOT COMMAND build_loadable_extension_capi)
++    set(DUCKDB_EXTENSION_API_VERSION_UNSTABLE 1)
++endif()
+ 
+ ###
+ # Configuration
+@@ -58,7 +60,8 @@
+ ###
+ # Build
+ ###
+-# Create Extension library
++# Create the extension library. DuckDB's static build exposes the same stable
++# C API v1 entrypoint as the standalone extension target.
+ set(EXTENSION_SOURCES
+         src/inet_extension.cpp
+         src/inet_html.cpp
+@@ -66,20 +69,22 @@
+         src/inet_ipaddress.cpp
+ )
+ 
+-if (DUCKDB_WASM_EXTENSION)
+-    add_library(${EXTENSION_NAME} STATIC ${EXTENSION_SOURCES})
++if(COMMAND build_loadable_extension_capi AND COMMAND build_static_extension_capi)
++    set(CAPI_MAJOR 1)
++    set(CAPI_MINOR 5)
++    set(CAPI_PATCH 6)
++    build_loadable_extension_capi(${EXTENSION_NAME} ${CAPI_MAJOR} ${CAPI_MINOR} ${CAPI_PATCH} ${EXTENSION_SOURCES})
++    build_static_extension_capi(${EXTENSION_NAME} ${CAPI_MAJOR} ${CAPI_MINOR} ${CAPI_PATCH} ${EXTENSION_SOURCES})
++    set(INET_EXTENSION_TARGETS ${EXTENSION_NAME}_loadable_extension ${EXTENSION_NAME}_extension)
+ else()
+-    add_library(${EXTENSION_NAME} SHARED ${EXTENSION_SOURCES})
++    if (DUCKDB_WASM_EXTENSION)
++        add_library(${EXTENSION_NAME} STATIC ${EXTENSION_SOURCES})
++    else()
++        add_library(${EXTENSION_NAME} SHARED ${EXTENSION_SOURCES})
++    endif()
++    set(INET_EXTENSION_TARGETS ${EXTENSION_NAME})
+ endif()
+-# for building with DuckDB - FIXME - this needs to be reconciled somehow
+-# build_loadable_extension_capi_unstable(${EXTENSION_NAME} ${EXTENSION_SOURCES})
+-
+-
+-# Include own headers
+-target_include_directories(${EXTENSION_NAME} PRIVATE src)
+-
+-# Include DuckDB C API headers
+-target_include_directories(${EXTENSION_NAME} PRIVATE duckdb_capi)
+ 
+-# Include DuckDB C++ API headers
+-target_include_directories(${EXTENSION_NAME} PRIVATE duckdb-cpp-api)
++foreach(INET_TARGET IN LISTS INET_EXTENSION_TARGETS)
++    target_include_directories(${INET_TARGET} PRIVATE src duckdb_capi duckdb-cpp-api)
++endforeach()

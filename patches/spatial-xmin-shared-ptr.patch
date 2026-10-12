@@ -1,0 +1,11 @@
+--- a/src/spatial/index/rtree/rtree_index_create_logical.cpp
++++ b/src/spatial/index/rtree/rtree_index_create_logical.cpp
+@@ -119,7 +119,7 @@
+ 	auto &xmin_func_entry =
+ 	    catalog.GetEntry(context, CatalogType::SCALAR_FUNCTION_ENTRY, Identifier::DefaultSchema(), "st_xmin")
+ 	        .Cast<ScalarFunctionCatalogEntry>();
+-	const auto &xmin_func = xmin_func_entry.functions.GetFunctionByArguments(context, {GeoTypes::POINT_2D()});
++	const auto &xmin_func = *xmin_func_entry.functions.GetFunctionByArguments(context, {GeoTypes::POINT_2D()});
+ 	vector<unique_ptr<Expression>> xmin_func_args;
+ 
+ 	// Reference the centroid

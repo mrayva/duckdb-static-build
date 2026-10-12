@@ -1,0 +1,214 @@
+diff --git a/src/delta_macros.cpp b/src/delta_macros.cpp
+index 9371042..4ca3b36 100644
+--- a/src/delta_macros.cpp
++++ b/src/delta_macros.cpp
+@@ -52,7 +52,7 @@ static constexpr auto FILE_COPY_MACRO = R"(
+ 
+ void DeltaMacros::RegisterTableMacro(ExtensionLoader &loader, const string &name, const string &query,
+                                      const vector<string> &params, const child_list_t<Value> &named_params) {
+-	auto parser = Parser::GetBuiltinParser();
++	Parser parser;
+ 	parser.ParseQuery(query);
+ 	const auto &stmt = parser.statements.back();
+ 	auto &node = stmt->Cast<SelectStatement>().node;
+diff --git a/src/functions/delta_domain_metadata.cpp b/src/functions/delta_domain_metadata.cpp
+index 95eba19..9becbfe 100644
+--- a/src/functions/delta_domain_metadata.cpp
++++ b/src/functions/delta_domain_metadata.cpp
+@@ -64,8 +64,7 @@ static unique_ptr<FunctionData> DeltaDomainMetadataBind(ClientContext &context,
+ 
+ DeltaDomainMetadataFunction::DeltaDomainMetadataFunction()
+     : DeltaBaseMetadataFunction("delta_domain_metadata", DeltaDomainMetadataBind) {
+-	GetSignature().WithTypedKwargs("options",
+-	                               [&](TypedKwargs &options) { options.Add("version", LogicalType::UBIGINT); });
++	named_parameters["version"] = LogicalType::UBIGINT;
+ }
+ 
+ TableFunctionSet DeltaFunctions::GetDeltaDomainMetadataFunction(ExtensionLoader &loader) {
+diff --git a/src/functions/delta_metadata_scan.cpp b/src/functions/delta_metadata_scan.cpp
+index d75a96d..268a2d0 100644
+--- a/src/functions/delta_metadata_scan.cpp
++++ b/src/functions/delta_metadata_scan.cpp
+@@ -132,12 +132,9 @@ static unique_ptr<FunctionData> DeltaFileListBind(ClientContext &context, TableF
+ }
+ 
+ DeltaFileListFunction::DeltaFileListFunction() : DeltaBaseMetadataFunction("delta_metadata", DeltaFileListBind) {
+-	// arguments.push_back(LogicalType::VARCHAR);
+-	GetSignature().WithTypedKwargs("options", [&](TypedKwargs &options) {
+-		options.Add("transform_expression", LogicalType::BOOLEAN)
+-		    .Add("delete_count", LogicalType::BOOLEAN)
+-		    .Add("version", LogicalType::UBIGINT);
+-	});
++	named_parameters["transform_expression"] = LogicalType::BOOLEAN;
++	named_parameters["delete_count"] = LogicalType::BOOLEAN;
++	named_parameters["version"] = LogicalType::UBIGINT;
+ }
+ 
+ TableFunctionSet DeltaFunctions::GetDeltaFileListFunction(ExtensionLoader &loader) {
+diff --git a/src/functions/delta_scan/delta_multi_file_reader.cpp b/src/functions/delta_scan/delta_multi_file_reader.cpp
+index 0b46ee5..91d8bf3 100644
+--- a/src/functions/delta_scan/delta_multi_file_reader.cpp
++++ b/src/functions/delta_scan/delta_multi_file_reader.cpp
+@@ -107,7 +107,7 @@ void FinalizeBindBaseOverride(MultiFileReaderData &reader_data, const MultiFileO
+ 	}
+ }
+ 
+-unique_ptr<MultiFileReader> DeltaMultiFileReader::CreateInstance(const BoundTableFunction &table_function) {
++unique_ptr<MultiFileReader> DeltaMultiFileReader::CreateInstance(const TableFunction &table_function) {
+ 	auto result = make_uniq<DeltaMultiFileReader>();
+ 
+ 	if (table_function.function_info) {
+@@ -289,17 +289,8 @@ ReaderInitializeType DeltaMultiFileReader::InitializeReader(MultiFileReaderData
+ 		overridden_global_columns[i] = std::move(kernel_columns[i]);
+ 	}
+ 
+-	// file_row_number is not a column of the file: it comes from the reader's row-number virtual column, which
+-	// core arranges by rewriting the id before it maps. This override has to do the same.
+-	auto column_ids = global_column_ids;
+-	auto &file_row_number_idx = bind_data.reader_bind.file_row_number_idx;
+-	if (file_row_number_idx.IsValid()) {
+-		for (auto &column_id : column_ids) {
+-			if (column_id.GetPrimaryIndex() == file_row_number_idx.GetIndex()) {
+-				column_id = ColumnIndex(MultiFileReader::COLUMN_IDENTIFIER_FILE_ROW_NUMBER);
+-			}
+-		}
+-	}
++	// Core passes the reserved virtual-column ID directly for file_row_number.
++	const auto &column_ids = global_column_ids;
+ 
+ 	FinalizeBind(reader_data, bind_data.file_options, bind_data.reader_bind, overridden_global_columns, column_ids,
+ 	             context, global_state);
+diff --git a/src/functions/delta_scan/delta_scan.cpp b/src/functions/delta_scan/delta_scan.cpp
+index 6495b3b..0077d83 100644
+--- a/src/functions/delta_scan/delta_scan.cpp
++++ b/src/functions/delta_scan/delta_scan.cpp
+@@ -72,11 +72,11 @@ virtual_column_map_t DeltaVirtualColumns(ClientContext &, optional_ptr<FunctionD
+ }
+ 
+ static void DeltaScanSerialize(Serializer &serializer, const optional_ptr<FunctionData> bind_data,
+-                               const BoundTableFunction &function) {
++                               const TableFunction &function) {
+ 	throw NotImplementedException("DeltaScan serialization not implemented");
+ }
+ 
+-static unique_ptr<FunctionData> DeltaScanDeserialize(Deserializer &deserializer, BoundTableFunction &function) {
++static unique_ptr<FunctionData> DeltaScanDeserialize(Deserializer &deserializer, TableFunction &function) {
+ 	throw NotImplementedException("DeltaScan deserialization not implemented");
+ }
+ 
+@@ -107,30 +107,14 @@ TableFunctionSet DeltaFunctions::GetDeltaScanFunction(ExtensionLoader &loader) {
+ 
+ 		function.to_string = DeltaFunctionToString;
+ 
+-		// Schema param is just confusing here, so the options are rebuilt without it
+-		auto &signature = function.GetSignature();
+-		signature.ExtendTypedKwargs([](TypedKwargs &options) {
+-			TypedKwargs without_schema;
+-			for (auto &option : options.GetOptions()) {
+-				if (option.name == "schema") {
+-					continue;
+-				}
+-				without_schema.Add(option.name, option.type);
+-				for (auto &alias : option.aliases) {
+-					without_schema.Alias(alias);
+-				}
+-			}
+-			options = std::move(without_schema);
+-		});
+-
+-		signature.ExtendTypedKwargs([&](TypedKwargs &options) {
+-			options.Add("pushdown_partition_info", LogicalType::BOOLEAN)
+-			    .Add("pushdown_filters", LogicalType::VARCHAR)
+-			    .Add("version", LogicalType::UBIGINT)
+-			    .Add("timestamp", LogicalType::TIMESTAMP_TZ)
+-			    .Add("log_tail", KernelUtils::GetLogPathType())
+-			    .Add("max_catalog_version", LogicalType::BIGINT);
+-		});
++		// The Delta scan exposes Delta options instead of Parquet's schema override.
++		function.named_parameters.erase("schema");
++		function.named_parameters["pushdown_partition_info"] = LogicalType::BOOLEAN;
++		function.named_parameters["pushdown_filters"] = LogicalType::VARCHAR;
++		function.named_parameters["version"] = LogicalType::UBIGINT;
++		function.named_parameters["timestamp"] = LogicalType::TIMESTAMP_TZ;
++		function.named_parameters["log_tail"] = KernelUtils::GetLogPathType();
++		function.named_parameters["max_catalog_version"] = LogicalType::BIGINT;
+ 
+ 		function.SetName("delta_scan");
+ 	});
+diff --git a/src/functions/delta_transaction_utils/idempotency_helpers.cpp b/src/functions/delta_transaction_utils/idempotency_helpers.cpp
+index 5900aec..d66586f 100644
+--- a/src/functions/delta_transaction_utils/idempotency_helpers.cpp
++++ b/src/functions/delta_transaction_utils/idempotency_helpers.cpp
+@@ -137,17 +137,12 @@ static unique_ptr<GlobalTableFunctionState> TransactionInitGlobalState(ClientCon
+ vector<TableFunction> DeltaFunctions::GetTransactionIdempotencyHelpers(DatabaseInstance &instance) {
+ 	vector<TableFunction> result;
+ 	result.push_back(TableFunction("delta_get_transaction_version",
+-	                               FunctionSignature()
+-	                                   .AddPositionalOnly("path", LogicalType::VARCHAR)
+-	                                   .AddPositionalOnly("app_id", LogicalType::VARCHAR),
++	                               {LogicalType::VARCHAR, LogicalType::VARCHAR},
+ 	                               DeltaGetTransactionVersionFunction, DeltaGetTransactionVersionBind,
+ 	                               TransactionInitGlobalState));
+ 	result.push_back(TableFunction("delta_set_transaction_version",
+-	                               FunctionSignature()
+-	                                   .AddPositionalOnly("path", LogicalType::VARCHAR)
+-	                                   .AddPositionalOnly("app_id", LogicalType::VARCHAR)
+-	                                   .AddPositionalOnly("new_version", LogicalType::UBIGINT)
+-	                                   .AddPositionalOnly("expected_version", LogicalType::UBIGINT),
++	                               {LogicalType::VARCHAR, LogicalType::VARCHAR, LogicalType::UBIGINT,
++	                                LogicalType::UBIGINT},
+ 	                               DeltaSetTransactionVersionFunction, DeltaSetTransactionVersionBind,
+ 	                               TransactionInitGlobalState));
+ 	return result;
+diff --git a/src/functions/metadata_functions.cpp b/src/functions/metadata_functions.cpp
+index 072d6bd..dc9bf8f 100644
+--- a/src/functions/metadata_functions.cpp
++++ b/src/functions/metadata_functions.cpp
+@@ -45,8 +45,7 @@ static void MetadataFunctionExecute(ClientContext &context, TableFunctionInput &
+ }
+ 
+ DeltaBaseMetadataFunction::DeltaBaseMetadataFunction(Identifier name_p, table_function_bind_t bind)
+-    : TableFunction(std::move(name_p), FunctionSignature().AddPositionalOnly("path", LogicalType::VARCHAR),
+-                    MetadataFunctionExecute, bind, MetadataFunctionInit) {
++	: TableFunction(std::move(name_p), {LogicalType::VARCHAR}, MetadataFunctionExecute, bind, MetadataFunctionInit) {
+ }
+ 
+ } // namespace duckdb
+diff --git a/src/include/functions/delta_scan/delta_multi_file_reader.hpp b/src/include/functions/delta_scan/delta_multi_file_reader.hpp
+index 3478986..d61282a 100644
+--- a/src/include/functions/delta_scan/delta_multi_file_reader.hpp
++++ b/src/include/functions/delta_scan/delta_multi_file_reader.hpp
+@@ -28,7 +28,7 @@ struct DeltaMultiFileReaderGlobalState : public MultiFileReaderGlobalState {
+ struct DeltaMultiFileReader : public MultiFileReader {
+ 	static constexpr column_t DELTA_FILE_NUMBER_COLUMN_ID = UINT64_C(10000000000000000000);
+ 
+-	static unique_ptr<MultiFileReader> CreateInstance(const BoundTableFunction &table_function);
++	static unique_ptr<MultiFileReader> CreateInstance(const TableFunction &table_function);
+ 	//! Return a DeltaMultiFileList
+ 	shared_ptr<MultiFileList> CreateFileList(ClientContext &context, const vector<string> &paths,
+ 	                                         const FileGlobInput &glob_input) override;
+diff --git a/src/storage/delta_table_entry.cpp b/src/storage/delta_table_entry.cpp
+index bf7bb2a..461fe65 100644
+--- a/src/storage/delta_table_entry.cpp
++++ b/src/storage/delta_table_entry.cpp
+@@ -76,7 +76,7 @@ TableFunction DeltaTableEntry::GetScanFunctionInternal(ClientContext &context, u
+ 	delta_scan_function.function_info = std::move(function_info);
+ 
+ 	vector<Value> inputs = {delta_catalog.GetDBPath()};
+-	named_argument_map_t param_map;
++	named_parameter_map_t param_map;
+ 	vector<LogicalType> return_types;
+ 	vector<Identifier> names;
+ 	TableFunctionRef empty_ref;
+@@ -89,9 +89,8 @@ TableFunction DeltaTableEntry::GetScanFunctionInternal(ClientContext &context, u
+ 		param_map.insert({"version", Value::UBIGINT(param_version)});
+ 	}
+ 
+-	// the bind sees the function as a bound call would; nothing is read back off it afterwards
+-	BoundTableFunction bound_scan_function(delta_scan_function);
+-	TableFunctionBindInput bind_input(inputs, param_map, return_types, names, nullptr, nullptr, bound_scan_function,
++	// The bind sees the mutable function metadata, as it would during a regular scan bind.
++	TableFunctionBindInput bind_input(inputs, param_map, return_types, names, nullptr, nullptr, delta_scan_function,
+ 	                                  empty_ref);
+ 
+ 	auto result = delta_scan_function.bind(context, bind_input, return_types, names);

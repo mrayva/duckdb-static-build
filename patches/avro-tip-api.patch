@@ -1,0 +1,33 @@
+diff --git a/CMakeLists.txt b/CMakeLists.txt
+index 2cc9085..479beb9 100644
+--- a/CMakeLists.txt
++++ b/CMakeLists.txt
+@@ -30,6 +30,13 @@ set(CMAKE_POLICY_VERSION_MINIMUM 3.5)
+ # Add avro-c from submodule
+ add_subdirectory(third_party/avro-c/lang/c EXCLUDE_FROM_ALL)
+ 
++# The bundled avro-c hash table uses pre-C23 unspecified-argument callback
++# declarations. Keep that C target on a compatible standard even when the host
++# compiler defaults to C23.
++if(TARGET avro-static)
++  set_property(TARGET avro-static PROPERTY C_STANDARD 99)
++endif()
++
+ # Get avro-c include directory
+ set(AVRO_INCLUDE_DIR "${CMAKE_CURRENT_SOURCE_DIR}/third_party/avro-c/lang/c/src")
+ 
+diff --git a/src/avro_metadata.cpp b/src/avro_metadata.cpp
+index a9ee27a..bea7ffd 100644
+--- a/src/avro_metadata.cpp
++++ b/src/avro_metadata.cpp
+@@ -76,8 +76,8 @@ static void AvroMetadataFunction(ClientContext &context, TableFunctionInput &dat
+ }
+ 
+ TableFunction AvroMetadata::GetFunction() {
+-	TableFunction func("avro_metadata", FunctionSignature().AddPositionalOnly("path", LogicalType::VARCHAR),
+-	                   AvroMetadataFunction, AvroMetadataBind, AvroMetadataInit);
++	TableFunction func("avro_metadata", {LogicalType::VARCHAR}, AvroMetadataFunction, AvroMetadataBind,
++	                   AvroMetadataInit);
+ 	return func;
+ }
+ 

@@ -1,0 +1,12 @@
+diff --git a/src/include/fts_indexing.hpp b/src/include/fts_indexing.hpp
+index 222333a..249fb46 100644
+--- a/src/include/fts_indexing.hpp
++++ b/src/include/fts_indexing.hpp
+@@ -9,6 +9,7 @@
+ #pragma once
+ 
+ #include "duckdb/main/client_context.hpp"
++#include "duckdb/function/function.hpp"
+ 
+ namespace duckdb {
+ 

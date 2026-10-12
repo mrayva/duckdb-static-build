@@ -1,0 +1,226 @@
+diff --git a/src/cloudformation_functions.cpp b/src/cloudformation_functions.cpp
+index 2ce6942..7117bfb 100644
+--- a/src/cloudformation_functions.cpp
++++ b/src/cloudformation_functions.cpp
+@@ -1107,52 +1107,39 @@ void CloudFormationFunctions::Register(ExtensionLoader &loader) {
+ 
+ 	// The template is the only positional argument: it is what the verb acts on.
+ 	// Everything else modifies the call.
+-	FunctionSignature create_signature;
+-	create_signature.AddParameter("template", LogicalType::VARCHAR)
+-	    .WithTypedKwargs("options", [&](TypedKwargs &options) {
+-		    options.Add("name", LogicalType::VARCHAR)
+-		        .Add("region", LogicalType::VARCHAR)
+-		        .Add("template_parameters", map_vv)
+-		        .Add("tags", map_vv)
+-		        // Typed BOOLEAN rather than a string key: a value that failed to parse would
+-		        // fall through to false and create a real stack.
+-		        .Add("dry_run", LogicalType::BOOLEAN);
+-	    });
+-	TableFunction create_fn("cloudformation_create_stack", std::move(create_signature), CloudFormationCreateStackFun,
++	TableFunction create_fn("cloudformation_create_stack", {LogicalType::VARCHAR}, CloudFormationCreateStackFun,
+ 	                        CloudFormationCreateStackBind);
++	create_fn.named_parameters["name"] = LogicalType::VARCHAR;
++	create_fn.named_parameters["region"] = LogicalType::VARCHAR;
++	create_fn.named_parameters["template_parameters"] = map_vv;
++	create_fn.named_parameters["tags"] = map_vv;
++	// Typed BOOLEAN rather than a string key: a value that failed to parse would
++	// fall through to false and create a real stack.
++	create_fn.named_parameters["dry_run"] = LogicalType::BOOLEAN;
+ 	loader.RegisterFunction(create_fn);
+ 
+-	FunctionSignature describe_signature;
+-	describe_signature.AddParameter("handle", map_vv);
+-	TableFunction describe_fn("cloudformation_describe_stack", std::move(describe_signature),
+-	                          CloudFormationDescribeStackFun, CloudFormationDescribeStackBind);
++	TableFunction describe_fn("cloudformation_describe_stack", {map_vv}, CloudFormationDescribeStackFun,
++	                          CloudFormationDescribeStackBind);
+ 	loader.RegisterFunction(describe_fn);
+ 
+-	FunctionSignature delete_signature;
+-	delete_signature.AddParameter("handle", map_vv).WithTypedKwargs("options", [&](TypedKwargs &options) {
+-		options.Add("dry_run", LogicalType::BOOLEAN);
+-	});
+-	TableFunction delete_fn("cloudformation_delete_stack", std::move(delete_signature), CloudFormationDeleteStackFun,
++	TableFunction delete_fn("cloudformation_delete_stack", {map_vv}, CloudFormationDeleteStackFun,
+ 	                        CloudFormationDeleteStackBind);
++	delete_fn.named_parameters["dry_run"] = LogicalType::BOOLEAN;
+ 	loader.RegisterFunction(delete_fn);
+ 
+-	FunctionSignature list_signature;
+-	list_signature.AddParameter("region", LogicalType::VARCHAR).WithTypedKwargs("options", [&](TypedKwargs &options) {
+-		options.Add("status_filter", LogicalType::LIST(LogicalType::VARCHAR));
+-	});
+-	TableFunction list_fn("cloudformation_list_stacks", std::move(list_signature), CloudFormationListStacksFun,
++	TableFunction list_fn("cloudformation_list_stacks", {LogicalType::VARCHAR}, CloudFormationListStacksFun,
+ 	                      CloudFormationListStacksBind);
++	list_fn.named_parameters["status_filter"] = LogicalType::LIST(LogicalType::VARCHAR);
+ 	loader.RegisterFunction(list_fn);
+ 
+ 	// Overloaded: no arg -> all default regions (parallel); VARCHAR -> one region; LIST(VARCHAR) -> those
+ 	// regions (parallel). Bind dispatches on the argument shape.
+ 	TableFunctionSet describe_all_set("cloudformation_describe_stacks");
+ 	describe_all_set.AddFunction(TableFunction({}, CloudFormationDescribeStacksFun, CloudFormationDescribeStacksBind));
+-	describe_all_set.AddFunction(TableFunction(FunctionSignature().AddPositionalOnly("region", LogicalType::VARCHAR),
+-	                                           CloudFormationDescribeStacksFun, CloudFormationDescribeStacksBind));
+ 	describe_all_set.AddFunction(
+-	    TableFunction(FunctionSignature().AddPositionalOnly("regions", LogicalType::LIST(LogicalType::VARCHAR)),
+-	                  CloudFormationDescribeStacksFun, CloudFormationDescribeStacksBind));
++	    TableFunction({LogicalType::VARCHAR}, CloudFormationDescribeStacksFun, CloudFormationDescribeStacksBind));
++	describe_all_set.AddFunction(TableFunction({LogicalType::LIST(LogicalType::VARCHAR)},
++	                                           CloudFormationDescribeStacksFun, CloudFormationDescribeStacksBind));
+ 	loader.RegisterFunction(describe_all_set);
+ 
+ 	ScalarFunction session_id_fn("duckdb_aws_session_id", {}, LogicalType::VARCHAR, DuckDBAwsSessionIdFunction);
+diff --git a/src/create_aws_legacy_function_stubs.cpp b/src/create_aws_legacy_function_stubs.cpp
+index cecd403..a1b3c4e 100644
+--- a/src/create_aws_legacy_function_stubs.cpp
++++ b/src/create_aws_legacy_function_stubs.cpp
+@@ -27,20 +27,14 @@ static void LoadAWSCredentialsFunction(ClientContext &, TableFunctionInput &, Da
+ 
+ void CreateAwsLegacyFunctionStubs::Register(ExtensionLoader &loader) {
+ 	TableFunctionSet function_set("load_aws_credentials");
+-	FunctionSignature base_signature;
+-	base_signature.WithTypedKwargs("options", [&](TypedKwargs &options) {
+-		options.Add("set_region", LogicalTypeId::BOOLEAN).Add("redact_secret", LogicalTypeId::BOOLEAN);
+-	});
+-	auto base_fun = TableFunction("load_aws_credentials", std::move(base_signature), LoadAWSCredentialsFunction,
+-	                              LoadAWSCredentialsBind);
+-
+-	FunctionSignature profile_signature;
+-	profile_signature.AddParameter("profile", LogicalTypeId::VARCHAR)
+-	    .WithTypedKwargs("options", [&](TypedKwargs &options) {
+-		    options.Add("set_region", LogicalTypeId::BOOLEAN).Add("redact_secret", LogicalTypeId::BOOLEAN);
+-	    });
+-	auto profile_fun = TableFunction("load_aws_credentials", std::move(profile_signature), LoadAWSCredentialsFunction,
+-	                                 LoadAWSCredentialsBind);
++	auto base_fun = TableFunction("load_aws_credentials", {}, LoadAWSCredentialsFunction, LoadAWSCredentialsBind);
++	base_fun.named_parameters["set_region"] = LogicalType::BOOLEAN;
++	base_fun.named_parameters["redact_secret"] = LogicalType::BOOLEAN;
++
++	auto profile_fun =
++	    TableFunction("load_aws_credentials", {LogicalType::VARCHAR}, LoadAWSCredentialsFunction, LoadAWSCredentialsBind);
++	profile_fun.named_parameters["set_region"] = LogicalType::BOOLEAN;
++	profile_fun.named_parameters["redact_secret"] = LogicalType::BOOLEAN;
+ 
+ 	function_set.AddFunction(base_fun);
+ 	function_set.AddFunction(profile_fun);
+diff --git a/src/quack_on_ec2_resource.cpp b/src/quack_on_ec2_resource.cpp
+index 39d09eb..d9f2c55 100644
+--- a/src/quack_on_ec2_resource.cpp
++++ b/src/quack_on_ec2_resource.cpp
+@@ -106,7 +106,14 @@ static void QuackCreateFun(ClientContext &context, TableFunctionInput &data_p, D
+ 	if (res->HasError()) {
+ 		throw IOException("quack-on-ec2 create failed: %s", res->GetError());
+ 	}
+-	output.data[0].Append(res->Collection().GetValue(0, 0));
++	auto chunk = res->Fetch();
++	if (res->HasError()) {
++		throw IOException("quack-on-ec2 create failed: %s", res->GetError());
++	}
++	if (!chunk || chunk->size() == 0) {
++		throw IOException("quack-on-ec2 create returned no stack handle");
++	}
++	output.data[0].Append(chunk->GetValue(0, 0));
+ 	state.done = true;
+ }
+ 
+@@ -142,9 +149,15 @@ static void QuackStatusFun(ClientContext &context, TableFunctionInput &data_p, D
+ 	if (res->HasError()) {
+ 		throw IOException("quack-on-ec2 status failed: %s", res->GetError());
+ 	}
+-	auto rows = res->Collection().GetRows();
+-	output.data[0].Append(rows.GetValue(0, 0));
+-	output.data[1].Append(rows.GetValue(1, 0));
++	auto chunk = res->Fetch();
++	if (res->HasError()) {
++		throw IOException("quack-on-ec2 status failed: %s", res->GetError());
++	}
++	if (!chunk || chunk->size() == 0) {
++		throw IOException("quack-on-ec2 status returned no stack state");
++	}
++	output.data[0].Append(chunk->GetValue(0, 0));
++	output.data[1].Append(chunk->GetValue(1, 0));
+ 	state.done = true;
+ }
+ 
+@@ -180,8 +193,10 @@ static void QuackDestroyFun(ClientContext &context, TableFunctionInput &data_p,
+ // connect blob (uri/token) is deliberately NOT surfaced here — list is discovery; resolve/status produce that.
+ struct QuackListState : public GlobalTableFunctionState {
+ 	unique_ptr<QueryResult> result;
++	unique_ptr<DataChunk> chunk;
+ 	idx_t cursor = 0;
+ 	bool ran = false;
++	bool finished = false;
+ };
+ 
+ static unique_ptr<GlobalTableFunctionState> QuackListInit(ClientContext &, TableFunctionInitInput &) {
+@@ -243,19 +258,29 @@ static void QuackListFun(ClientContext &context, TableFunctionInput &data_p, Dat
+ 		state.ran = true;
+ 	}
+ 
+-	idx_t total = state.result->RowCount();
+-	idx_t remaining = total - state.cursor;
+-	idx_t to_emit = remaining < (idx_t)STANDARD_VECTOR_SIZE ? remaining : (idx_t)STANDARD_VECTOR_SIZE;
+-	auto rows = state.result->Collection().GetRows();
+-	for (idx_t i = 0; i < to_emit; i++) {
+-		idx_t row = state.cursor + i;
+-		output.data[0].Append(rows.GetValue(0, row));
+-		output.data[1].Append(rows.GetValue(1, row));
+-		output.data[2].Append(rows.GetValue(2, row));
+-		output.data[3].Append(rows.GetValue(3, row));
++	idx_t to_emit = 0;
++	while (to_emit < STANDARD_VECTOR_SIZE && !state.finished) {
++		if (!state.chunk || state.cursor >= state.chunk->size()) {
++			state.chunk = state.result->Fetch();
++			state.cursor = 0;
++			if (state.result->HasError()) {
++				throw IOException("quack-on-ec2 list failed: %s", state.result->GetError());
++			}
++			if (!state.chunk || state.chunk->size() == 0) {
++				state.finished = true;
++				break;
++			}
++		}
++		while (state.cursor < state.chunk->size() && to_emit < STANDARD_VECTOR_SIZE) {
++			output.data[0].Append(state.chunk->GetValue(0, state.cursor));
++			output.data[1].Append(state.chunk->GetValue(1, state.cursor));
++			output.data[2].Append(state.chunk->GetValue(2, state.cursor));
++			output.data[3].Append(state.chunk->GetValue(3, state.cursor));
++			state.cursor++;
++			to_emit++;
++		}
+ 	}
+ 	output.CheckCardinality(to_emit);
+-	state.cursor += to_emit;
+ }
+ 
+ } // namespace
+@@ -264,22 +289,18 @@ void QuackOnEc2Resource::Register(ExtensionLoader &loader) {
+ 	auto map_vv = LogicalType::MAP(LogicalType::VARCHAR, LogicalType::VARCHAR);
+ 
+ 	// Native callbacks (no SQL macros): thin adapters over cloudformation_*.
+-	TableFunction create_fn("__aws__cloudformation__quack_on_ec2__create",
+-	                        FunctionSignature().AddPositionalOnly("input", map_vv), QuackCreateFun, QuackCreateBind,
++	TableFunction create_fn("__aws__cloudformation__quack_on_ec2__create", {map_vv}, QuackCreateFun, QuackCreateBind,
+ 	                        QuackAdapterInit);
+ 	loader.RegisterFunction(create_fn);
+-	TableFunction status_fn("__aws__cloudformation__quack_on_ec2__status",
+-	                        FunctionSignature().AddPositionalOnly("input", map_vv), QuackStatusFun, QuackStatusBind,
++	TableFunction status_fn("__aws__cloudformation__quack_on_ec2__status", {map_vv}, QuackStatusFun, QuackStatusBind,
+ 	                        QuackAdapterInit);
+ 	loader.RegisterFunction(status_fn);
+-	TableFunction destroy_fn("__aws__cloudformation__quack_on_ec2__destroy",
+-	                         FunctionSignature().AddPositionalOnly("input", map_vv), QuackDestroyFun, QuackDestroyBind,
+-	                         QuackAdapterInit);
++	TableFunction destroy_fn("__aws__cloudformation__quack_on_ec2__destroy", {map_vv}, QuackDestroyFun,
++	                         QuackDestroyBind, QuackAdapterInit);
+ 	loader.RegisterFunction(destroy_fn);
+ 	// Also wired into the resource-type registry below (as this type's `list_function`), so
+ 	// `SHOW ALL EXTERNAL RESOURCES` can discover existing stacks that are not locally managed.
+-	TableFunction list_fn("__aws__cloudformation__quack_on_ec2__list",
+-	                      FunctionSignature().AddPositionalOnly("input", map_vv), QuackListFun, QuackListBind,
++	TableFunction list_fn("__aws__cloudformation__quack_on_ec2__list", {map_vv}, QuackListFun, QuackListBind,
+ 	                      QuackListInit);
+ 	loader.RegisterFunction(list_fn);
+ 

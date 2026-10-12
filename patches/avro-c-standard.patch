@@ -1,0 +1,9 @@
+diff --git a/CMakeLists.txt b/CMakeLists.txt
+--- a/CMakeLists.txt
++++ b/CMakeLists.txt
+@@ -36,6 +36,7 @@
+ # Disable all UBSan checks for avro-static to work around multiple UB issues in avro-c
+ if(TARGET avro-static AND NOT MSVC)
++  set_property(TARGET avro-static PROPERTY C_STANDARD 99)
+   target_compile_options(avro-static PRIVATE -fno-sanitize=undefined)
+ endif()
