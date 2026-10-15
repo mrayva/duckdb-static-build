@@ -1,0 +1,231 @@
+diff --git a/README.md b/README.md
+index f1dd5b3..6654fe7 100644
+--- a/README.md
++++ b/README.md
+@@ -31,3 +31,14 @@ a script is run to transform the shared library into a loadable extension by app
+ to the `build/debug` directory.
+ 
+ To create optimized release binaries, simply run `make release` instead.
++
++## Parameter handles
++
++`odbc_create_params()` creates a reusable parameter handle for `odbc_query(..., params_handle := handle)` and
++`odbc_bind_params(...)`. Parameter handles are independent of query plans and remain registered until explicitly
++released with `odbc_destroy_params(handle)`. Deallocate prepared statements that use the handle before releasing it.
++
++```sql
++DEALLOCATE query_stmt;
++SELECT odbc_destroy_params(getvariable('params'));
++```
+diff --git a/src/functions/odbc_create_params.cpp b/src/functions/odbc_create_params.cpp
+index 3ec74d2..b27256f 100644
+--- a/src/functions/odbc_create_params.cpp
++++ b/src/functions/odbc_create_params.cpp
+@@ -1,5 +1,6 @@
+ #include "odbc_scanner.hpp"
+ 
++#include <cstdint>
+ #include <string>
+ #include <vector>
+ 
+@@ -9,11 +10,14 @@
+ #include "params.hpp"
+ #include "registries.hpp"
+ #include "scanner_exception.hpp"
++#include "types.hpp"
+ 
+ DUCKDB_EXTENSION_EXTERN
+ 
+ static void odbc_create_params_function(duckdb_function_info info, duckdb_data_chunk input,
+                                         duckdb_vector output) noexcept;
++static void odbc_destroy_params_function(duckdb_function_info info, duckdb_data_chunk input,
++                                         duckdb_vector output) noexcept;
+ 
+ namespace odbcscanner {
+ 
+@@ -26,6 +30,21 @@ static void CreateParams(duckdb_function_info info, duckdb_data_chunk input, duc
+ 	result_data[0] = ParamsRegistry::Add(std::move(params_ptr));
+ }
+ 
++static void DestroyParams(duckdb_function_info info, duckdb_data_chunk input, duckdb_vector output) {
++	(void)info;
++	auto handle_arg = Types::ExtractFunctionArg<int64_t>(input, 0);
++	if (handle_arg.second) {
++		throw ScannerException("'odbc_destroy_params' error: specified parameters handle must be not NULL");
++	}
++	auto params_ptr = ParamsRegistry::Remove(handle_arg.first);
++	if (params_ptr.get() == nullptr) {
++		throw ScannerException("'odbc_destroy_params' error: specified parameters handle not found, ID: " +
++		                       std::to_string(handle_arg.first));
++	}
++	uint8_t *result_data = reinterpret_cast<uint8_t *>(duckdb_vector_get_data(output));
++	result_data[0] = 1;
++}
++
+ void OdbcCreateParamsFunction::Register(duckdb_connection conn) {
+ 	auto fun = ScalarFunctionPtr(duckdb_create_scalar_function(), ScalarFunctionDeleter);
+ 	duckdb_scalar_function_set_name(fun.get(), "odbc_create_params");
+@@ -48,6 +67,24 @@ void OdbcCreateParamsFunction::Register(duckdb_connection conn) {
+ 	}
+ }
+ 
++void OdbcDestroyParamsFunction::Register(duckdb_connection conn) {
++	auto fun = ScalarFunctionPtr(duckdb_create_scalar_function(), ScalarFunctionDeleter);
++	duckdb_scalar_function_set_name(fun.get(), "odbc_destroy_params");
++
++	auto bigint_type = LogicalTypePtr(duckdb_create_logical_type(DUCKDB_TYPE_BIGINT), LogicalTypeDeleter);
++	auto bool_type = LogicalTypePtr(duckdb_create_logical_type(DUCKDB_TYPE_BOOLEAN), LogicalTypeDeleter);
++	duckdb_scalar_function_add_parameter(fun.get(), bigint_type.get());
++	duckdb_scalar_function_set_return_type(fun.get(), bool_type.get());
++	duckdb_scalar_function_set_function(fun.get(), odbc_destroy_params_function);
++	duckdb_scalar_function_set_special_handling(fun.get());
++	duckdb_scalar_function_set_volatile(fun.get());
++
++	duckdb_state state = duckdb_register_scalar_function(conn, fun.get());
++	if (state != DuckDBSuccess) {
++		throw ScannerException("'odbc_destroy_params' function registration failed");
++	}
++}
++
+ } // namespace odbcscanner
+ 
+ static void odbc_create_params_function(duckdb_function_info info, duckdb_data_chunk input,
+@@ -58,3 +95,12 @@ static void odbc_create_params_function(duckdb_function_info info, duckdb_data_c
+ 		duckdb_scalar_function_set_error(info, e.what());
+ 	}
+ }
++
++static void odbc_destroy_params_function(duckdb_function_info info, duckdb_data_chunk input,
++                                         duckdb_vector output) noexcept {
++	try {
++		odbcscanner::DestroyParams(info, input, output);
++	} catch (std::exception &e) {
++		duckdb_scalar_function_set_error(info, e.what());
++	}
++}
+diff --git a/src/include/odbc_scanner.hpp b/src/include/odbc_scanner.hpp
+index 49a6503..fe909cb 100644
+--- a/src/include/odbc_scanner.hpp
++++ b/src/include/odbc_scanner.hpp
+@@ -36,6 +36,10 @@ struct OdbcCreateParamsFunction {
+ 	static void Register(duckdb_connection connection);
+ };
+ 
++struct OdbcDestroyParamsFunction {
++	static void Register(duckdb_connection connection);
++};
++
+ struct OdbcListDataSourcesFunction {
+ 	static void Register(duckdb_connection connection);
+ };
+@@ -52,4 +56,4 @@ struct OdbcRollbackFunction {
+ 	static void Register(duckdb_connection connection);
+ };
+ 
+-} // namespace odbcscanner
+\ No newline at end of file
++} // namespace odbcscanner
+diff --git a/src/odbc_scanner.cpp b/src/odbc_scanner.cpp
+index 117f9ad..742b8fe 100644
+--- a/src/odbc_scanner.cpp
++++ b/src/odbc_scanner.cpp
+@@ -20,6 +20,7 @@ static void Initialize(duckdb_connection connection, duckdb_extension_info, duck
+ 	OdbcConnectFunction::Register(connection);
+ 	OdbcCopyFunction::Register(connection);
+ 	OdbcCreateParamsFunction::Register(connection);
++	OdbcDestroyParamsFunction::Register(connection);
+ 	OdbcListDataSourcesFunction::Register(connection);
+ 	OdbcListDriversFunction::Register(connection);
+ 	OdbcQueryFunction::Register(connection);
+diff --git a/test/sql/duckdb/params_handle.test b/test/sql/duckdb/params_handle.test
+index 13ac7ee..c238715 100644
+--- a/test/sql/duckdb/params_handle.test
++++ b/test/sql/duckdb/params_handle.test
+@@ -84,6 +84,16 @@ EXECUTE p1
+ statement ok
+ DEALLOCATE p1
+ 
++query I
++SELECT odbc_destroy_params(getvariable('params1'))
++----
++true
++
++statement error
++SELECT odbc_destroy_params(NULL)
++----
++Invalid Input Error: 'odbc_destroy_params' error: specified parameters handle must be not NULL
++
+ statement error
+ PREPARE p2 AS SELECT * FROM odbc_query(getvariable('conn'), 'SELECT ?::INTEGER', params_handle=getvariable('params1'))
+ ----
+@@ -125,5 +135,13 @@ DEALLOCATE p2_bind
+ statement ok
+ DEALLOCATE p2
+ 
++statement ok
++SELECT odbc_destroy_params(getvariable('params2'))
++
++statement error
++SELECT odbc_destroy_params(getvariable('params2'))
++----
++<REGEX>:.*Invalid Input Error: 'odbc_destroy_params' error: specified parameters handle not found.*
++
+ statement ok
+ SELECT odbc_close(getvariable('conn'))
+diff --git a/src/functions/odbc_query.cpp b/src/functions/odbc_query.cpp
+--- a/src/functions/odbc_query.cpp
++++ b/src/functions/odbc_query.cpp
+@@ -70,13 +70,6 @@
+ 	BindData &operator=(const BindData &other) = delete;
+ 	BindData &operator=(BindData &&other) = delete;
+ 
+-	~BindData() noexcept {
+-		if (params_handle != 0) {
+-			auto params_ptr = ParamsRegistry::Remove(params_handle);
+-			(void)params_ptr;
+-		}
+-	}
+-
+ 	static void Destroy(void *bdata_in) noexcept {
+ 		auto bdata = reinterpret_cast<BindData *>(bdata_in);
+ 		delete bdata;
+@@ -86,20 +79,26 @@
+ struct GlobalInitData {
+ 	int64_t conn_id;
+ 	std::unique_ptr<OdbcConnection> conn_ptr;
++	StmtHandlePtr &stmt_ptr;
+ 	bool close_connection = false;
+ 
+-	GlobalInitData(int64_t conn_id, std::unique_ptr<OdbcConnection> conn_ptr_in, bool close_connection_in, HSTMT stmt)
+-	    : conn_id(conn_id), conn_ptr(std::move(conn_ptr_in)), close_connection(close_connection_in) {
++	GlobalInitData(int64_t conn_id, std::unique_ptr<OdbcConnection> conn_ptr_in, bool close_connection_in,
++	               StmtHandlePtr &stmt_ptr_in)
++	    : conn_id(conn_id), conn_ptr(std::move(conn_ptr_in)), stmt_ptr(stmt_ptr_in),
++	      close_connection(close_connection_in) {
+ 		if (!conn_ptr) {
+ 			throw ScannerException("'odbc_query' error: ODBC connection not found on global init, id: " +
+ 			                       std::to_string(conn_id));
+ 		}
+-		CancellationRegistry::Add(conn_id, stmt);
++		CancellationRegistry::Add(conn_id, stmt_ptr.get());
+ 	}
+ 
+ 	~GlobalInitData() {
+ 		CancellationRegistry::Remove(conn_id);
+-		if (!close_connection) {
++		if (close_connection) {
++			// Free the statement while its parent DBC is still alive.
++			stmt_ptr.reset();
++		} else {
+ 			// We are not closing the connection, even in case of error,
+ 			// so need to return connection to registry
+ 			ConnectionsRegistry::Add(std::move(conn_ptr));
+@@ -238,7 +237,7 @@
+ 	// to not allow other threads operate on it or close it.
+ 	auto conn_ptr = ConnectionsRegistry::Remove(bdata.conn_id);
+ 	auto gdata_ptr = std_make_unique<GlobalInitData>(bdata.conn_id, std::move(conn_ptr),
+-	                                                 bdata.query_options.close_connection, bdata.ctx.hstmt());
++	                                                 bdata.query_options.close_connection, bdata.ctx.hstmt_ptr);
+ 	duckdb_init_set_init_data(info, gdata_ptr.release(), GlobalInitData::Destroy);
+ }
+ 

@@ -535,6 +535,13 @@ if [ -f .github/config/extensions/odbc_scanner.cmake ] && \
         .github/config/extensions/odbc_scanner.cmake
     log_success "Skipping ODBC linker patch already integrated at current tip"
 fi
+if [ -f .github/config/extensions/odbc_scanner.cmake ]; then
+    mkdir -p .github/patches/extensions/odbc_scanner
+    cp "$BUILD_SCRIPT_DIR/patches/odbc-scanner-lifecycle-tip.patch" \
+       .github/patches/extensions/odbc_scanner/0002-duckdb-tip-lifecycle.patch
+    ensure_include_after_git_tag .github/config/extensions/odbc_scanner.cmake "APPLY_PATCHES"
+    log_success "Configured ODBC parameter and statement lifecycle compatibility patch"
+fi
 if [ -f .github/config/extensions/quack.cmake ] && \
     ! grep -A3 'duckdb_extension_load(quack' .github/config/extensions/quack.cmake | grep -q '^[[:space:]]*LOAD_TESTS'; then
     sed -i '/duckdb_extension_load(quack/a\    LOAD_TESTS' .github/config/extensions/quack.cmake
