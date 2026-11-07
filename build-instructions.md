@@ -99,6 +99,16 @@ Current known-good verification matrix:
 - `--with-spatial`
 - current tip static release build completes successfully with the repo compat patches
 
+The latest recorded full `test/unittest` run reported 10,608 passing cases and 6,513,219 assertions. Environment-gated external-service cases and tests marked flaky, unstable, or unsupported were skipped.
+
+The DuckDB-backed ODBC subset passed all 24 test cases with 301 assertions. Run it against a build with:
+
+```bash
+scripts/validate-odbc-tests.sh /path/to/duckdb/build/release-static
+```
+
+This does not validate ODBC connections to external database engines or every registered integration test.
+
 ## 6. Fast Rebuilds
 
 If dependencies are already present:

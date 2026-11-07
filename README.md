@@ -30,6 +30,16 @@ OpenIVM and DuckDBSP are built separately from `mrayva/openivm` and `mrayva/duck
 Current known-good verification matrix:
 - `--skip-vcpkg --with-spatial`
 
+The latest recorded full `test/unittest` run reported 10,608 passing cases and 6,513,219 assertions. Tests gated on unavailable external services or credentials, and tests marked flaky, unstable, or unsupported, were skipped; this does not mean every registered integration test ran.
+
+The DuckDB-backed ODBC subset was separately validated: 24 tests and 301 assertions passed. Run it against a build with:
+
+```bash
+scripts/validate-odbc-tests.sh /path/to/duckdb/build/release-static
+```
+
+The validator creates an isolated unixODBC registry because SQLLogic tests may not see a user-level driver registration. ODBC tests for other database engines still require their own servers and connection strings.
+
 ## Extensions Included
 
 | Category | Extensions |
@@ -70,6 +80,7 @@ OpenIVM and DuckDBSP are no longer built from this repo. They are built separate
 |------|-------------|
 | `build-duckdb-static.sh` | Automated build script |
 | `build-instructions.md` | Full build/runbook (clean env + troubleshooting) |
+| `scripts/validate-odbc-tests.sh` | Run DuckDB-backed ODBC tests with an isolated unixODBC registry |
 | `README.md` | Summary |
 
 ## Requirements
