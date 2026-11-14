@@ -1,0 +1,38 @@
+diff --git a/src/include/quack_client.hpp b/src/include/quack_client.hpp
+--- a/src/include/quack_client.hpp
++++ b/src/include/quack_client.hpp
+@@ -117,5 +117,7 @@ public:
+ 	                               string connection_id_p, idx_t heartbeat_timeout_seconds_p,
+ 	                               idx_t max_connections_cached = 1);
+ 	~QuackClientConnection();
++	//! Stop background lease traffic when the owning attached database closes.
++	void StopHeartbeat();
+ 
+ 	void CancelQuery(hugeint_t query_uuid);
+diff --git a/src/quack_client.cpp b/src/quack_client.cpp
+--- a/src/quack_client.cpp
++++ b/src/quack_client.cpp
+@@ -328,3 +328,3 @@
+ QuackClientConnection::~QuackClientConnection() {
+-	heartbeat.Stop();
++	StopHeartbeat();
+ 	if (!cached_clients.empty()) {
+@@ -340,3 +340,7 @@
+ }
+ 
++void QuackClientConnection::StopHeartbeat() {
++	heartbeat.Stop();
++}
++
+ void QuackClientConnection::StartHeartbeat() {
+diff --git a/src/storage/quack_catalog.cpp b/src/storage/quack_catalog.cpp
+--- a/src/storage/quack_catalog.cpp
++++ b/src/storage/quack_catalog.cpp
+@@ -51,2 +51,7 @@
+ QuackCatalog::~QuackCatalog() {
++	// Plans may retain the shared connection after this catalog is closed. Stop its worker
++	// before DatabaseInstance closes the HTTP transport manager.
++	if (client_connection) {
++		client_connection->StopHeartbeat();
++	}
+ }

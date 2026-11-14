@@ -1,0 +1,16 @@
+Rename GDAL's vendored json_object_get symbol so it cannot bind to Jansson's
+incompatible json_object_get when GDAL and Quack are statically linked into
+the same DuckDB process.
+
+diff --git a/ogr/ogrsf_frmts/geojson/libjson/json_object.h b/ogr/ogrsf_frmts/geojson/libjson/json_object.h
+index 05f25b0..085faca 100644
+--- a/ogr/ogrsf_frmts/geojson/libjson/json_object.h
++++ b/ogr/ogrsf_frmts/geojson/libjson/json_object.h
+@@ -20,3 +20,7 @@
++/* DuckDB static build: namespace this vendored JSON-C API to avoid clashes
++ * with other JSON libraries in the same process. */
++#define json_object_get gdal__json_object_get
++
+ #ifdef __GNUC__
+ #define JSON_C_CONST_FUNCTION(func) func __attribute__((const))
+ #else

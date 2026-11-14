@@ -1,0 +1,150 @@
+diff --git a/src/hnsw/hnsw_index.cpp b/src/hnsw/hnsw_index.cpp
+index 2ee0b66..722a441 100644
+--- a/src/hnsw/hnsw_index.cpp
++++ b/src/hnsw/hnsw_index.cpp
+@@ -336,7 +336,7 @@ unique_ptr<IndexScanState> HNSWIndex::InitializeScan(float *query_vector, idx_t
+ 
+ 	// Acquire a shared lock to search the index
+ 	auto lock = rwlock.GetSharedLock();
+-	auto search_result = [&]() {
++	auto run_search = [&]() {
+ 		if (!filter) {
+ 			return index.ef_search(query_vector, limit, ef_search);
+ 		}
+@@ -344,28 +344,54 @@ unique_ptr<IndexScanState> HNSWIndex::InitializeScan(float *query_vector, idx_t
+ 			return filter->Contains(key);
+ 		};
+ 		return index.filtered_ef_search(query_vector, limit, ef_search, predicate);
+-	}();
++	};
+ 
+-	state->current_row = 0;
+-	state->row_ids = make_uniq_array<row_t>(search_result.size());
+-	search_result.dump_to(state->row_ids.get());
++	unique_array<row_t> row_ids = nullptr;
++	idx_t result_count = 0;
++	{
++		// Copy results before a possible retry because usearch search results own a
++		// thread context that is reused by subsequent searches.
++		auto search_result = run_search();
++		result_count = search_result.size();
++		row_ids = make_uniq_array<row_t>(result_count);
++		search_result.dump_to(row_ids.get());
++	}
+ 
+ 	// The filtered search is expected to return only keys accepted by the
+ 	// predicate. Check the bitmap again before exposing row IDs to DuckDB so a
+-	// regression in the search library can underfill, but can never leak a row
+-	// that does not satisfy the pushed-down filters.
+-	if (filter) {
++	// regression in the search library can never leak a row that does not satisfy
++	// the pushed-down filters.
++	auto count_eligible_results = [&]() {
++		if (!filter) {
++			return result_count;
++		}
+ 		idx_t eligible_count = 0;
+-		for (idx_t result_idx = 0; result_idx < search_result.size(); result_idx++) {
+-			auto row_id = state->row_ids[result_idx];
+-			if (filter->Contains(row_id)) {
+-				state->row_ids[eligible_count++] = row_id;
++		for (idx_t result_idx = 0; result_idx < result_count; result_idx++) {
++			if (filter->Contains(row_ids[result_idx])) {
++				row_ids[eligible_count++] = row_ids[result_idx];
+ 			}
+ 		}
+-		state->total_rows = eligible_count;
+-	} else {
+-		state->total_rows = search_result.size();
++		return eligible_count;
++	};
++
++	auto eligible_count = count_eligible_results();
++	if (filter && filter->Count() >= limit && eligible_count < limit) {
++		// Approximate traversal can miss enough filtered nodes even with a large
++		// expansion. Recover the requested cardinality only on this underfill path.
++		auto predicate = [&](row_t key) {
++			return filter->Contains(key);
++		};
++		auto exact_result = index.filtered_ef_search(query_vector, limit, ef_search, predicate,
++		                                            USearchIndexType::any_thread(), true);
++		result_count = exact_result.size();
++		row_ids = make_uniq_array<row_t>(result_count);
++		exact_result.dump_to(row_ids.get());
++		eligible_count = count_eligible_results();
+ 	}
++
++	state->current_row = 0;
++	state->row_ids = std::move(row_ids);
++	state->total_rows = eligible_count;
+ 	return std::move(state);
+ }
+ 
+diff --git a/src/include/hnsw/hnsw_index.hpp b/src/include/hnsw/hnsw_index.hpp
+index 7fe5456..4883c87 100644
+--- a/src/include/hnsw/hnsw_index.hpp
++++ b/src/include/hnsw/hnsw_index.hpp
+@@ -34,14 +34,19 @@ struct HNSWFilterBitmap {
+ 	void Set(row_t row_id) {
+ 		D_ASSERT(row_id >= 0);
+ 		if (row_id >= MAX_ROW_ID) {
+-			local_row_ids.insert(row_id);
++			if (local_row_ids.insert(row_id).second) {
++				count++;
++			}
+ 			return;
+ 		}
+ 		auto bitmap_index = static_cast<idx_t>(row_id);
+ 		if (bitmap_index >= base_row_ids.size()) {
+ 			base_row_ids.resize(bitmap_index + 1);
+ 		}
+-		base_row_ids[bitmap_index] = true;
++		if (!base_row_ids[bitmap_index]) {
++			base_row_ids[bitmap_index] = true;
++			count++;
++		}
+ 	}
+ 
+ 	bool Contains(row_t row_id) const {
+@@ -55,9 +60,14 @@ struct HNSWFilterBitmap {
+ 		return bitmap_index < base_row_ids.size() && base_row_ids[bitmap_index];
+ 	}
+ 
++	idx_t Count() const {
++		return count;
++	}
++
+ private:
+ 	vector<bool> base_row_ids;
+ 	unordered_set<row_t> local_row_ids;
++	idx_t count = 0;
+ };
+ 
+ class HNSWIndex : public BoundIndex {
+diff --git a/test/sql/hnsw/hnsw_prefilter.test b/test/sql/hnsw/hnsw_prefilter.test
+index 30996e8..b12cbba 100644
+--- a/test/sql/hnsw/hnsw_prefilter.test
++++ b/test/sql/hnsw/hnsw_prefilter.test
+@@ -205,6 +205,12 @@ INSERT INTO many_items SELECT i, i >= 2500, [i, 0, 0]::FLOAT[3] FROM range(5000)
+ statement ok
+ CREATE INDEX many_items_vec_idx ON many_items USING HNSW (vec);
+ 
++# This multi-chunk filter has enough eligible rows for LIMIT. Even a large
++# approximate search can underfill on some graph topologies, so the exact retry
++# must recover the requested cardinality.
++statement ok
++SET hnsw_ef_search = 5000;
++
+ query II
+ EXPLAIN SELECT id FROM many_items WHERE eligible ORDER BY array_distance(vec, [0, 0, 0]::FLOAT[3]) LIMIT 10;
+ ----
+@@ -213,6 +219,9 @@ physical_plan	<REGEX>:.*HNSW_INDEX_SCAN.*
+ statement ok
+ CREATE TEMP TABLE many_items_result AS SELECT id, eligible FROM many_items WHERE eligible ORDER BY array_distance(vec, [0, 0, 0]::FLOAT[3]) LIMIT 10;
+ 
++statement ok
++RESET hnsw_ef_search;
++
+ query II
+ SELECT count(*), count(*) FILTER (WHERE NOT eligible) FROM many_items_result;
+ ----

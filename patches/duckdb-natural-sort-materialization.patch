@@ -1,0 +1,35 @@
+diff --git a/src/common/sort/natural_sort.cpp b/src/common/sort/natural_sort.cpp
+index 6f94b068..bc78e486 100644
+--- a/src/common/sort/natural_sort.cpp
++++ b/src/common/sort/natural_sort.cpp
+@@ -14,10 +14,9 @@ public:
+ 	atomic<idx_t> count;
+ 
+ 	unique_ptr<ColumnDataCollection> columns;
+-	atomic<idx_t> get_columns;
+ };
+ 
+-NaturalSortGroup::NaturalSortGroup(ClientContext &client) : count(0), get_columns(0) {
++NaturalSortGroup::NaturalSortGroup(ClientContext &client) : count(0) {
+ }
+ 
+ //===--------------------------------------------------------------------===//
+@@ -179,15 +178,10 @@ const NaturalSort::ChunkRows &NaturalSort::GetHashGroups(GlobalSourceState &gsta
+ 	return gsource.chunk_rows;
+ }
+ 
+-SourceResultType NaturalSort::MaterializeColumnData(ExecutionContext &execution, idx_t hash_bin,
+-                                                    OperatorSourceInput &source) const {
++SourceResultType NaturalSort::MaterializeColumnData(ExecutionContext &, idx_t hash_bin,
++                                                    OperatorSourceInput &) const {
+ 	D_ASSERT(hash_bin == 0);
+-	auto &gsource = source.global_state.Cast<NaturalSortGlobalSourceState>();
+-	auto &gsink = gsource.gsink;
+-	auto &hash_group = *gsink.hash_group;
+-
+-	// Hack: Only report finished for the first call
+-	return hash_group.get_columns++ ? SourceResultType::HAVE_MORE_OUTPUT : SourceResultType::FINISHED;
++	return SourceResultType::FINISHED;
+ }
+ 
+ NaturalSort::HashGroupPtr NaturalSort::GetColumnData(idx_t hash_bin, OperatorSourceInput &source) const {

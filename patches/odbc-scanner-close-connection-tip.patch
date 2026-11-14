@@ -1,0 +1,49 @@
+diff --git a/src/functions/odbc_query.cpp b/src/functions/odbc_query.cpp
+--- a/src/functions/odbc_query.cpp
++++ b/src/functions/odbc_query.cpp
+@@ -47,6 +47,6 @@ struct BindData {
+ 	int64_t conn_id = 0;
+-	QueryContext ctx;
++	mutable QueryContext ctx;
+ 
+ 	std::vector<ResultColumn> columns;
+ 
+ 	QueryOptions query_options;
+@@ -72,20 +72,26 @@
+ struct GlobalInitData {
+ 	int64_t conn_id;
+ 	std::unique_ptr<OdbcConnection> conn_ptr;
++	StmtHandlePtr &stmt_ptr;
+ 	bool close_connection = false;
+ 
+-	GlobalInitData(int64_t conn_id, std::unique_ptr<OdbcConnection> conn_ptr_in, bool close_connection_in, HSTMT stmt)
+-	    : conn_id(conn_id), conn_ptr(std::move(conn_ptr_in)), close_connection(close_connection_in) {
++	GlobalInitData(int64_t conn_id, std::unique_ptr<OdbcConnection> conn_ptr_in, bool close_connection_in,
++	               StmtHandlePtr &stmt_ptr_in)
++	    : conn_id(conn_id), conn_ptr(std::move(conn_ptr_in)), stmt_ptr(stmt_ptr_in),
++	      close_connection(close_connection_in) {
+ 		if (!conn_ptr) {
+ 			throw ScannerException("'odbc_query' error: ODBC connection not found on global init, id: " +
+ 			                       std::to_string(conn_id));
+ 		}
+-		CancellationRegistry::Add(conn_id, stmt);
++		CancellationRegistry::Add(conn_id, stmt_ptr.get());
+ 	}
+ 
+ 	~GlobalInitData() {
+ 		CancellationRegistry::Remove(conn_id);
+-		if (!close_connection) {
++		if (close_connection) {
++			// Release the statement before its parent connection is destroyed.
++			stmt_ptr.reset();
++		} else {
+ 			// We are not closing the connection, even in case of error,
+ 			// so need to return connection to registry
+ 			ConnectionsRegistry::Add(std::move(conn_ptr));
+@@ -196,5 +202,5 @@ static void GlobalInit(TableFunction::InitGlobalInput &input) {
+ 	// to not allow other threads operate on it or close it.
+ 	auto conn_ptr = ConnectionsRegistry::Remove(bdata.conn_id);
+ 	input.SetGlobalState<GlobalInitData>(bdata.conn_id, std::move(conn_ptr), bdata.query_options.close_connection,
+-	                                     bdata.ctx.hstmt());
++	                                     bdata.ctx.hstmt_ptr);
+ }

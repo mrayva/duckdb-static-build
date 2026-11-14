@@ -107,7 +107,7 @@ index d056a9d..80189fa 100644
 diff --git a/database-connector/src/functions/configure_pool.cpp b/database-connector/src/functions/configure_pool.cpp
 index e69b563..0ac9a34 100644
 --- a/database-connector/src/functions/configure_pool.cpp
-+++ b/database-connector/database-connector/src/functions/configure_pool.cpp
++++ b/database-connector/src/functions/configure_pool.cpp
 @@ -5,7 +5,7 @@ namespace functions {
  
  using namespace duckdb;
@@ -165,7 +165,7 @@ index e69b563..0ac9a34 100644
 diff --git a/database-connector/src/include/dbconnector/functions/configure_pool.hpp b/database-connector/src/include/dbconnector/functions/configure_pool.hpp
 index 66eb3f5..abfdbcb 100644
 --- a/database-connector/src/include/dbconnector/functions/configure_pool.hpp
-+++ b/database-connector/database-connector/src/include/dbconnector/functions/configure_pool.hpp
++++ b/database-connector/src/include/dbconnector/functions/configure_pool.hpp
 @@ -28,7 +28,7 @@ struct ConfigurePool {
  		std::pair<bool, bool> enable_reaper_thread;
  		std::pair<std::string, bool> health_check_query;

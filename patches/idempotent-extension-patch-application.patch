@@ -1,0 +1,27 @@
+diff --git a/scripts/apply_extension_patches.py b/scripts/apply_extension_patches.py
+index 54308d62..b4f074f9 100644
+--- a/scripts/apply_extension_patches.py
++++ b/scripts/apply_extension_patches.py
+@@ -41,6 +41,22 @@ if not patches:
+ 
+ current_dir = os.getcwd()
+ print(f"Applying patches at '{current_dir}'")
++
++# FetchContent can rerun its patch step on a source tree that already has the
++# full patch series applied. Preserve that tree (including generated local
++# files) instead of resetting and then misclassifying those files as edits.
++already_applied = all(
++    subprocess.run(
++        ["patch", "-R", "-p1", "--dry-run", "--silent", "-i", os.path.join(directory, patch)],
++        stdout=subprocess.DEVNULL,
++        stderr=subprocess.DEVNULL,
++    ).returncode == 0
++    for patch in patches
++)
++if already_applied:
++    print(f"All {len(patches)} patches are already applied; preserving the source tree")
++    sys.exit(0)
++
+ print(f"Resetting patches in {directory}\n")
+ 
+ # capture the current diff

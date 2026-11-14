@@ -1,0 +1,47 @@
+diff --git a/src/include/quack_storage.hpp b/src/include/quack_storage.hpp
+index 56fc8f6..7400bfb 100644
+--- a/src/include/quack_storage.hpp
++++ b/src/include/quack_storage.hpp
+@@ -35,6 +35,7 @@ public:
+ 	vector<ServerSnapshot> ListServers();
+ 	void RegisterClientConnection(const shared_ptr<QuackClientConnection> &connection);
+ 	void StopClientHeartbeats();
++	void StopServers();
+ 
+ 	static constexpr const char *STORAGE_EXTENSION_KEY = "quack";
+ 
+diff --git a/src/quack_extension.cpp b/src/quack_extension.cpp
+index fe236f0..e2e8894 100644
+--- a/src/quack_extension.cpp
++++ b/src/quack_extension.cpp
+@@ -299,7 +299,11 @@ static void LoadInternal(ExtensionLoader &loader) {
+ 	StorageExtension::Register(loader.GetDatabaseInstance().config, QuackStorageExtensionInfo::STORAGE_EXTENSION_KEY,
+ 	                           ext);
+ 	ExtensionCallbackManager::Get(loader.GetDatabaseInstance()).RegisterDatabaseShutdownCallback(
+-	    [](DatabaseInstance &db) { QuackStorageExtensionInfo::GetState(db).StopClientHeartbeats(); });
++	    [](DatabaseInstance &db) {
++		auto &state = QuackStorageExtensionInfo::GetState(db);
++		state.StopClientHeartbeats();
++		state.StopServers();
++	    });
+ 
+ 	// whoami() contract — register the table macro directly via the default-table-macro
+ 	// machinery so function resolution in the body is deferred to invocation time
+diff --git a/src/quack_storage.cpp b/src/quack_storage.cpp
+index 282d9b2..c8e468b 100644
+--- a/src/quack_storage.cpp
++++ b/src/quack_storage.cpp
+@@ -107,6 +107,13 @@ void QuackStorageExtensionInfo::StopClientHeartbeats() {
+ 	}
+ }
+ 
++void QuackStorageExtensionInfo::StopServers() {
++	std::lock_guard<std::mutex> lock(servers_mutex);
++	for (auto &entry : servers) {
++		entry.second->StopAccepting();
++	}
++}
++
+ bool QuackStorageExtensionInfo::StopServer(ClientContext &context, const QuackUri &listen_uri) {
+ 	unique_ptr<QuackServer> to_destroy;
+ 	{

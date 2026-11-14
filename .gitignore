@@ -1,0 +1,5 @@
+/out/
+/build/
+/.codegraph/
+/.codex
+*.orig

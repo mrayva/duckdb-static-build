@@ -1,0 +1,26 @@
+diff --git a/src/lance_storage.cpp b/src/lance_storage.cpp
+index 602a714..85ac4b8 100644
+--- a/src/lance_storage.cpp
++++ b/src/lance_storage.cpp
+@@ -1466,7 +1466,7 @@ public:
+       // An unsupported discovery operation can still expose known native
+       // entries without marking the default generator complete. Named child
+       // lookup continues to report the capability error.
+-      DuckCatalog::ScanSchemas(std::move(callback));
++      DuckCatalog::ScanSchemas(context, std::move(callback));
+       return;
+     }
+     DuckCatalog::ScanSchemas(context, std::move(callback));
+diff --git a/src/lance_table_entry.cpp b/src/lance_table_entry.cpp
+index 489248b..4fe4c74 100644
+--- a/src/lance_table_entry.cpp
++++ b/src/lance_table_entry.cpp
+@@ -354,7 +354,7 @@ unique_ptr<CatalogEntry> LanceTableEntry::AlterEntry(ClientContext &context,
+           default_binder->BindDefaultValue(
+               add.new_column, bound_defaults,
+               catalog.GetName().GetIdentifierName(),
+-              schema.name.GetIdentifierName());
++              schema.GetSchemaPath());
+           if (bound_defaults.size() != 1 || !bound_defaults[0]) {
+             throw InternalException(
+                 "DuckDB default binder returned an unexpected result");

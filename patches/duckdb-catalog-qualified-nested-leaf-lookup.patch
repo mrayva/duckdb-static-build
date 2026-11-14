@@ -1,0 +1,42 @@
+diff --git a/src/catalog/catalog.cpp b/src/catalog/catalog.cpp
+index 08da566b..df0c8cc3 100644
+--- a/src/catalog/catalog.cpp
++++ b/src/catalog/catalog.cpp
+@@ -709,7 +709,36 @@ vector<CatalogSearchEntry> GetCatalogEntries(CatalogEntryRetriever &retriever, c
+ 			}
+ 		}
+ 	} else if (IsInvalidSchema(schema)) {
+-		entries = search_path.GetEntriesForCatalog(catalog);
++		auto configured_entries = search_path.GetEntriesForCatalog(catalog);
++		for (auto &entry : configured_entries) {
++			entries.push_back(entry);
++			if (!entry.IsNested()) {
++				continue;
++			}
++			// A catalog-qualified name in a nested schema can also resolve through the leaf schema name.
++			// Keep the full nested path first, and do not add a fallback when the leaf schema is already
++			// explicitly present in the configured search path.
++			bool leaf_is_configured = false;
++			for (auto &candidate : configured_entries) {
++				if (!candidate.IsNested() && candidate.GetSchema() == entry.GetSchema()) {
++					leaf_is_configured = true;
++					break;
++				}
++			}
++			if (leaf_is_configured) {
++				continue;
++			}
++			bool leaf_was_added = false;
++			for (auto &candidate : entries) {
++				if (!candidate.IsNested() && candidate.GetSchema() == entry.GetSchema()) {
++					leaf_was_added = true;
++					break;
++				}
++			}
++			if (!leaf_was_added) {
++				entries.emplace_back(catalog, entry.GetSchema());
++			}
++		}
+ 		if (entries.empty()) {
+ 			auto catalog_entry = Catalog::GetCatalogEntry(context, catalog);
+ 			if (!catalog_entry) {

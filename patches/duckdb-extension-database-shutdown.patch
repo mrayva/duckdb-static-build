@@ -1,0 +1,79 @@
+diff --git a/src/include/duckdb/main/extension_callback_manager.hpp b/src/include/duckdb/main/extension_callback_manager.hpp
+index b22ca85d..ff032bed 100644
+--- a/src/include/duckdb/main/extension_callback_manager.hpp
++++ b/src/include/duckdb/main/extension_callback_manager.hpp
+@@ -14,6 +14,7 @@
+ #include "duckdb/common/shared_ptr.hpp"
+ #include "duckdb/common/vector.hpp"
+ #include "duckdb/common/case_insensitive_map.hpp"
++#include <functional>
+ 
+ namespace duckdb {
+ 
+@@ -35,6 +36,8 @@ class ExtensionCallbackIteratorHelper;
+ 
+ class ExtensionCallbackManager {
+ public:
++	using DatabaseShutdownCallback = std::function<void(DatabaseInstance &)>;
++
+ 	ExtensionCallbackManager();
+ 	~ExtensionCallbackManager();
+ 
+@@ -53,6 +56,8 @@ public:
+ 	void Register(shared_ptr<OperatorExtension> extension);
+ 	void Register(const string &name, shared_ptr<StorageExtension> extension);
+ 	void Register(shared_ptr<ExtensionCallback> extension);
++	void RegisterDatabaseShutdownCallback(DatabaseShutdownCallback callback);
++	void RunDatabaseShutdownCallbacks(DatabaseInstance &db) const;
+ 	void Register(const string &name, shared_ptr<ProfilerExtension> extension);
+ 
+ 	ExtensionCallbackIteratorHelper<shared_ptr<OperatorExtension>> OperatorExtensions() const;
+diff --git a/src/main/database.cpp b/src/main/database.cpp
+index 7694ac81..ab617b93 100644
+--- a/src/main/database.cpp
++++ b/src/main/database.cpp
+@@ -94,6 +94,7 @@ ParserCache &DatabaseInstance::GetParserCache() {
+ }
+ 
+ DatabaseInstance::~DatabaseInstance() {
++	ExtensionCallbackManager::Get(*this).RunDatabaseShutdownCallbacks(*this);
+ 	// destroy all attached databases
+ 	if (db_manager) {
+ 		db_manager->ResetDatabases();
+diff --git a/src/main/extension_callback_manager.cpp b/src/main/extension_callback_manager.cpp
+index 27706d5a..398382fb 100644
+--- a/src/main/extension_callback_manager.cpp
++++ b/src/main/extension_callback_manager.cpp
+@@ -31,6 +31,8 @@ struct ExtensionCallbackRegistry {
+ 	case_insensitive_map_t<shared_ptr<StorageExtension>> storage_extensions;
+ 	//! Set of callbacks that can be installed by extensions
+ 	vector<shared_ptr<ExtensionCallback>> extension_callbacks;
++	//! Cleanup hooks run before DatabaseInstance tears down its services.
++	vector<ExtensionCallbackManager::DatabaseShutdownCallback> database_shutdown_callbacks;
+ 	//! Pluggable profiler / EXPLAIN tree renderers, keyed by format name
+ 	case_insensitive_map_t<shared_ptr<ProfilerExtension>> profiler_extensions;
+ };
+@@ -146,6 +148,23 @@ void ExtensionCallbackManager::Register(shared_ptr<ExtensionCallback> extension)
+ 	PublishRegistry(std::move(new_registry));
+ }
+ 
++void ExtensionCallbackManager::RegisterDatabaseShutdownCallback(DatabaseShutdownCallback callback) {
++	if (!callback) {
++		throw InvalidInputException("Cannot register a null database-shutdown callback");
++	}
++	lock_guard<mutex> guard(registry_lock);
++	auto new_registry = CopyRegistry();
++	new_registry->database_shutdown_callbacks.push_back(std::move(callback));
++	PublishRegistry(std::move(new_registry));
++}
++
++void ExtensionCallbackManager::RunDatabaseShutdownCallbacks(DatabaseInstance &db) const {
++	auto registry = callback_registry.load();
++	for (auto &callback : registry->database_shutdown_callbacks) {
++		callback(db);
++	}
++}
++
+ void ExtensionCallbackManager::Register(const string &name, shared_ptr<ProfilerExtension> extension) {
+ 	lock_guard<mutex> guard(registry_lock);
+ 	auto new_registry = CopyRegistry();

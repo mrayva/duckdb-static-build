@@ -1,0 +1,54 @@
+diff --git a/test/sql/gdal/gdal_axis_order.test b/test/sql/gdal/gdal_axis_order.test
+index 2a3192b..734113d 100644
+--- a/test/sql/gdal/gdal_axis_order.test
++++ b/test/sql/gdal/gdal_axis_order.test
+@@ -15,7 +15,7 @@ COPY data TO '{TEST_DIR}/output.kml' WITH (FORMAT GDAL, DRIVER 'KML', SRS 'EPSG:
+ ----
+ Invalid Configuration Error: GDAL COPY TO with an SRS is sensitive to the coordinate axis order
+ 
+-# Explicitly use the authority-defined axis order
++# Explicitly select authority-axis mode; KML serializes coordinates as longitude,latitude.
+ statement ok
+ SET geometry_always_xy = false;
+ 
+@@ -27,9 +27,9 @@ COPY data TO '{TEST_DIR}/output.kml' WITH (FORMAT GDAL, DRIVER 'KML', SRS 'EPSG:
+ query I
+ select geom from st_read('{TEST_DIR}/output.kml');
+ ----
+ POINT (0 100)
+ 
+-# Tell DuckDB to ignore CRS authority and always consider coordinates in XY order
++# Explicitly select XY mode; the original x/y tuple is written as longitude,latitude.
+ statement ok
+ SET geometry_always_xy = true;
+ 
+diff --git a/test/sql/gdal/gdal_read.test b/test/sql/gdal/gdal_read.test
+index ee59d43..17a390a 100644
+--- a/test/sql/gdal/gdal_read.test
++++ b/test/sql/gdal/gdal_read.test
+@@ -12,7 +12,10 @@ SELECT COUNT(*) FROM st_read('{WORKING_DIRECTORY}/test/data/amsterdam_roads.fgb'
+ 870
+ 
+ statement ok
+-CREATE TABLE roads1 AS SELECT * FROM st_read('{WORKING_DIRECTORY}/test/data/amsterdam_roads.fgb') LIMIT 50;
++CREATE TABLE roads1 AS
++SELECT kind, ST_SetCRS(ST_Transform(geom, 'EPSG:3857', 'EPSG:4326'), 'EPSG:4326') AS geom
++FROM st_read('{WORKING_DIRECTORY}/test/data/amsterdam_roads.fgb')
++LIMIT 50;
+ 
+ # Test Copy
+ statement ok
+@@ -28,10 +31,10 @@ SELECT COUNT(*) FROM st_read('{WORKING_DIRECTORY}/test/data/amsterdam_roads_50.g
+ statement ok
+ CREATE TABLE roads2 AS SELECT * FROM st_read('{WORKING_DIRECTORY}/test/data/amsterdam_roads_50.geojson');
+ 
+-# GDAL I/O should preserve order, so this is safe
+-# Compare that the two tables are identical even though they were round-tripped through GDAL
++# GeoJSON uses EPSG:4326 and rounds coordinates to its configured precision.
++# Compare the round-tripped geometry within that serialization precision.
+ query I
+-SELECT bool_and(roads1.kind = roads2.kind) = bool_and(roads1.geom = roads2.geom)
++SELECT bool_and(roads1.kind = roads2.kind) AND bool_and(ST_DWithin(roads1.geom, roads2.geom, 1e-7))
+ FROM roads1 JOIN roads2 on roads1.rowid = roads2.rowid;
+ ----
+ true

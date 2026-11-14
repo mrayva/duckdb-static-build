@@ -1,0 +1,21 @@
+diff --git a/tools/cpp/CMakeLists.txt b/tools/cpp/CMakeLists.txt
+index 6cf0a369..24040387 100644
+--- a/tools/cpp/CMakeLists.txt
++++ b/tools/cpp/CMakeLists.txt
+@@ -5,7 +5,9 @@
+ 
+ add_library(duckdb_cpp_api STATIC duckdb_cpp.cpp)
+ target_include_directories(
+-  duckdb_cpp_api PUBLIC $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}>)
++  duckdb_cpp_api
++  PUBLIC $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}>
++         $<INSTALL_INTERFACE:${INSTALL_INCLUDE_DIR}>)
+ set_target_properties(duckdb_cpp_api PROPERTIES CXX_VISIBILITY_PRESET hidden
+                                                 VISIBILITY_INLINES_HIDDEN ON)
+ 
+@@ -36,3 +38,5 @@ install(
+   EXPORT "${DUCKDB_EXPORT_SET}"
+   LIBRARY DESTINATION "${INSTALL_LIB_DIR}"
+   ARCHIVE DESTINATION "${INSTALL_LIB_DIR}")
++install(FILES duckdb_cpp.hpp duckdb_cpp_extension.hpp
++        DESTINATION "${INSTALL_INCLUDE_DIR}")

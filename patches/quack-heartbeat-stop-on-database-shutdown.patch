@@ -1,0 +1,117 @@
+diff --git a/src/include/quack_storage.hpp b/src/include/quack_storage.hpp
+index 354b93c..56fc8f6 100644
+--- a/src/include/quack_storage.hpp
++++ b/src/include/quack_storage.hpp
+@@ -7,6 +7,7 @@
+ namespace duckdb {
+ 
+ class DatabaseInstance;
++class QuackClientConnection;
+ 
+ class QuackStorageExtension : public StorageExtension {
+ public:
+@@ -32,11 +33,16 @@ public:
+ 
+ 	vector<QuackConnectionSnapshot> GetActiveConnectionSnaps();
+ 	vector<ServerSnapshot> ListServers();
++	void RegisterClientConnection(const shared_ptr<QuackClientConnection> &connection);
++	void StopClientHeartbeats();
+ 
+ 	static constexpr const char *STORAGE_EXTENSION_KEY = "quack";
+ 
+ private:
+ 	std::mutex servers_mutex;
+ 	unordered_map<string, unique_ptr<QuackServer>> servers;
++	std::mutex client_connections_mutex;
++	vector<weak_ptr<QuackClientConnection>> client_connections;
++	atomic<bool> shutting_down {false};
+ };
+ } // namespace duckdb
+diff --git a/src/quack_client.cpp b/src/quack_client.cpp
+index b9e6aa8..98b65d6 100644
+--- a/src/quack_client.cpp
++++ b/src/quack_client.cpp
+@@ -15,6 +15,7 @@
+ #include "quack_client.hpp"
+ #include "quack_secret.hpp"
+ #include "quack_session_state.hpp"
++#include "quack_storage.hpp"
+ #include "quack_uri.hpp"
+ 
+ namespace duckdb {
+@@ -452,6 +453,7 @@ shared_ptr<QuackClientConnection> QuackClient::ConnectToServer(ClientContext &co
+ 	    make_shared_ptr<QuackClientConnection>(*context.db, std::move(client), server_uri, std::move(connection_id),
+ 	                                           accepted_heartbeat_timeout_seconds, pool_size);
+ 	connection->StartHeartbeat();
++	QuackStorageExtensionInfo::GetState(*context.db).RegisterClientConnection(connection);
+ 	return connection;
+ }
+ 
+diff --git a/src/quack_extension.cpp b/src/quack_extension.cpp
+index 23e1162..fe236f0 100644
+--- a/src/quack_extension.cpp
++++ b/src/quack_extension.cpp
+@@ -11,6 +11,7 @@
+ #include "duckdb/main/extension_helper.hpp"
+ #include "duckdb/main/secret/secret.hpp"
+ #include "duckdb/main/secret/secret_manager.hpp"
++#include "duckdb/main/extension_callback_manager.hpp"
+ #include "duckdb/parser/parser.hpp"
+ #include "duckdb/storage/storage_extension.hpp"
+ #include "storage/quack_optimizer.hpp"
+@@ -297,6 +298,8 @@ static void LoadInternal(ExtensionLoader &loader) {
+ 	ext->storage_info = duckdb::make_uniq<QuackStorageExtensionInfo>();
+ 	StorageExtension::Register(loader.GetDatabaseInstance().config, QuackStorageExtensionInfo::STORAGE_EXTENSION_KEY,
+ 	                           ext);
++	ExtensionCallbackManager::Get(loader.GetDatabaseInstance()).RegisterDatabaseShutdownCallback(
++	    [](DatabaseInstance &db) { QuackStorageExtensionInfo::GetState(db).StopClientHeartbeats(); });
+ 
+ 	// whoami() contract — register the table macro directly via the default-table-macro
+ 	// machinery so function resolution in the body is deferred to invocation time
+diff --git a/src/quack_storage.cpp b/src/quack_storage.cpp
+index 599fac2..282d9b2 100644
+--- a/src/quack_storage.cpp
++++ b/src/quack_storage.cpp
+@@ -1,4 +1,5 @@
+ #include <thread>
++#include <algorithm>
+ 
+ #include "duckdb/common/exception/binder_exception.hpp"
+ #include "duckdb/common/unordered_set.hpp"
+@@ -76,6 +77,36 @@ vector<QuackConnectionSnapshot> QuackStorageExtensionInfo::GetActiveConnectionSn
+ 	return result;
+ }
+ 
++void QuackStorageExtensionInfo::RegisterClientConnection(const shared_ptr<QuackClientConnection> &connection) {
++	std::lock_guard<std::mutex> lock(client_connections_mutex);
++	if (shutting_down) {
++		connection->StopHeartbeat();
++		return;
++	}
++	client_connections.erase(
++	    std::remove_if(client_connections.begin(), client_connections.end(),
++	                   [](const weak_ptr<QuackClientConnection> &entry) { return entry.expired(); }),
++	    client_connections.end());
++	client_connections.push_back(connection);
++}
++
++void QuackStorageExtensionInfo::StopClientHeartbeats() {
++	vector<shared_ptr<QuackClientConnection>> connections;
++	{
++		std::lock_guard<std::mutex> lock(client_connections_mutex);
++		shutting_down = true;
++		for (auto &entry : client_connections) {
++			if (auto connection = entry.lock()) {
++				connections.push_back(std::move(connection));
++			}
++		}
++		client_connections.clear();
++	}
++	for (auto &connection : connections) {
++		connection->StopHeartbeat();
++	}
++}
++
+ bool QuackStorageExtensionInfo::StopServer(ClientContext &context, const QuackUri &listen_uri) {
+ 	unique_ptr<QuackServer> to_destroy;
+ 	{

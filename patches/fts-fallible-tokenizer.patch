@@ -1,0 +1,12 @@
+diff --git a/src/fts_tokenizer.cpp b/src/fts_tokenizer.cpp
+index 3a7ba27..4b42e08 100644
+--- a/src/fts_tokenizer.cpp
++++ b/src/fts_tokenizer.cpp
+@@ -380,6 +380,7 @@ template <bool WITH_OFFSETS> static ScalarFunction GetTokenizeFunction() {
+       {LogicalType::VARCHAR, LogicalType::VARCHAR, LogicalType::VARCHAR,
+        LogicalType::BOOLEAN, LogicalType::BOOLEAN},
+       LogicalType::LIST(element_type), TokenizeFunction<WITH_OFFSETS>);
++  function.SetFallible();
+   function.SetNullHandling(FunctionNullHandling::SPECIAL_HANDLING);
+   function.SetInitStateCallback(InitTokenizeState);
+   return function;

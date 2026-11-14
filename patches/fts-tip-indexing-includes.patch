@@ -1,0 +1,16 @@
+diff --git a/src/fts_indexing.cpp b/src/fts_indexing.cpp
+--- a/src/fts_indexing.cpp
++++ b/src/fts_indexing.cpp
+@@ -4,1 +4,2 @@
+ #include "fts_index_maintenance.hpp"
++#include "duckdb/catalog/catalog.hpp"
+diff --git a/src/include/fts_indexing.hpp b/src/include/fts_indexing.hpp
+--- a/src/include/fts_indexing.hpp
++++ b/src/include/fts_indexing.hpp
+@@ -9,6 +9,7 @@
+ #pragma once
+ 
+ #include "duckdb/main/client_context.hpp"
++#include "duckdb/function/function.hpp"
+ 
+ namespace duckdb {

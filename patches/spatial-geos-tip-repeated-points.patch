@@ -1,0 +1,51 @@
+diff --git a/src/spatial/modules/geos/geos_geometry.hpp b/src/spatial/modules/geos/geos_geometry.hpp
+index d426c8a..18cc4b4 100644
+--- a/src/spatial/modules/geos/geos_geometry.hpp
++++ b/src/spatial/modules/geos/geos_geometry.hpp
+@@ -537,7 +537,45 @@ inline GeosGeometry GeosGeometry::get_simplified_topo(double tolerance) const {
+ }
+ 
+ inline GeosGeometry GeosGeometry::get_without_repeated_points(double tolerance) const {
+-	const auto simplified = GEOSRemoveRepeatedPoints_r(handle, geom, tolerance);
++	auto simplified = GEOSRemoveRepeatedPoints_r(handle, geom, tolerance);
++	// Keep the endpoint contract when GEOS collapses a non-empty line at a large tolerance.
++	if (simplified && GEOSGeomTypeId_r(handle, geom) == GEOS_LINESTRING && GEOSisEmpty_r(handle, geom) == 0 &&
++	    GEOSisEmpty_r(handle, simplified) == 1) {
++		const auto *input_seq = GEOSGeom_getCoordSeq_r(handle, geom);
++		unsigned int vertex_count = 0;
++		if (input_seq && GEOSCoordSeq_getSize_r(handle, input_seq, &vertex_count) && vertex_count >= 2) {
++			auto *mutable_input_seq = const_cast<GEOSCoordSequence *>(input_seq);
++			const auto has_z = GEOSCoordSeq_hasZ_r(handle, mutable_input_seq) == 1;
++			const auto has_m = GEOSCoordSeq_hasM_r(handle, mutable_input_seq) == 1;
++			if (!has_m || has_z) {
++				const auto dimensions = 2 + static_cast<unsigned int>(has_z) + static_cast<unsigned int>(has_m);
++				auto *output_seq = GEOSCoordSeq_createWithDimensions_r(handle, 2, has_z, has_m);
++				bool copied = output_seq != nullptr;
++				for (unsigned int output_idx = 0; copied && output_idx < 2; output_idx++) {
++					const auto input_idx = output_idx == 0 ? 0 : vertex_count - 1;
++					for (unsigned int dim = 0; dim < dimensions; dim++) {
++						double ordinate;
++						if (!GEOSCoordSeq_getOrdinate_r(handle, input_seq, input_idx, dim, &ordinate) ||
++						    !GEOSCoordSeq_setOrdinate_r(handle, output_seq, output_idx, dim, ordinate)) {
++							copied = false;
++							break;
++						}
++					}
++				}
++				if (copied) {
++					auto *preserved_endpoints = GEOSGeom_createLineString_r(handle, output_seq);
++					if (preserved_endpoints) {
++						GEOSGeom_destroy_r(handle, simplified);
++						simplified = preserved_endpoints;
++					} else {
++						GEOSCoordSeq_destroy_r(handle, output_seq);
++					}
++				} else if (output_seq) {
++					GEOSCoordSeq_destroy_r(handle, output_seq);
++				}
++			}
++		}
++	}
+ 	return GeosGeometry(handle, simplified);
+ }
+ 

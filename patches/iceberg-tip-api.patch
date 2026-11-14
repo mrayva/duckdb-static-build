@@ -88,15 +88,9 @@ diff --git a/src/include/iceberg_options.hpp b/src/include/iceberg_options.hpp
 diff --git a/src/include/planning/iceberg_multi_file_reader.hpp b/src/include/planning/iceberg_multi_file_reader.hpp
 --- a/src/include/planning/iceberg_multi_file_reader.hpp
 +++ b/src/include/planning/iceberg_multi_file_reader.hpp
-@@ -94,7 +94,7 @@
- 	IcebergMultiFileReader(shared_ptr<TableFunctionInfo> function_info);
- 
- public:
+@@ -97,1 +97,1 @@
 -	static unique_ptr<MultiFileReader> CreateInstance(const BoundTableFunction &table);
 +	static unique_ptr<MultiFileReader> CreateInstance(const TableFunction &table);
- 	static OpenFileInfo FileInfo(const string &path, const string &format, int64_t size, optional<int64_t> first_row_id,
- 	                             optional<int64_t> sequence_number);
- 	static vector<PartitionStatistics> IcebergGetPartitionStats(ClientContext &context, GetPartitionStatsInput &input);
 diff --git a/src/include/planning/metadata_io/avro/iceberg_avro_multi_file_reader.hpp b/src/include/planning/metadata_io/avro/iceberg_avro_multi_file_reader.hpp
 --- a/src/include/planning/metadata_io/avro/iceberg_avro_multi_file_reader.hpp
 +++ b/src/include/planning/metadata_io/avro/iceberg_avro_multi_file_reader.hpp

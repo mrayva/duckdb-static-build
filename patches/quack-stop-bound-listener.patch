@@ -1,0 +1,22 @@
+diff --git a/src/quack_http_server.cpp b/src/quack_http_server.cpp
+index 5ac96c0..bdfe5c7 100644
+--- a/src/quack_http_server.cpp
++++ b/src/quack_http_server.cpp
+@@ -139,13 +139,10 @@ void HttpQuackServer::StopAccepting() {
+ 	// Closes the listening socket only. Idempotent. Safe to call from a
+ 	// request-handler thread.
+ 	lock_guard<mutex> guard(state_lock);
+-	if (server_state == QuackServerState::RUNNING) {
+-		// server is running - stop it and decommission
+-		server->wait_until_ready();
+-		server->stop();
+-		server->decommission();
+-	}
+-	// close the server
++	// The socket is bound before the listener thread marks itself RUNNING. Close it in
++	// WAITING_TO_START too, or a concurrent stop can leak the bound descriptor.
++	server->stop();
++	server->decommission();
+ 	server_state = QuackServerState::CLOSED;
+ }
+ 

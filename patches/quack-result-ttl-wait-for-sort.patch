@@ -1,0 +1,14 @@
+diff --git a/test/sql/result_ttl_releases_query.test b/test/sql/result_ttl_releases_query.test
+index 800135d..9616d1f 100644
+--- a/test/sql/result_ttl_releases_query.test
++++ b/test/sql/result_ttl_releases_query.test
+@@ -33,6 +33,9 @@ CREATE SECRET (TYPE quack, TOKEN 'asdf');
+ statement ok
+ PREPARE p AS SELECT count(*) FROM quack_query({server}, 'SELECT * FROM big ORDER BY s', token=>'asdf');
+ 
++# PREPARE returns after the first batch, while the server-side sort continues asynchronously.
++sleep 1 seconds
++
+ # The sort's payload is held by the query behind that tail.
+ query I quack_db:quack_server_con
+ SELECT memory_usage_bytes > 0 FROM duckdb_memory() WHERE tag = 'ORDER_BY';

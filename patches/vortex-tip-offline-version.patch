@@ -1,0 +1,7 @@
+diff --git a/CMakeLists.txt b/CMakeLists.txt
+--- a/CMakeLists.txt
++++ b/CMakeLists.txt
+@@ -102 +102,2 @@
+-        message(FATAL_ERROR "failed getting tags for vortex-duckdb")
++        message(WARNING "failed getting Vortex tags; using pinned commit")
++        set(VORTEX_REMOTE_TAGS "")

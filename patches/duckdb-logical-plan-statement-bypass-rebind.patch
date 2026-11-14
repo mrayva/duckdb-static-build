@@ -1,0 +1,17 @@
+diff --git a/src/main/client_context.cpp b/src/main/client_context.cpp
+index 32183998..c734aef5 100644
+--- a/src/main/client_context.cpp
++++ b/src/main/client_context.cpp
+@@ -363,6 +363,12 @@ shared_ptr<PreparedStatementData> ClientContext::CreatePreparedStatementInternal
+ shared_ptr<PreparedStatementData> ClientContext::CreatePreparedStatement(ClientContextLock &lock,
+                                                                          unique_ptr<SQLStatement> statement,
+                                                                          const QueryParameters &parameters) {
++	// A logical plan is already bound and may hold non-serializable or stateful operators. Client-state
++	// rebind hooks apply to SQL statements before planning, not to this internal, already-planned form.
++	if (statement->type == StatementType::LOGICAL_PLAN_STATEMENT) {
++		return CreatePreparedStatementInternal(lock, std::move(statement), parameters);
++	}
++
+ 	// check if any client context state could request a rebind
+ 	bool can_request_rebind = false;
+ 	for (auto &state : registered_state->States()) {

@@ -8,14 +8,46 @@ set -euo pipefail
 #   Options:
 #     --vcpkg-dir DIR    Path to vcpkg installation (default: ~/vcpkg)
 #     --duckdb-dir DIR   Path to DuckDB source (default: ~/duckdbsrc)
-#     --openivm-dir DIR  Build OpenIVM from this checkout as a loadable extension
-#     --duckdbsp-dir DIR Build DuckDBSP from this checkout as a loadable extension
+#     --vss-dir DIR      Build VSS from this source checkout
+#     --lance-dir DIR    Build Lance from this source checkout
+#     --vortex-dir DIR   Build Vortex from this source checkout
 #     --ducklake-dir DIR Build DuckLake from this checkout instead of FetchContent
+#     --iceberg-dir DIR  Build Iceberg from this source checkout instead of FetchContent
+#     --encodings-dir DIR Build the DuckDB encodings extension from this checkout
 #     --clean-dirty-deps Remove modified FetchContent checkouts before configuring
+#     --refresh-extension-tips  Resolve extension GIT_TAGs to moving upstream HEADs
 #     --skip-vcpkg       Skip vcpkg dependency installation
+#     --jobs N           Limit parallel build jobs (default: nproc)
 #     --clean            Clean build before starting
 #     --with-spatial     Include spatial as a statically-linked extension
 #     --help             Show this help
+
+usage() {
+    cat <<'USAGE'
+DuckDB Static Build Script
+Build DuckDB and the configured built-in extensions at the revisions in build.lock.
+
+Usage: ./build-duckdb-static.sh [options]
+  --vcpkg-dir DIR       Path to vcpkg (default: ~/vcpkg)
+  --duckdb-dir DIR      Path to DuckDB source (default: ~/duckdbsrc)
+  --refresh-extension-tips
+                        Resolve configured extension refs to moving upstream HEADs
+  --vss-dir DIR         Build VSS from this source checkout
+  --lance-dir DIR       Build Lance from this source checkout
+  --vortex-dir DIR      Build Vortex from this source checkout
+  --ducklake-dir DIR    Build DuckLake from this checkout instead of FetchContent
+  --iceberg-dir DIR     Build Iceberg from this source checkout instead of FetchContent
+  --encodings-dir DIR   Build encodings from this source checkout
+  --clean-dirty-deps    Remove modified FetchContent checkouts before configuring
+  --skip-vcpkg          Skip vcpkg dependency installation
+  --jobs N              Limit parallel build jobs (default: nproc)
+  --clean               Clean build before starting
+  --with-spatial        Include Spatial as a statically linked extension
+  --help                Show this help
+
+Tip refreshes are intentionally non-reproducible. See build.lock for pinned revisions.
+USAGE
+}
 
 # Colors for output
 RED='\033[0;31m'
@@ -27,16 +59,25 @@ NC='\033[0m' # No Color
 # Default paths
 VCPKG_DIR="$HOME/vcpkg"
 DUCKDB_DIR="$HOME/duckdbsrc"
-OPENIVM_DIR=${OPENIVM_DIR:-}
-DUCKDBSP_DIR=${DUCKDBSP_DIR:-}
+VSS_DIR=${VSS_DIR:-}
+LANCE_DIR=${LANCE_DIR:-}
+VORTEX_DIR=${VORTEX_DIR:-}
 DUCKLAKE_DIR=${DUCKLAKE_DIR:-}
+ENCODINGS_DIR=${ENCODINGS_DIR:-}
 BUILD_SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+BUILD_LOCK_FILE="$BUILD_SCRIPT_DIR/build.lock"
 SKIP_VCPKG=false
 CLEAN_BUILD=false
 WITH_SPATIAL=false
 CLEAN_DIRTY_DEPS=false
+REFRESH_EXTENSION_TIPS=false
+BUILD_JOBS=${BUILD_JOBS:-}
 ICEBERG_SOURCE_DIR=${ICEBERG_SOURCE_DIR:-}
 ICEBERG_FALLBACK_DIR=${ICEBERG_FALLBACK_DIR:-/tmp/duckdb-iceberg-src}
+LOCKED_DUCKDB_REF=""
+LOCKED_VCPKG_REF=""
+LOCKED_ICEBERG_REF=""
+declare -A LOCKED_EXTENSION_REFS=()
 
 # Keep unavailable GitHub endpoints from blocking a build indefinitely. These
 # settings apply both to the script's Git operations and to CMake FetchContent.
@@ -53,6 +94,75 @@ git_network() {
         -c "http.connectTimeout=$GIT_HTTP_CONNECT_TIMEOUT" \
         -c "http.lowSpeedLimit=$GIT_HTTP_LOW_SPEED_LIMIT" \
         -c "http.lowSpeedTime=$GIT_HTTP_LOW_SPEED_TIME" "$@"
+}
+
+load_build_lock() {
+    local key value
+    if [ ! -f "$BUILD_LOCK_FILE" ]; then
+        echo "[ERROR] Build lock file not found: $BUILD_LOCK_FILE" >&2
+        exit 1
+    fi
+    while IFS='=' read -r key value; do
+        [[ -z "$key" || "$key" == \#* ]] && continue
+        case "$key" in
+            duckdb_ref) LOCKED_DUCKDB_REF="$value" ;;
+            vcpkg_ref) LOCKED_VCPKG_REF="$value" ;;
+            iceberg_ref) LOCKED_ICEBERG_REF="$value" ;;
+            extension.*) LOCKED_EXTENSION_REFS["${key#extension.}"]="$value" ;;
+            *) echo "[ERROR] Unknown build.lock key: $key" >&2; exit 1 ;;
+        esac
+        if [[ ! "$value" =~ ^[[:xdigit:]]{40}$ ]]; then
+            echo "[ERROR] Invalid 40-character commit in build.lock: $key=$value" >&2
+            exit 1
+        fi
+    done < "$BUILD_LOCK_FILE"
+    if [ -z "$LOCKED_DUCKDB_REF" ] || [ -z "$LOCKED_VCPKG_REF" ] || [ -z "$LOCKED_ICEBERG_REF" ]; then
+        echo "[ERROR] build.lock must define duckdb_ref, vcpkg_ref, and iceberg_ref" >&2
+        exit 1
+    fi
+}
+
+prepare_pinned_checkout() {
+    local repo_dir="$1"
+    local repo_url="$2"
+    local expected_ref="$3"
+    local label="$4"
+    local actual_ref
+
+    if [ ! -e "$repo_dir" ]; then
+        mkdir -p "$(dirname "$repo_dir")"
+        git init --quiet "$repo_dir"
+        git -C "$repo_dir" remote add origin "$repo_url"
+        git_network -C "$repo_dir" fetch --depth 1 origin "$expected_ref"
+        git -C "$repo_dir" checkout --quiet --detach FETCH_HEAD
+    fi
+    if ! actual_ref=$(git -C "$repo_dir" rev-parse --verify HEAD 2>/dev/null); then
+        echo "[ERROR] $label path is not a Git checkout: $repo_dir" >&2
+        exit 1
+    fi
+    if [ "$actual_ref" != "$expected_ref" ]; then
+        echo "[ERROR] $label checkout at $repo_dir is $actual_ref; build.lock requires $expected_ref." >&2
+        echo "        Use a separate clean checkout or intentionally update build.lock; existing files were left untouched." >&2
+        exit 1
+    fi
+}
+
+apply_extension_lock() {
+    local extension config ref
+    for extension in "${!LOCKED_EXTENSION_REFS[@]}"; do
+        config="$DUCKDB_DIR/.github/config/extensions/$extension.cmake"
+        ref="${LOCKED_EXTENSION_REFS[$extension]}"
+        if [ ! -f "$config" ]; then
+            echo "[ERROR] Locked extension config not found: $config" >&2
+            exit 1
+        fi
+        if grep -qE '^[[:space:]]*GIT_TAG[[:space:]]+' "$config"; then
+            sed -i -E "0,/^([[:space:]]*GIT_TAG[[:space:]]+)[^[:space:]]+/s//\\1$ref/" "$config"
+        elif [ "$extension" != iceberg ]; then
+            echo "[ERROR] No GIT_TAG in locked extension config: $config" >&2
+            exit 1
+        fi
+    done
 }
 
 export GIT_CONFIG_PARAMETERS="'http.connectTimeout=$GIT_HTTP_CONNECT_TIMEOUT' 'http.lowSpeedLimit=$GIT_HTTP_LOW_SPEED_LIMIT' 'http.lowSpeedTime=$GIT_HTTP_LOW_SPEED_TIME'"
@@ -113,6 +223,11 @@ apply_patch_if_needed() {
     local patch_file="$2"
     local label="$3"
 
+    if [ ! -f "$patch_file" ]; then
+        log_error "$label patch input is missing: $patch_file"
+        return 1
+    fi
+
     if git -C "$repo_dir" apply --check "$patch_file" >/dev/null 2>&1; then
         git -C "$repo_dir" apply "$patch_file"
         log_success "$label applied"
@@ -124,8 +239,8 @@ apply_patch_if_needed() {
         return 0
     fi
 
-    log_warning "$label no longer matches upstream tree; skipping"
-    return 0
+    log_error "$label patch does not apply to the pinned DuckDB checkout: $patch_file"
+    return 1
 }
 
 apply_patch_series_to_source_dir() {
@@ -147,8 +262,9 @@ apply_patch_series_to_source_dir() {
     done < <(find "$patch_dir" -maxdepth 1 -type f -name '*.patch' | sort)
 
     if [ ${#patches[@]} -eq 0 ]; then
-        log_error "No patch files found for $label in $patch_dir"
-        exit 1
+        rm -f "$stamp_file"
+        log_info "$label source needs no local compatibility patches"
+        return 0
     fi
 
     patch_fingerprint=$(cat "${patches[@]}" | sha256sum | awk '{print $1}')
@@ -195,14 +311,226 @@ sync_iceberg_tip_api_patch() {
     local patch_dir="$2"
     local patch_file="$patch_dir/0004-duckdb-tip-api.patch"
 
+    if grep -Fq 'named_argument_map_t named_parameters' "$DUCKDB_DIR/src/include/duckdb/function/function.hpp" 2>/dev/null && \
+        grep -Fq 'class BoundTableFunction' "$DUCKDB_DIR/src/include/duckdb/function/table_function.hpp" 2>/dev/null; then
+        rm -f "$patch_file"
+        log_info "Skipping Iceberg legacy function API patch; DuckDB tip already exposes the bound-function APIs"
+        return
+    fi
+
     if [ -d "$source_dir/src" ] && \
-        grep -REq '(^|[^[:alnum:]_])(named_argument_map_t|BoundTableFunction)([^[:alnum:]_]|$)' \
+        patch -d "$source_dir" -R -p1 --dry-run \
+            < "$BUILD_SCRIPT_DIR/patches/iceberg-tip-api.patch" >/dev/null 2>&1; then
+        cp "$BUILD_SCRIPT_DIR/patches/iceberg-tip-api.patch" "$patch_file"
+        log_success "Preserving already-applied Iceberg API compatibility patch"
+    elif [ -d "$source_dir/src" ] && \
+        grep -REq --exclude='*.orig' '(^|[^[:alnum:]_])(named_argument_map_t|BoundTableFunction)([^[:alnum:]_]|$)' \
             "$source_dir/src"; then
         cp "$BUILD_SCRIPT_DIR/patches/iceberg-tip-api.patch" "$patch_file"
         log_success "Configured Iceberg API compatibility patch for legacy source"
     else
         rm -f "$patch_file"
         log_info "Skipping Iceberg API compatibility patch; source already uses current table-function APIs"
+    fi
+}
+
+sync_iceberg_tip_semantics_patch() {
+    local source_dir="$1"
+    local patch_dir="$2"
+    local patch_file="$patch_dir/0006-duckdb-tip-semantics.patch"
+
+    if grep -Fq 'RedactHttpLogsSetting' "$DUCKDB_DIR/src/include/duckdb/main/settings.hpp" 2>/dev/null && \
+        grep -Fq 'Parser(ClientContext &context)' "$DUCKDB_DIR/src/include/duckdb/parser/parser.hpp" 2>/dev/null && \
+        grep -Fq 'vector<Identifier> column_path' "$DUCKDB_DIR/src/include/duckdb/parser/parsed_data/alter_table_info.hpp" 2>/dev/null && \
+        grep -Fq 'ExecuteTaskStep()' "$DUCKDB_DIR/src/include/duckdb/parallel/task_executor.hpp" 2>/dev/null; then
+        rm -f "$patch_file"
+        log_info "Skipping Iceberg old semantics patch; DuckDB tip retains context, path, redaction, and incremental-task APIs"
+        return
+    fi
+
+    if [ -d "$source_dir/src" ] && \
+        patch -d "$source_dir" -R -p1 --dry-run \
+            < "$BUILD_SCRIPT_DIR/patches/iceberg-tip-semantics.patch" >/dev/null 2>&1; then
+        cp "$BUILD_SCRIPT_DIR/patches/iceberg-tip-semantics.patch" "$patch_file"
+        log_success "Preserving already-applied Iceberg semantics compatibility patch"
+    elif [ -d "$source_dir/src" ] && \
+        grep -REq --exclude='*.orig' 'RedactHttpLogsSetting|Parser parser\(context\)|change_type_info\.column_path|set_default_info\.column_path|change\.column_path' \
+            "$source_dir/src"; then
+        cp "$BUILD_SCRIPT_DIR/patches/iceberg-tip-semantics.patch" "$patch_file"
+        log_success "Configured Iceberg DuckDB settings/parser/alter API compatibility patch"
+    else
+        rm -f "$patch_file"
+        log_info "Skipping Iceberg semantics patch; source already uses current APIs"
+    fi
+}
+
+sync_iceberg_tip_helper_api_patch() {
+    local source_dir="$1"
+    local patch_dir="$2"
+    local patch_file="$patch_dir/0007-duckdb-tip-helper-api.patch"
+
+    if grep -Fq 'CanAutoloadExtension(DatabaseInstance &db' \
+        "$DUCKDB_DIR/src/include/duckdb/main/extension_helper.hpp" 2>/dev/null; then
+        rm -f "$patch_file"
+        log_info "Skipping Iceberg helper patch; DuckDB tip retains the database-aware helper API"
+        return
+    fi
+
+    if [ -d "$source_dir/src" ] && \
+        patch -d "$source_dir" -R -p1 --dry-run \
+            < "$BUILD_SCRIPT_DIR/patches/iceberg-tip-helper-api.patch" >/dev/null 2>&1; then
+        cp "$BUILD_SCRIPT_DIR/patches/iceberg-tip-helper-api.patch" "$patch_file"
+        log_success "Preserving already-applied Iceberg helper API compatibility patch"
+    elif grep -Fq 'CanAutoloadExtension(db, extension_name)' "$source_dir/src/common/iceberg_utils.cpp" 2>/dev/null; then
+        cp "$BUILD_SCRIPT_DIR/patches/iceberg-tip-helper-api.patch" "$patch_file"
+        log_success "Configured Iceberg extension-helper API compatibility patch"
+    else
+        rm -f "$patch_file"
+        log_info "Skipping Iceberg helper patch; source already uses current APIs"
+    fi
+}
+
+sync_iceberg_tip_table_function_api_patch() {
+    local source_dir="$1"
+    local patch_dir="$2"
+    local patch_file="$patch_dir/0008-duckdb-tip-table-function-api.patch"
+
+    if grep -Fq 'class FunctionSignature' "$DUCKDB_DIR/src/include/duckdb/function/function.hpp" 2>/dev/null && \
+        grep -Fq 'GetSignature()' "$DUCKDB_DIR/src/include/duckdb/function/function.hpp" 2>/dev/null; then
+        rm -f "$patch_file"
+        log_info "Skipping Iceberg table-function downgrade; DuckDB tip provides FunctionSignature"
+        return
+    fi
+
+    if [ -d "$source_dir/src" ] && \
+        patch -d "$source_dir" -R -p1 --dry-run \
+            < "$BUILD_SCRIPT_DIR/patches/iceberg-tip-table-function-api.patch" >/dev/null 2>&1; then
+        cp "$BUILD_SCRIPT_DIR/patches/iceberg-tip-table-function-api.patch" "$patch_file"
+        log_success "Preserving already-applied Iceberg table-function API compatibility patch"
+    elif grep -REq --exclude='*.orig' 'AddPositionalOnly|GetSignature|WithTypedKwargs|ExtendTypedKwargs|TypedKwargs' \
+        "$source_dir/src" 2>/dev/null; then
+        cp "$BUILD_SCRIPT_DIR/patches/iceberg-tip-table-function-api.patch" "$patch_file"
+        log_success "Configured Iceberg table-function API compatibility patch"
+    else
+        rm -f "$patch_file"
+        log_info "Skipping Iceberg table-function patch; source already uses current APIs"
+    fi
+}
+
+sync_iceberg_tip_scan_bind_info_patch() {
+    local source_dir="$1"
+    local patch_dir="$2"
+    local patch_file="$patch_dir/0009-duckdb-tip-scan-bind-info.patch"
+
+    if grep -Fq 'struct TableFunctionGetBindInfoInput' \
+        "$DUCKDB_DIR/src/include/duckdb/function/table_function.hpp" 2>/dev/null && \
+        grep -Fq 'table_function_get_table_entry_t' \
+            "$DUCKDB_DIR/src/include/duckdb/function/table_function.hpp" 2>/dev/null; then
+        rm -f "$patch_file"
+        log_info "Skipping Iceberg scan callback downgrade; DuckDB tip exposes bind-info and table-entry callbacks"
+        return
+    fi
+
+    if [ -d "$source_dir/src" ] && \
+        patch -d "$source_dir" -R -p1 --dry-run \
+            < "$BUILD_SCRIPT_DIR/patches/iceberg-tip-scan-bind-info.patch" >/dev/null 2>&1; then
+        cp "$BUILD_SCRIPT_DIR/patches/iceberg-tip-scan-bind-info.patch" "$patch_file"
+        log_success "Preserving already-applied Iceberg scan bind-info compatibility patch"
+    elif grep -Eq 'TableFunctionGetBindInfoInput|function\.get_table_entry = IcebergGetTableEntry' \
+        "$source_dir/src/function/scan/iceberg_scan.cpp" 2>/dev/null; then
+        cp "$BUILD_SCRIPT_DIR/patches/iceberg-tip-scan-bind-info.patch" "$patch_file"
+        log_success "Configured Iceberg scan bind-info compatibility patch"
+    else
+        rm -f "$patch_file"
+        log_info "Skipping Iceberg scan bind-info patch; source already uses current APIs"
+    fi
+}
+
+sync_iceberg_tip_row_filter_parser_patch() {
+    local source_dir="$1"
+    local patch_dir="$2"
+    local patch_file="$patch_dir/0010-duckdb-tip-row-filter-parser.patch"
+
+    if grep -Fq 'Parser(ClientContext &context)' "$DUCKDB_DIR/src/include/duckdb/parser/parser.hpp" 2>/dev/null; then
+        rm -f "$patch_file"
+        log_info "Skipping Iceberg row-filter parser patch; DuckDB tip supports context-aware Parser"
+        return
+    fi
+
+    if [ -d "$source_dir/src" ] && \
+        patch -d "$source_dir" -R -p1 --dry-run \
+            < "$BUILD_SCRIPT_DIR/patches/iceberg-tip-row-filter-parser.patch" >/dev/null 2>&1; then
+        cp "$BUILD_SCRIPT_DIR/patches/iceberg-tip-row-filter-parser.patch" "$patch_file"
+        log_success "Preserving already-applied Iceberg row-filter parser compatibility patch"
+    elif grep -Fq 'Parser(context).ParseExpressionList' \
+        "$source_dir/src/function/scan_planning/iceberg_row_filter.cpp" 2>/dev/null; then
+        cp "$BUILD_SCRIPT_DIR/patches/iceberg-tip-row-filter-parser.patch" "$patch_file"
+        log_success "Configured Iceberg row-filter parser compatibility patch"
+    else
+        rm -f "$patch_file"
+        log_info "Skipping Iceberg row-filter parser patch; source already uses current APIs"
+    fi
+}
+
+sync_iceberg_tip_task_executor_patch() {
+    local source_dir="$1"
+    local patch_dir="$2"
+    local patch_file="$patch_dir/0011-duckdb-tip-task-executor.patch"
+
+    if grep -Fq 'ExecuteTaskStep()' "$DUCKDB_DIR/src/include/duckdb/parallel/task_executor.hpp" 2>/dev/null && \
+        grep -Fq 'Cancel()' "$DUCKDB_DIR/src/include/duckdb/parallel/task_executor.hpp" 2>/dev/null; then
+        rm -f "$patch_file"
+        log_info "Skipping Iceberg task rewrite; DuckDB tip supports incremental executor steps and cancellation"
+        return
+    fi
+
+    if [ -d "$source_dir/src" ] && \
+        patch -d "$source_dir" -R -p1 --dry-run \
+            < "$BUILD_SCRIPT_DIR/patches/iceberg-tip-task-executor.patch" >/dev/null 2>&1; then
+        cp "$BUILD_SCRIPT_DIR/patches/iceberg-tip-task-executor.patch" "$patch_file"
+        log_success "Preserving already-applied Iceberg task-executor compatibility patch"
+    elif grep -Fq 'ExecuteTaskStep() override' \
+        "$source_dir/src/planning/scan_plan/iceberg_manifest_store.cpp" 2>/dev/null; then
+        cp "$BUILD_SCRIPT_DIR/patches/iceberg-tip-task-executor.patch" "$patch_file"
+        log_success "Configured Iceberg task-executor compatibility patch"
+    else
+        rm -f "$patch_file"
+        log_info "Skipping Iceberg task-executor patch; source already uses current APIs"
+    fi
+}
+
+prune_iceberg_upstream_compat_patches() {
+    local source_dir="$1"
+    local patch_dir="$2"
+
+    [ -d "$source_dir/src" ] || return 0
+
+    if grep -Fq 'FunctionSignature()' "$source_dir/src/function/ducklake/iceberg_to_ducklake.cpp" && \
+        grep -Fq 'FunctionSignature()' "$source_dir/src/function/metadata/iceberg_column_stats.cpp" && \
+        grep -Fq 'BoundTableFunction bound_table_function' \
+            "$source_dir/src/catalog/rest/catalog_entry/table/iceberg_table_schema_version.cpp"; then
+        rm -f "$patch_dir/0001-table-function-signature-options.patch"
+        log_info "Skipping bundled Iceberg signature patch; current source already uses the new function APIs"
+    fi
+
+    if grep -Fq 'alter_table_info.column_path' \
+        "$source_dir/src/catalog/rest/catalog_entry/schema/iceberg_schema_entry.cpp" && \
+        grep -Fq 'change_type_info.column_path' \
+            "$source_dir/src/catalog/rest/catalog_entry/schema/iceberg_schema_entry.cpp"; then
+        rm -f "$patch_dir/0002-alter-info-column-path.patch"
+        log_info "Skipping bundled Iceberg alter patch; current source already uses nested column paths"
+    fi
+
+    if ! grep -Fq 'duckdb/common/extra_type_info.hpp' \
+        "$source_dir/src/catalog/rest/api/iceberg_type.cpp"; then
+        rm -f "$patch_dir/0002-logical-type-info-header.patch"
+        log_info "Skipping bundled Iceberg type-header patch; current source no longer includes the removed header"
+    fi
+
+    if grep -Fq 'function.get_table_entry = IcebergGetTableEntry' \
+        "$source_dir/src/function/scan/iceberg_scan.cpp"; then
+        rm -f "$patch_dir/0003-table-function-get-table-entry.patch"
+        log_info "Skipping bundled Iceberg scan patch; current source already provides get_table_entry"
     fi
 }
 
@@ -246,7 +574,15 @@ ensure_local_archive_source() {
     fi
 
     tar -xzf "$archive_path" -C "$extract_dir"
-    rm -rf "$source_dir"
+    if [ -e "$source_dir" ]; then
+        local preserved_dir="${source_dir}.preserved.$(date +%Y%m%d-%H%M%S)"
+        while [ -e "$preserved_dir" ]; do
+            preserved_dir="${source_dir}.preserved.$(date +%Y%m%d-%H%M%S)-$$"
+            sleep 1
+        done
+        mv "$source_dir" "$preserved_dir"
+        log_warning "Preserved previous $label source tree at $preserved_dir"
+    fi
     mkdir -p "$(dirname "$source_dir")"
     mv "$extract_dir/$top_dir" "$source_dir"
     echo "$ref" > "$marker_file"
@@ -281,6 +617,31 @@ EOF
     log_success "$label config patched to use SOURCE_DIR $source_dir"
 }
 
+refresh_extension_tips() {
+    local config name url old_tag new_tag
+    for config in "$DUCKDB_DIR"/.github/config/extensions/*.cmake; do
+        [ -f "$config" ] || continue
+        url=$(awk '/^[[:space:]]*GIT_URL[[:space:]]/ {print $2; exit}' "$config")
+        old_tag=$(awk '/^[[:space:]]*GIT_TAG[[:space:]]/ {print $2; exit}' "$config")
+        [ -n "$url" ] && [ -n "$old_tag" ] || continue
+        name=$(basename "$config" .cmake)
+        if ! new_tag=$(git_network ls-remote "$url" HEAD | awk 'NR == 1 {print $1}'); then
+            log_error "Could not resolve upstream HEAD for $name ($url)"
+            return 1
+        fi
+        if [[ ! "$new_tag" =~ ^[[:xdigit:]]{40}$ ]]; then
+            log_error "Could not parse upstream HEAD for $name ($url): $new_tag"
+            return 1
+        fi
+        if [ "$new_tag" != "$old_tag" ]; then
+            sed -i -E "0,/^([[:space:]]*GIT_TAG[[:space:]]+)[^[:space:]]+/s//\\1$new_tag/" "$config"
+            log_info "Refreshed $name pin: $old_tag -> $new_tag"
+        else
+            log_info "$name is already at upstream HEAD $new_tag"
+        fi
+    done
+}
+
 # Parse arguments
 while [[ $# -gt 0 ]]; do
   case $1 in
@@ -300,20 +661,28 @@ while [[ $# -gt 0 ]]; do
       DUCKDB_DIR="$2"
       shift 2
       ;;
-    --openivm-dir)
+    --vss-dir)
       if [[ $# -lt 2 ]]; then
-        echo -e "${RED}[ERROR]${NC} --openivm-dir requires a value"
+        echo -e "${RED}[ERROR]${NC} --vss-dir requires a value"
         exit 1
       fi
-      OPENIVM_DIR="$2"
+      VSS_DIR="$2"
       shift 2
       ;;
-    --duckdbsp-dir)
+    --lance-dir)
       if [[ $# -lt 2 ]]; then
-        echo -e "${RED}[ERROR]${NC} --duckdbsp-dir requires a value"
+        echo -e "${RED}[ERROR]${NC} --lance-dir requires a value"
         exit 1
       fi
-      DUCKDBSP_DIR="$2"
+      LANCE_DIR="$2"
+      shift 2
+      ;;
+    --vortex-dir)
+      if [[ $# -lt 2 ]]; then
+        echo -e "${RED}[ERROR]${NC} --vortex-dir requires a value"
+        exit 1
+      fi
+      VORTEX_DIR="$2"
       shift 2
       ;;
     --ducklake-dir)
@@ -324,9 +693,33 @@ while [[ $# -gt 0 ]]; do
       DUCKLAKE_DIR="$2"
       shift 2
       ;;
+    --iceberg-dir)
+      if [[ $# -lt 2 ]]; then
+        echo -e "${RED}[ERROR]${NC} --iceberg-dir requires a value"
+        exit 1
+      fi
+      ICEBERG_SOURCE_DIR="$2"
+      shift 2
+      ;;
+    --encodings-dir)
+      if [[ $# -lt 2 ]]; then
+        echo -e "${RED}[ERROR]${NC} --encodings-dir requires a value"
+        exit 1
+      fi
+      ENCODINGS_DIR="$2"
+      shift 2
+      ;;
     --skip-vcpkg)
       SKIP_VCPKG=true
       shift
+      ;;
+    --jobs)
+      if [[ $# -lt 2 ]]; then
+        echo -e "${RED}[ERROR]${NC} --jobs requires a value"
+        exit 1
+      fi
+      BUILD_JOBS="$2"
+      shift 2
       ;;
     --clean)
       CLEAN_BUILD=true
@@ -340,8 +733,12 @@ while [[ $# -gt 0 ]]; do
       WITH_SPATIAL=true
       shift
       ;;
+    --refresh-extension-tips)
+      REFRESH_EXTENSION_TIPS=true
+      shift
+      ;;
     --help)
-      grep '^#' "$0" | grep -v '#!/bin/bash' | sed 's/^# //'
+      usage
       exit 0
       ;;
     *)
@@ -350,6 +747,8 @@ while [[ $# -gt 0 ]]; do
       ;;
   esac
 done
+
+load_build_lock
 
 log_info() {
     echo -e "${BLUE}[INFO]${NC} $1"
@@ -367,7 +766,7 @@ log_error() {
     echo -e "${RED}[ERROR]${NC} $1"
 }
 
-for source_var in OPENIVM_DIR DUCKDBSP_DIR DUCKLAKE_DIR; do
+for source_var in VSS_DIR LANCE_DIR VORTEX_DIR DUCKLAKE_DIR ICEBERG_SOURCE_DIR ENCODINGS_DIR; do
     source_path="${!source_var}"
     [ -n "$source_path" ] || continue
     if [ ! -f "$source_path/CMakeLists.txt" ]; then
@@ -387,32 +786,36 @@ for cmd in gcc g++ cargo rustc; do
 done
 if [ "$WITH_SPATIAL" = true ]; then
     require_cmd xxd
+    require_cmd nm
 fi
 log_success "All prerequisites found"
 
 # Step 1: Install/check vcpkg
 log_info "Step 1: Setting up vcpkg at $VCPKG_DIR"
-if [ ! -d "$VCPKG_DIR" ]; then
-    log_info "Cloning vcpkg..."
-    git_network clone --depth 1 https://github.com/microsoft/vcpkg.git "$VCPKG_DIR"
+prepare_pinned_checkout "$VCPKG_DIR" "https://github.com/microsoft/vcpkg.git" "$LOCKED_VCPKG_REF" "vcpkg"
+if [ ! -x "$VCPKG_DIR/vcpkg" ]; then
+    log_info "Bootstrapping pinned vcpkg checkout..."
     cd "$VCPKG_DIR"
     ./bootstrap-vcpkg.sh
     log_success "vcpkg installed"
 else
-    log_success "vcpkg already exists at $VCPKG_DIR"
+    log_success "Pinned vcpkg checkout ready at $VCPKG_DIR"
 fi
 
 # Step 2: Clone/check DuckDB
 log_info "Step 2: Setting up DuckDB at $DUCKDB_DIR"
-if [ ! -d "$DUCKDB_DIR" ]; then
-    log_info "Cloning DuckDB..."
-    git_network clone --depth 1 https://github.com/duckdb/duckdb.git "$DUCKDB_DIR"
-    log_success "DuckDB cloned"
-else
-    log_success "DuckDB already exists at $DUCKDB_DIR"
-fi
+prepare_pinned_checkout "$DUCKDB_DIR" "https://github.com/duckdb/duckdb.git" "$LOCKED_DUCKDB_REF" "DuckDB"
+log_success "Pinned DuckDB checkout ready at $DUCKDB_DIR ($LOCKED_DUCKDB_REF)"
 
 cd "$DUCKDB_DIR"
+
+if [ "$REFRESH_EXTENSION_TIPS" = true ]; then
+    log_warning "Resolving live extension tips; this build will differ from build.lock"
+    refresh_extension_tips
+else
+    apply_extension_lock
+    log_success "Applied extension revisions from build.lock"
+fi
 
 # The upstream remote-optimizer test forks after the test runner may have
 # initialized Spatial/PROJ's process-global SQLite state. Run its client and
@@ -422,7 +825,20 @@ apply_patch_if_needed "$DUCKDB_DIR" "$BUILD_SCRIPT_DIR/patches/remote-optimizer-
     "remote optimizer exec isolation"
 apply_patch_if_needed "$DUCKDB_DIR" "$BUILD_SCRIPT_DIR/patches/duckdb-quack-test-server-cleanup.patch" \
     "Quack SQLLogic server lifecycle cleanup"
-
+apply_patch_if_needed "$DUCKDB_DIR" "$BUILD_SCRIPT_DIR/patches/duckdb-logical-plan-statement-bypass-rebind.patch" \
+	"bypassing SQL rebind hooks for already-bound logical plans"
+apply_patch_if_needed "$DUCKDB_DIR" "$BUILD_SCRIPT_DIR/patches/duckdb-natural-sort-materialization.patch" \
+    "idempotent natural-sort materialization completion"
+apply_patch_if_needed "$DUCKDB_DIR" "$BUILD_SCRIPT_DIR/patches/duckdb-static-test-fixtures.patch" \
+    "static-extension and Quack crypto test fixtures"
+apply_patch_if_needed "$DUCKDB_DIR" "$BUILD_SCRIPT_DIR/patches/idempotent-extension-patch-application.patch" \
+    "FetchContent patch reapplication preservation"
+apply_patch_if_needed "$DUCKDB_DIR" "$BUILD_SCRIPT_DIR/patches/duckdb-cpp-api-export-tip.patch" \
+    "stable C++ API install-interface export for current DuckDB tip"
+apply_patch_if_needed "$DUCKDB_DIR" "$BUILD_SCRIPT_DIR/patches/duckdb-extension-database-shutdown.patch" \
+    "extension callbacks before database service shutdown"
+apply_patch_if_needed "$DUCKDB_DIR" "$BUILD_SCRIPT_DIR/patches/duckdb-catalog-qualified-nested-leaf-lookup.patch" \
+    "catalog-qualified nested-schema leaf fallback"
 # Clean build if requested
 if [ "$CLEAN_BUILD" = true ]; then
     log_info "Cleaning previous build artifacts..."
@@ -441,68 +857,25 @@ fi
 # Step 3: Create extension configuration
 log_info "Step 3: Creating extension configuration..."
 mkdir -p extension
-QUACK_CONFIG=.github/config/extensions/quack.cmake
-QUACK_GIT_URL=$(awk '/GIT_URL/ {print $2; exit}' "$QUACK_CONFIG")
-QUACK_GIT_TAG=$(awk '/GIT_TAG/ {print $2; exit}' "$QUACK_CONFIG")
-if [ -z "$QUACK_GIT_URL" ] || [ -z "$QUACK_GIT_TAG" ]; then
-    log_error "Could not determine the Quack URL/tag from $QUACK_CONFIG"
-    exit 1
-fi
 cat > extension/extension_config_local.cmake << EOF
-duckdb_extension_load(autocomplete)
-duckdb_extension_load(icu)
-duckdb_extension_load(tpcds)
-duckdb_extension_load(tpch)
-duckdb_extension_load(fts)
-duckdb_extension_load(json)
-duckdb_extension_load(parquet)
-duckdb_extension_load(sqlite_scanner APPLY_PATCHES)
-duckdb_extension_load(postgres_scanner APPLY_PATCHES)
-duckdb_extension_load(mysql_scanner APPLY_PATCHES)
-duckdb_extension_load(excel)
-duckdb_extension_load(vss)
-duckdb_extension_load(inet)
-duckdb_extension_load(avro)
-duckdb_extension_load(httpfs)
-duckdb_extension_load(aws)
-duckdb_extension_load(azure)
-duckdb_extension_load(iceberg)
-duckdb_extension_load(delta APPLY_PATCHES)
-duckdb_extension_load(unity_catalog)
-duckdb_extension_load(quack LOAD_TESTS
-    GIT_URL $QUACK_GIT_URL
-    GIT_TAG $QUACK_GIT_TAG
-)
+# Only register out-of-tree source overrides here. BUILD_EXTENSIONS loads the
+# pinned first-party extension configs for built-ins and fetches their sources.
 EOF
 if [ -n "$DUCKLAKE_DIR" ]; then
     cat >> extension/extension_config_local.cmake <<EOF
 duckdb_extension_load(ducklake
     SOURCE_DIR "$DUCKLAKE_DIR"
-)
-EOF
-else
-    echo "duckdb_extension_load(ducklake)" >> extension/extension_config_local.cmake
-fi
-if [ -n "$OPENIVM_DIR" ]; then
-    cat >> extension/extension_config_local.cmake <<EOF
-duckdb_extension_load(openivm
-    DONT_LINK
-    SOURCE_DIR "$OPENIVM_DIR"
     LOAD_TESTS
 )
 EOF
 fi
-if [ -n "$DUCKDBSP_DIR" ]; then
+if [ -n "$ENCODINGS_DIR" ]; then
     cat >> extension/extension_config_local.cmake <<EOF
-duckdb_extension_load(dbsp
-    DONT_LINK
-    SOURCE_DIR "$DUCKDBSP_DIR"
+duckdb_extension_load(encodings
+    SOURCE_DIR "$ENCODINGS_DIR"
     LOAD_TESTS
 )
 EOF
-fi
-if [ "$WITH_SPATIAL" = true ]; then
-    echo "duckdb_extension_load(spatial APPLY_PATCHES)" >> extension/extension_config_local.cmake
 fi
 log_success "Extension configuration created"
 
@@ -514,15 +887,62 @@ if [ -f .github/config/extensions/fts.cmake ]; then
     ensure_include_after_git_tag .github/config/extensions/fts.cmake "INCLUDE_DIR src/include"
     log_success "FTS config patched"
 fi
+if [ -f .github/config/extensions/avro.cmake ]; then
+    ensure_include_after_git_tag .github/config/extensions/avro.cmake "APPLY_PATCHES"
+fi
+if grep -Fq 'GIT_TAG ff49af5354c6c70107fc28828251bbd870ccf8d1' \
+    .github/config/extensions/vortex.cmake; then
+    mkdir -p .github/patches/extensions/vortex
+    cp "$BUILD_SCRIPT_DIR/patches/vortex-tip-offline-version.patch" \
+       .github/patches/extensions/vortex/0001-offline-version-fallback.patch
+    ensure_include_after_git_tag .github/config/extensions/vortex.cmake "APPLY_PATCHES"
+    log_success "Configured Vortex pinned-version fallback when GitHub tag lookup is unavailable"
+else
+    rm -f .github/patches/extensions/vortex/0001-offline-version-fallback.patch
+fi
+if [ -n "$LANCE_DIR" ]; then
+    cat > .github/config/extensions/lance.cmake <<EOF
+if (NOT MINGW AND NOT \${WASM_ENABLED})
+    duckdb_extension_load(lance
+        SOURCE_DIR "$LANCE_DIR"
+        LOAD_TESTS
+    )
+endif()
+EOF
+    log_success "Configured Lance from source directory $LANCE_DIR"
+fi
+if grep -Fq 'GIT_TAG 0f439d63771458b7f101862cb86cf51875c93b4e' \
+    .github/config/extensions/lance.cmake; then
+    mkdir -p .github/patches/extensions/lance
+    cp "$BUILD_SCRIPT_DIR/patches/lance-tip-duckdb-api.patch" \
+       .github/patches/extensions/lance/0001-duckdb-tip-api.patch
+    ensure_include_after_git_tag .github/config/extensions/lance.cmake "APPLY_PATCHES"
+    log_success "Configured Lance DuckDB tip schema/default binding compatibility"
+else
+    rm -f .github/patches/extensions/lance/0001-duckdb-tip-api.patch
+fi
+if [ -n "$VORTEX_DIR" ]; then
+    cat > .github/config/extensions/vortex.cmake <<EOF
+if (NOT DEFINED VORTEX_ENABLED)
+    set(VORTEX_ENABLED ON)
+endif()
+if (VORTEX_ENABLED AND NOT WIN32 AND NOT \${WASM_ENABLED} AND NOT \${MUSL_ENABLED})
+    duckdb_extension_load(vortex
+        SOURCE_DIR "$VORTEX_DIR"
+        APPLY_PATCHES
+        LOAD_TESTS
+    )
+endif()
+EOF
+    log_success "Configured Vortex from source directory $VORTEX_DIR"
+fi
 if [ -f .github/config/extensions/vss.cmake ]; then
     sed -i '/DONT_LINK/d' .github/config/extensions/vss.cmake
     log_success "VSS config patched"
 fi
-if [ -f .github/config/extensions/odbc_scanner.cmake ] && \
-    ! grep -A3 'duckdb_extension_load(odbc_scanner' .github/config/extensions/odbc_scanner.cmake | grep -q DONT_LINK; then
-    sed -i '/duckdb_extension_load(odbc_scanner/a\            DONT_LINK' \
-        .github/config/extensions/odbc_scanner.cmake
-    log_success "odbc_scanner retained as a loadable C-API extension"
+if [ -f .github/config/extensions/odbc_scanner.cmake ]; then
+    sed -i '/DONT_LINK/d' .github/config/extensions/odbc_scanner.cmake
+    log_success "Removed obsolete ODBC DONT_LINK flag; extension remains loadable"
 fi
 if [ -f .github/config/extensions/odbc_scanner.cmake ] && \
     ! grep -A3 'duckdb_extension_load(odbc_scanner' .github/config/extensions/odbc_scanner.cmake | grep -q '^[[:space:]]*LOAD_TESTS'; then
@@ -539,23 +959,33 @@ if [ -f .github/config/extensions/odbc_scanner.cmake ] && \
 fi
 if [ -f .github/config/extensions/odbc_scanner.cmake ]; then
     mkdir -p .github/patches/extensions/odbc_scanner
-    cp "$BUILD_SCRIPT_DIR/patches/odbc-scanner-lifecycle-tip.patch" \
-       .github/patches/extensions/odbc_scanner/0002-duckdb-tip-lifecycle.patch
+    if grep -Fq 'GIT_TAG ef4382fbfcb238e3012373384ae4e1953f3736a3' \
+        .github/config/extensions/odbc_scanner.cmake; then
+        cp "$BUILD_SCRIPT_DIR/patches/odbc-scanner-close-connection-tip.patch" \
+           .github/patches/extensions/odbc_scanner/0002-duckdb-tip-lifecycle.patch
+        log_success "Configured current ODBC close-connection statement lifetime fix"
+    else
+        cp "$BUILD_SCRIPT_DIR/patches/odbc-scanner-lifecycle-tip.patch" \
+           .github/patches/extensions/odbc_scanner/0002-duckdb-tip-lifecycle.patch
+        log_success "Configured legacy ODBC parameter-handle lifecycle patch"
+    fi
     ensure_include_after_git_tag .github/config/extensions/odbc_scanner.cmake "APPLY_PATCHES"
-    log_success "Configured ODBC parameter and statement lifecycle compatibility patch"
 fi
 if [ -f .github/config/extensions/quack.cmake ] && \
     ! grep -A3 'duckdb_extension_load(quack' .github/config/extensions/quack.cmake | grep -q '^[[:space:]]*LOAD_TESTS'; then
     sed -i '/duckdb_extension_load(quack/a\    LOAD_TESTS' .github/config/extensions/quack.cmake
 fi
-if grep -Fq 'GIT_TAG f964cece8ecfe9006a607aa0a3e9b9030296c54f' \
-    extension/extension_config_local.cmake; then
-    rm -f .github/patches/extensions/quack/0001-table-catalog-entry-columns.patch \
+if [ -f .github/config/extensions/quack.cmake ] && \
+    grep -Fq 'GIT_TAG c19ca48dadcb26febdabf23eae08c753c77eea21' \
+        .github/config/extensions/quack.cmake; then
+    rm -f .github/patches/extensions/quack/0001-revert-d959dd6.patch \
+          .github/patches/extensions/quack/0001-table-catalog-entry-columns.patch \
           .github/patches/extensions/quack/0002-binder-include.patch \
-          .github/patches/extensions/quack/0002-literal-constant-expression.patch
-    sed -i '/^[[:space:]]*APPLY_PATCHES[[:space:]]*$/d' \
-        .github/config/extensions/quack.cmake
-    log_success "Skipping Quack compatibility patches already integrated at current tip"
+          .github/patches/extensions/quack/0002-literal-constant-expression.patch \
+          .github/patches/extensions/quack/0002-table-function-signature-options.patch \
+          .github/patches/extensions/quack/0003-builtin-parser.patch \
+          .github/patches/extensions/quack/0004-table-function-get-table-entry.patch
+    log_success "Skipping Quack patches already superseded by the current extension source"
 fi
 if [ -f .github/config/extensions/postgres_scanner.cmake ]; then
     sed -i '/DONT_LINK/d' .github/config/extensions/postgres_scanner.cmake
@@ -564,11 +994,22 @@ if [ -f .github/config/extensions/postgres_scanner.cmake ]; then
     log_success "postgres_scanner config patched"
 fi
 if [ -f .github/config/extensions/sqlite_scanner.cmake ] && \
+    grep -Fq 'GIT_TAG 9c5f9d3d886dcbda537afceea05e16509b0ddf44' \
+        .github/config/extensions/sqlite_scanner.cmake; then
+    mkdir -p .github/patches/extensions/sqlite_scanner
+    rm -f .github/patches/extensions/sqlite_scanner/0001-duckdb-tip-api.patch \
+          .github/patches/extensions/sqlite_scanner/0002-duckdb-tip-parser-api.patch \
+          .github/patches/extensions/sqlite_scanner/0003-table-function-get-table-entry.patch
+    ensure_include_after_git_tag .github/config/extensions/sqlite_scanner.cmake "APPLY_PATCHES"
+    log_success "Skipping SQLite compatibility patches already superseded by current extension source"
+elif [ -f .github/config/extensions/sqlite_scanner.cmake ] && \
     grep -Fq 'GIT_TAG 1f5805cec42c130fb1c6dbd4490bbf19e60af801' \
         .github/config/extensions/sqlite_scanner.cmake; then
     mkdir -p .github/patches/extensions/sqlite_scanner
     cp "$BUILD_SCRIPT_DIR/patches/sqlite-scanner-tip-api.patch" \
        .github/patches/extensions/sqlite_scanner/0001-duckdb-tip-api.patch
+    rm -f .github/patches/extensions/sqlite_scanner/0002-duckdb-tip-parser-api.patch \
+          .github/patches/extensions/sqlite_scanner/0003-table-function-get-table-entry.patch
     ensure_include_after_git_tag .github/config/extensions/sqlite_scanner.cmake "APPLY_PATCHES"
     log_success "Configured SQLite scanner tip API compatibility patch"
 fi
@@ -579,7 +1020,12 @@ if [ -f .github/config/extensions/mysql_scanner.cmake ]; then
         .github/config/extensions/mysql_scanner.cmake
     ensure_include_after_git_tag .github/config/extensions/mysql_scanner.cmake "INCLUDE_DIR src/include"
     ensure_include_after_git_tag .github/config/extensions/mysql_scanner.cmake "APPLY_PATCHES"
-    if grep -Fq 'GIT_TAG 8bf846472bd5e696dcedfbfd6451f6e78194c55e' \
+    if grep -Fq 'GIT_TAG be95014f50571b6a23a13338b8b57cc6dddcaf64' \
+        .github/config/extensions/mysql_scanner.cmake; then
+        rm -f .github/patches/extensions/mysql_scanner/0003-table-function-get-table-entry.patch
+        log_info "Skipping MySQL table-entry callback patch already integrated at current tip"
+    fi
+    if grep -Eq 'GIT_TAG (8bf846472bd5e696dcedfbfd6451f6e78194c55e|576e803219d53eddd82adea21fc28649bab5af2c)' \
         .github/config/extensions/mysql_scanner.cmake; then
         # This MySQL tip has migrated cast handling to TypeExpression/GetLiteral APIs;
         # DuckDB's older cast compatibility patches target code removed upstream.
@@ -590,7 +1036,7 @@ if [ -f .github/config/extensions/mysql_scanner.cmake ]; then
     log_success "mysql_scanner config patched"
 fi
 if [ -f .github/config/extensions/excel.cmake ] && \
-    grep -Fq 'GIT_TAG 03d72f5056f3b831168ab354358abb1968527b62' \
+    grep -Eq 'GIT_TAG (03d72f5056f3b831168ab354358abb1968527b62|fac3dd09bc5fc3848ba10f60a5092944af9bfe13)' \
         .github/config/extensions/excel.cmake; then
     # These exact patches reverse-apply to the pinned tip, confirming they are upstream.
     rm -f .github/patches/extensions/excel/0001-vector-fix.patch \
@@ -608,15 +1054,20 @@ if [ -f .github/config/extensions/excel.cmake ] && \
     log_success "Skipping Excel compatibility patches already integrated at current tip"
 fi
 if [ -f .github/config/extensions/vss.cmake ] && \
-    grep -Fq 'GIT_TAG 6c5ae1b105892bb9f95386e783a5b7fc8b9adae3' \
+    grep -Eq 'GIT_TAG (6c5ae1b105892bb9f95386e783a5b7fc8b9adae3|ee9df713f36978ba26a91b42d1ed0a468a27e786)' \
         .github/config/extensions/vss.cmake; then
-    rm -f .github/patches/extensions/vss/0001-hnsw-catalog-columnref-includes.patch \
-          .github/patches/extensions/vss/0001-literal-constant-expression.patch
+    rm -f .github/patches/extensions/vss/*.patch
     sed -i '/^[[:space:]]*APPLY_PATCHES[[:space:]]*$/d' .github/config/extensions/vss.cmake
     log_success "Skipping VSS patches already integrated at current tip"
 fi
+if [ -f .github/config/extensions/vss.cmake ] && \
+    grep -Fq 'GIT_TAG 3685131eacaf0d467d430be5c4e5e7d1d483437a' \
+        .github/config/extensions/vss.cmake; then
+    rm -f .github/patches/extensions/vss/0004-expression-rewriter-add-rule.patch
+    log_success "Skipping VSS expression-rewriter patch already integrated at the locked tip"
+fi
 if [ -f .github/config/extensions/inet.cmake ] && \
-    grep -Fq 'GIT_TAG 61ce2d7245a0b27c479a16cb4b57ae0562b71880' \
+    grep -Eq 'GIT_TAG (61ce2d7245a0b27c479a16cb4b57ae0562b71880|ac0286a4742dd420d3fe5acf47a44ef991336f83)' \
         .github/config/extensions/inet.cmake; then
     # Inet was rewritten around the unstable C API; the old C++ compatibility patches
     # refer to source files removed from this tip.
@@ -644,13 +1095,60 @@ if [ -f .github/config/extensions/spatial.cmake ] && \
     log_success "Skipping Spatial patches confirmed upstream at current tip"
 fi
 if [ -f .github/config/extensions/delta.cmake ] && \
-    grep -Fq 'GIT_TAG a33adba985f7e418a446a20c26bd6b7f073358a4' \
+    grep -Eq 'GIT_TAG (a33adba985f7e418a446a20c26bd6b7f073358a4|f0ca4d88eaad4ad1a0d919bab3c1b351177020aa)' \
         .github/config/extensions/delta.cmake; then
     rm -f .github/patches/extensions/delta/0004-columnref-expression-include.patch
     # Delta tip has adopted the literal-expression conversion; CREATE TABLE option
     # evaluation has since moved to its binder path, superseding the old accessor hunk.
     rm -f .github/patches/extensions/delta/0004-literal-constant-expression.patch
     log_success "Skipping Delta compatibility hunks superseded by current tip APIs"
+fi
+if [ -f .github/config/extensions/postgres_scanner.cmake ] && \
+    grep -Fq 'GIT_TAG 8d201d476ce690dac2e33921547c43e4daca587a' \
+        .github/config/extensions/postgres_scanner.cmake; then
+    rm -f .github/patches/extensions/postgres_scanner/0002-table-catalog-entry-columns.patch \
+          .github/patches/extensions/postgres_scanner/0003-literal-constant-expression.patch
+    log_success "Skipping Postgres scanner patches already integrated at current tip"
+fi
+if [ -f .github/config/extensions/postgres_scanner.cmake ] && \
+    grep -Fq 'GIT_TAG 57f857eb8a24697cd44c224716c0d26c851a89e7' \
+        .github/config/extensions/postgres_scanner.cmake; then
+    rm -f .github/patches/extensions/postgres_scanner/0002-builtin-parser.patch \
+          .github/patches/extensions/postgres_scanner/0003-catalog-set-concurrent-clear.patch \
+          .github/patches/extensions/postgres_scanner/0003-table-function-get-table-entry.patch
+    log_success "Skipping Postgres patches already integrated at current tip"
+fi
+if [ -f .github/config/extensions/aws.cmake ] && \
+    grep -Fq 'GIT_TAG 682de5561c21241d61b3ff6d8c7360c2c350ce8a' \
+        .github/config/extensions/aws.cmake; then
+    cp "$BUILD_SCRIPT_DIR/patches/aws-tip-environment-through-os-util.patch" \
+       .github/patches/extensions/aws/0004-environment-through-os-util.patch
+    log_success "Trimmed obsolete CloudFormation hunks from the current AWS environment patch"
+fi
+if [ -f .github/config/extensions/fts.cmake ] && \
+    grep -Fq 'GIT_TAG fe47e2b4d98979d02f1053d553c45ca39eb886b5' \
+        .github/config/extensions/fts.cmake; then
+    cp "$BUILD_SCRIPT_DIR/patches/fts-tip-indexing-includes.patch" \
+       .github/patches/extensions/fts/0002-fts-indexing-includes.patch
+    cp "$BUILD_SCRIPT_DIR/patches/fts-fallible-tokenizer.patch" \
+       .github/patches/extensions/fts/0003-fallible-tokenizers.patch
+    ensure_include_after_git_tag .github/config/extensions/fts.cmake "APPLY_PATCHES"
+    log_success "Refreshed FTS catalog include patch for the current extension tip"
+fi
+if [ -f .github/config/extensions/ducklake.cmake ] && \
+    grep -Fq 'GIT_TAG 971065f0569c00e3634a95dced29553fddbb896f' \
+        .github/config/extensions/ducklake.cmake; then
+    cp "$BUILD_SCRIPT_DIR/patches/ducklake-return-stats-containers-tip.patch" \
+       .github/patches/extensions/ducklake/0017-return-stats-containers.patch
+    log_success "Refreshed DuckLake tip container-statistics patch for current source"
+fi
+if [ -f .github/config/extensions/ducklake.cmake ] && \
+    grep -q 'duckdb_extension_load(ducklake' .github/config/extensions/ducklake.cmake; then
+    mkdir -p .github/patches/extensions/ducklake
+    cp "$BUILD_SCRIPT_DIR/patches/ducklake-reject-session-timezone-tzns-partition.patch" \
+       .github/patches/extensions/ducklake/0025-reject-tzns-calendar-partition.patch
+    ensure_include_after_git_tag .github/config/extensions/ducklake.cmake "APPLY_PATCHES"
+    log_success "Rejecting DuckLake calendar partitions that implicitly use the session time zone for TIMESTAMP_TZ_NS"
 fi
 if [ -f .github/config/extensions/iceberg.cmake ]; then
     ICEBERG_PATCH_DIR="$DUCKDB_DIR/.github/patches/extensions/iceberg"
@@ -659,7 +1157,9 @@ if [ -f .github/config/extensions/iceberg.cmake ]; then
     ICEBERG_REFRESH_REF=""
     CURRENT_ICEBERG_SOURCE_DIR=$(awk '/SOURCE_DIR/ {print $2; exit}' .github/config/extensions/iceberg.cmake)
     ICEBERG_GIT_TAG=$(awk '/GIT_TAG/ {print $2; exit}' .github/config/extensions/iceberg.cmake)
-    if [ -n "$ICEBERG_GIT_TAG" ]; then
+    if [ "$REFRESH_EXTENSION_TIPS" = false ]; then
+        ICEBERG_REFRESH_REF="$LOCKED_ICEBERG_REF"
+    elif [ -n "$ICEBERG_GIT_TAG" ]; then
         ICEBERG_REFRESH_REF="$ICEBERG_GIT_TAG"
     elif [ -f "$ICEBERG_FALLBACK_DIR/.duckdb_static_build_ref" ]; then
         ICEBERG_REFRESH_REF=$(cat "$ICEBERG_FALLBACK_DIR/.duckdb_static_build_ref")
@@ -681,9 +1181,23 @@ if [ -f .github/config/extensions/iceberg.cmake ]; then
         log_info "Skipping Iceberg planner patch; source already uses the current planner API"
     fi
     sync_iceberg_tip_api_patch "$ICEBERG_DETECT_SOURCE_DIR" "$ICEBERG_PATCH_DIR"
+    sync_iceberg_tip_semantics_patch "$ICEBERG_DETECT_SOURCE_DIR" "$ICEBERG_PATCH_DIR"
+    sync_iceberg_tip_helper_api_patch "$ICEBERG_DETECT_SOURCE_DIR" "$ICEBERG_PATCH_DIR"
+    sync_iceberg_tip_table_function_api_patch "$ICEBERG_DETECT_SOURCE_DIR" "$ICEBERG_PATCH_DIR"
+    sync_iceberg_tip_scan_bind_info_patch "$ICEBERG_DETECT_SOURCE_DIR" "$ICEBERG_PATCH_DIR"
+    sync_iceberg_tip_row_filter_parser_patch "$ICEBERG_DETECT_SOURCE_DIR" "$ICEBERG_PATCH_DIR"
+    sync_iceberg_tip_task_executor_patch "$ICEBERG_DETECT_SOURCE_DIR" "$ICEBERG_PATCH_DIR"
+    prune_iceberg_upstream_compat_patches "$ICEBERG_DETECT_SOURCE_DIR" "$ICEBERG_PATCH_DIR"
     rm -f "$ICEBERG_PATCH_DIR/fix.patch"
     if [ -n "$ICEBERG_SOURCE_DIR" ]; then
         sync_iceberg_tip_api_patch "$ICEBERG_SOURCE_DIR" "$ICEBERG_PATCH_DIR"
+        sync_iceberg_tip_semantics_patch "$ICEBERG_SOURCE_DIR" "$ICEBERG_PATCH_DIR"
+        sync_iceberg_tip_helper_api_patch "$ICEBERG_SOURCE_DIR" "$ICEBERG_PATCH_DIR"
+        sync_iceberg_tip_table_function_api_patch "$ICEBERG_SOURCE_DIR" "$ICEBERG_PATCH_DIR"
+        sync_iceberg_tip_scan_bind_info_patch "$ICEBERG_SOURCE_DIR" "$ICEBERG_PATCH_DIR"
+        sync_iceberg_tip_row_filter_parser_patch "$ICEBERG_SOURCE_DIR" "$ICEBERG_PATCH_DIR"
+        sync_iceberg_tip_task_executor_patch "$ICEBERG_SOURCE_DIR" "$ICEBERG_PATCH_DIR"
+        prune_iceberg_upstream_compat_patches "$ICEBERG_SOURCE_DIR" "$ICEBERG_PATCH_DIR"
         apply_patch_series_to_source_dir "$ICEBERG_SOURCE_DIR" "$ICEBERG_PATCH_DIR" "duckdb-iceberg"
         use_iceberg_source_dir "$ICEBERG_SOURCE_DIR" "duckdb-iceberg"
     elif [ -n "$CURRENT_ICEBERG_SOURCE_DIR" ]; then
@@ -695,6 +1209,13 @@ if [ -f .github/config/extensions/iceberg.cmake ]; then
             fi
             ensure_local_archive_source "duckdb/duckdb-iceberg" "$ICEBERG_REFRESH_REF" "$CURRENT_ICEBERG_SOURCE_DIR" "duckdb-iceberg" true
             sync_iceberg_tip_api_patch "$CURRENT_ICEBERG_SOURCE_DIR" "$ICEBERG_PATCH_DIR"
+            sync_iceberg_tip_semantics_patch "$CURRENT_ICEBERG_SOURCE_DIR" "$ICEBERG_PATCH_DIR"
+            sync_iceberg_tip_helper_api_patch "$CURRENT_ICEBERG_SOURCE_DIR" "$ICEBERG_PATCH_DIR"
+            sync_iceberg_tip_table_function_api_patch "$CURRENT_ICEBERG_SOURCE_DIR" "$ICEBERG_PATCH_DIR"
+            sync_iceberg_tip_scan_bind_info_patch "$CURRENT_ICEBERG_SOURCE_DIR" "$ICEBERG_PATCH_DIR"
+            sync_iceberg_tip_row_filter_parser_patch "$CURRENT_ICEBERG_SOURCE_DIR" "$ICEBERG_PATCH_DIR"
+            sync_iceberg_tip_task_executor_patch "$CURRENT_ICEBERG_SOURCE_DIR" "$ICEBERG_PATCH_DIR"
+            prune_iceberg_upstream_compat_patches "$CURRENT_ICEBERG_SOURCE_DIR" "$ICEBERG_PATCH_DIR"
             if grep -Fq 'optional_idx column_id_index' \
                 "$CURRENT_ICEBERG_SOURCE_DIR/src/execution/operator/iceberg_update.cpp"; then
                 ICEBERG_COMPAT_PATCH_REQUIRED=true
@@ -714,6 +1235,13 @@ if [ -f .github/config/extensions/iceberg.cmake ]; then
         fi
         ensure_local_archive_source "duckdb/duckdb-iceberg" "$ICEBERG_REFRESH_REF" "$ICEBERG_FALLBACK_DIR" "duckdb-iceberg"
         sync_iceberg_tip_api_patch "$ICEBERG_FALLBACK_DIR" "$ICEBERG_PATCH_DIR"
+        sync_iceberg_tip_semantics_patch "$ICEBERG_FALLBACK_DIR" "$ICEBERG_PATCH_DIR"
+        sync_iceberg_tip_helper_api_patch "$ICEBERG_FALLBACK_DIR" "$ICEBERG_PATCH_DIR"
+        sync_iceberg_tip_table_function_api_patch "$ICEBERG_FALLBACK_DIR" "$ICEBERG_PATCH_DIR"
+        sync_iceberg_tip_scan_bind_info_patch "$ICEBERG_FALLBACK_DIR" "$ICEBERG_PATCH_DIR"
+        sync_iceberg_tip_row_filter_parser_patch "$ICEBERG_FALLBACK_DIR" "$ICEBERG_PATCH_DIR"
+        sync_iceberg_tip_task_executor_patch "$ICEBERG_FALLBACK_DIR" "$ICEBERG_PATCH_DIR"
+        prune_iceberg_upstream_compat_patches "$ICEBERG_FALLBACK_DIR" "$ICEBERG_PATCH_DIR"
         if grep -Fq 'optional_idx column_id_index' \
             "$ICEBERG_FALLBACK_DIR/src/execution/operator/iceberg_update.cpp"; then
             ICEBERG_COMPAT_PATCH_REQUIRED=true
@@ -727,6 +1255,13 @@ if [ -f .github/config/extensions/iceberg.cmake ]; then
             log_warning "duckdb-iceberg fallback source is stale or partially patched; refreshing from archive"
             ensure_local_archive_source "duckdb/duckdb-iceberg" "$ICEBERG_REFRESH_REF" "$ICEBERG_FALLBACK_DIR" "duckdb-iceberg" true
             sync_iceberg_tip_api_patch "$ICEBERG_FALLBACK_DIR" "$ICEBERG_PATCH_DIR"
+            sync_iceberg_tip_semantics_patch "$ICEBERG_FALLBACK_DIR" "$ICEBERG_PATCH_DIR"
+            sync_iceberg_tip_helper_api_patch "$ICEBERG_FALLBACK_DIR" "$ICEBERG_PATCH_DIR"
+            sync_iceberg_tip_table_function_api_patch "$ICEBERG_FALLBACK_DIR" "$ICEBERG_PATCH_DIR"
+            sync_iceberg_tip_scan_bind_info_patch "$ICEBERG_FALLBACK_DIR" "$ICEBERG_PATCH_DIR"
+            sync_iceberg_tip_row_filter_parser_patch "$ICEBERG_FALLBACK_DIR" "$ICEBERG_PATCH_DIR"
+            sync_iceberg_tip_task_executor_patch "$ICEBERG_FALLBACK_DIR" "$ICEBERG_PATCH_DIR"
+            prune_iceberg_upstream_compat_patches "$ICEBERG_FALLBACK_DIR" "$ICEBERG_PATCH_DIR"
         fi
         apply_patch_series_to_source_dir "$ICEBERG_FALLBACK_DIR" "$ICEBERG_PATCH_DIR" "duckdb-iceberg"
         use_iceberg_source_dir "$ICEBERG_FALLBACK_DIR" "duckdb-iceberg"
@@ -736,13 +1271,26 @@ if [ "$WITH_SPATIAL" = true ] && [ -f .github/config/extensions/spatial.cmake ];
     sed -i '/DONT_LINK/d' .github/config/extensions/spatial.cmake
     ensure_include_after_git_tag .github/config/extensions/spatial.cmake "APPLY_PATCHES"
     mkdir -p .github/patches/extensions/spatial
-    if grep -Fq 'GIT_TAG 2b072abd2a3875b5318de5c9d0263bf98fca8474' \
+    if grep -Eq 'GIT_TAG (2b072abd2a3875b5318de5c9d0263bf98fca8474|9926b5806a34363a7d58f6e0edbee272534712bc|a3dbcd1781ec26c3a1be9bd622be05b376d6f47a|d332807f4ffdcc4da0092fe760ef48266f548941)' \
         .github/config/extensions/spatial.cmake; then
         rm -f .github/patches/extensions/spatial/gdal-tip-compat.patch
         log_success "Skipping Spatial GDAL compatibility patch already present at current tip"
     else
         cp "$BUILD_SCRIPT_DIR/patches/spatial-current-duckdb.patch" \
            .github/patches/extensions/spatial/gdal-tip-compat.patch
+    fi
+    if grep -Fq 'GIT_TAG d332807f4ffdcc4da0092fe760ef48266f548941' \
+        .github/config/extensions/spatial.cmake; then
+        cp "$BUILD_SCRIPT_DIR/patches/spatial-gdal-test-semantics.patch" \
+           .github/patches/extensions/spatial/0016-gdal-test-semantics.patch
+        cp "$BUILD_SCRIPT_DIR/patches/spatial-geos-tip-repeated-points.patch" \
+           .github/patches/extensions/spatial/0017-geos-tip-repeated-points.patch
+        cp "$BUILD_SCRIPT_DIR/patches/spatial-geos-3.15-test-expectations.patch" \
+           .github/patches/extensions/spatial/0018-geos-3.15-test-expectations.patch
+    else
+        rm -f .github/patches/extensions/spatial/0016-gdal-test-semantics.patch
+        rm -f .github/patches/extensions/spatial/0017-geos-tip-repeated-points.patch
+        rm -f .github/patches/extensions/spatial/0018-geos-3.15-test-expectations.patch
     fi
     if grep -Fq 'GIT_TAG 2b072abd2a3875b5318de5c9d0263bf98fca8474' \
         .github/config/extensions/spatial.cmake; then
@@ -755,42 +1303,58 @@ if [ "$WITH_SPATIAL" = true ] && [ -f .github/config/extensions/spatial.cmake ];
         fi
         cp "$BUILD_SCRIPT_DIR/patches/spatial-xmin-shared-ptr.patch" \
            .github/patches/extensions/spatial/0007-z-xmin-function-set-shared-ptr.patch
+    else
+        rm -f .github/patches/extensions/spatial/0007-z-xmin-function-set-shared-ptr.patch
     fi
     log_success "spatial config patched"
 fi
 # Step 4b: Create extension patch files
 log_info "Step 4b: Creating extension patch files..."
 
-if grep -Fq 'GIT_TAG 03d72f5056f3b831168ab354358abb1968527b62' \
-    .github/config/extensions/excel.cmake; then
-    mkdir -p .github/patches/extensions/excel
-    cp "$BUILD_SCRIPT_DIR/patches/excel-tip-api.patch" \
-       .github/patches/extensions/excel/0010-duckdb-tip-api.patch
-    ensure_include_after_git_tag .github/config/extensions/excel.cmake "APPLY_PATCHES"
-    log_success "Configured Excel DuckDB table-function API compatibility patch"
-fi
-if grep -Fq 'GIT_TAG a33adba985f7e418a446a20c26bd6b7f073358a4' \
-    .github/config/extensions/delta.cmake; then
-    mkdir -p .github/patches/extensions/delta
-    cp "$BUILD_SCRIPT_DIR/patches/delta-tip-api.patch" \
-       .github/patches/extensions/delta/0001-duckdb-tip-api.patch
-    ensure_include_after_git_tag .github/config/extensions/delta.cmake "APPLY_PATCHES"
-    log_success "Configured Delta DuckDB table-function API compatibility patch"
-fi
-
-if grep -Fq 'GIT_TAG a0fcfdece407d3450dae7ce19baa1251f11fd356' \
+    if grep -Eq 'GIT_TAG (a0fcfdece407d3450dae7ce19baa1251f11fd356|8d201d476ce690dac2e33921547c43e4daca587a)' \
     .github/config/extensions/postgres_scanner.cmake; then
     mkdir -p .github/patches/extensions/postgres_scanner
     cp "$BUILD_SCRIPT_DIR/patches/postgres-scanner-tip-api.patch" \
        .github/patches/extensions/postgres_scanner/0003-duckdb-tip-api.patch
+    if grep -Fq 'GIT_TAG 8d201d476ce690dac2e33921547c43e4daca587a' \
+        .github/config/extensions/postgres_scanner.cmake; then
+        cp "$BUILD_SCRIPT_DIR/patches/postgres-scanner-tip-table-entry.patch" \
+           .github/patches/extensions/postgres_scanner/0004-duckdb-tip-table-entry.patch
+    else
+        rm -f .github/patches/extensions/postgres_scanner/0004-duckdb-tip-table-entry.patch
+    fi
     log_success "Configured Postgres scanner tip API compatibility patch"
 fi
-if grep -Fq 'GIT_TAG 8bf846472bd5e696dcedfbfd6451f6e78194c55e' \
+if grep -Eq 'GIT_TAG (8bf846472bd5e696dcedfbfd6451f6e78194c55e|576e803219d53eddd82adea21fc28649bab5af2c)' \
     .github/config/extensions/mysql_scanner.cmake; then
     mkdir -p .github/patches/extensions/mysql_scanner
     cp "$BUILD_SCRIPT_DIR/patches/mysql-scanner-tip-api.patch" \
        .github/patches/extensions/mysql_scanner/0004-duckdb-tip-api.patch
+    if grep -Fq 'GIT_TAG 576e803219d53eddd82adea21fc28649bab5af2c' \
+        .github/config/extensions/mysql_scanner.cmake; then
+        cp "$BUILD_SCRIPT_DIR/patches/mysql-scanner-tip-followup.patch" \
+           .github/patches/extensions/mysql_scanner/0005-duckdb-tip-followup.patch
+            cp "$BUILD_SCRIPT_DIR/patches/mysql-scanner-tip-types.patch" \
+               .github/patches/extensions/mysql_scanner/0006-duckdb-tip-types.patch
+        cp "$BUILD_SCRIPT_DIR/patches/mysql-scanner-tip-logical-types.patch" \
+           .github/patches/extensions/mysql_scanner/0007-duckdb-tip-logical-types.patch
+    else
+        rm -f .github/patches/extensions/mysql_scanner/0005-duckdb-tip-followup.patch
+            rm -f .github/patches/extensions/mysql_scanner/0006-duckdb-tip-types.patch
+        rm -f .github/patches/extensions/mysql_scanner/0007-duckdb-tip-logical-types.patch
+    fi
     log_success "Configured MySQL scanner tip API compatibility patch"
+fi
+if grep -Fq 'GIT_TAG d2e4b9de4180397f4b8fed80d0a4326d50cd3d61' \
+    .github/config/extensions/httpfs.cmake; then
+    mkdir -p .github/patches/extensions/httpfs
+    rm -f .github/patches/extensions/httpfs/0004-parse-memory-limit-or-maximum.patch
+    cp "$BUILD_SCRIPT_DIR/patches/httpfs-tip-api.patch" \
+       .github/patches/extensions/httpfs/0001-duckdb-tip-api.patch
+    ensure_include_after_git_tag .github/config/extensions/httpfs.cmake "APPLY_PATCHES"
+    log_success "Configured HTTPFS DuckDB retry/memory API compatibility patch"
+else
+    rm -f .github/patches/extensions/httpfs/0001-duckdb-tip-api.patch
 fi
 if grep -Fq 'GIT_TAG d786c8bd414ef417d6d4cb1b4f531dd2e7b8f7c3' \
     .github/config/extensions/avro.cmake; then
@@ -799,6 +1363,22 @@ if grep -Fq 'GIT_TAG d786c8bd414ef417d6d4cb1b4f531dd2e7b8f7c3' \
        .github/patches/extensions/avro/0005-duckdb-tip-api.patch
     ensure_include_after_git_tag .github/config/extensions/avro.cmake "APPLY_PATCHES"
     log_success "Configured Avro DuckDB tip API compatibility patch"
+elif grep -Eq 'GIT_TAG (516658d44abf0e0d71895c254e0caf4650744bf6|720dd8e4227d488e5e5191bb5ae3745afb347930)' \
+    .github/config/extensions/avro.cmake; then
+    mkdir -p .github/patches/extensions/avro
+    rm -f .github/patches/extensions/avro/0005-duckdb-tip-api.patch
+    cp "$BUILD_SCRIPT_DIR/patches/avro-cpp-api-tip.patch" \
+       .github/patches/extensions/avro/0005-duckdb-cpp-api-tip.patch
+    ensure_include_after_git_tag .github/config/extensions/avro.cmake "APPLY_PATCHES"
+    log_success "Configured Avro current-tip C++ Factory/registration API port"
+else
+    rm -f .github/patches/extensions/avro/0005-duckdb-cpp-api-tip.patch
+fi
+if grep -Fq 'GIT_TAG 4d95356ce9433a14165156dbc6f59dcc91bd4889' \
+    .github/config/extensions/avro.cmake; then
+    rm -f .github/patches/extensions/avro/0002-timestamptz-offset-seconds.patch
+    rm -f .github/patches/extensions/avro/0003-decimal-int128-short-encoding.patch
+    log_success "Skipping obsolete Avro timezone and decimal patches; current tip replaced both paths"
 fi
 if grep -Fq 'GIT_TAG 623ee80e0bd5a771347f7dd320915cc3ef2fb965' \
     .github/config/extensions/fts.cmake; then
@@ -816,15 +1396,52 @@ if grep -Fq 'GIT_TAG 3e0372bc70fe69e18bf96c5aabb6bead80628c55' \
     ensure_include_after_git_tag .github/config/extensions/aws.cmake "APPLY_PATCHES"
     log_success "Configured AWS DuckDB tip API compatibility patch"
 fi
-if grep -Fq 'GIT_TAG f964cece8ecfe9006a607aa0a3e9b9030296c54f' \
+if grep -Fq 'GIT_TAG cf1ea8d6c4836a0c0f87dc2c76eb9802705b26b5' \
+    .github/config/extensions/aws.cmake; then
+    rm -f .github/patches/extensions/aws/0001-table-function-signature-options.patch \
+          .github/patches/extensions/aws/0002-collection-get-value.patch
+    log_success "Skipping AWS signature/value patches already integrated at current tip"
+fi
+if grep -Fq 'GIT_TAG c19ca48dadcb26febdabf23eae08c753c77eea21' \
+    .github/config/extensions/quack.cmake; then
+    mkdir -p .github/patches/extensions/quack
+    rm -f .github/patches/extensions/quack/0003-duckdb-tip-parser-api.patch
+    cp "$BUILD_SCRIPT_DIR/patches/quack-tip-table-entry.patch" \
+       .github/patches/extensions/quack/0004-table-function-get-table-entry.patch
+    ensure_include_after_git_tag .github/config/extensions/quack.cmake "APPLY_PATCHES"
+    log_success "Skipping stale Quack API downgrade; preserving current table-entry callback patch"
+elif grep -Fq 'GIT_TAG f964cece8ecfe9006a607aa0a3e9b9030296c54f' \
     .github/config/extensions/quack.cmake; then
     mkdir -p .github/patches/extensions/quack
     cp "$BUILD_SCRIPT_DIR/patches/quack-tip-parser-api.patch" \
        .github/patches/extensions/quack/0003-duckdb-tip-parser-api.patch
+    rm -f .github/patches/extensions/quack/0004-table-function-get-table-entry.patch
     ensure_include_after_git_tag .github/config/extensions/quack.cmake "APPLY_PATCHES"
     log_success "Configured Quack DuckDB parser API compatibility patch"
 fi
-if grep -Fq 'GIT_TAG 41520960947facfb1f8063ef6591dd83f3df414b' \
+if [ -f .github/config/extensions/quack.cmake ] && \
+    grep -q 'duckdb_extension_load(quack' .github/config/extensions/quack.cmake; then
+    mkdir -p .github/patches/extensions/quack
+    cp "$BUILD_SCRIPT_DIR/patches/quack-heartbeat-stop-on-catalog-close.patch" \
+       .github/patches/extensions/quack/0005-heartbeat-stop-on-catalog-close.patch
+    cp "$BUILD_SCRIPT_DIR/patches/quack-heartbeat-stop-on-database-shutdown.patch" \
+       .github/patches/extensions/quack/0006-heartbeat-stop-on-database-shutdown.patch
+    cp "$BUILD_SCRIPT_DIR/patches/quack-stop-bound-listener.patch" \
+       .github/patches/extensions/quack/0007-stop-bound-listener.patch
+    cp "$BUILD_SCRIPT_DIR/patches/quack-result-ttl-wait-for-sort.patch" \
+       .github/patches/extensions/quack/0008-result-ttl-wait-for-sort.patch
+    cp "$BUILD_SCRIPT_DIR/patches/quack-database-shutdown-stop-servers.patch" \
+       .github/patches/extensions/quack/0009-database-shutdown-stop-servers.patch
+    ensure_include_after_git_tag .github/config/extensions/quack.cmake "APPLY_PATCHES"
+    log_success "Configured Quack shutdown cleanup, listener teardown, and async result TTL test barrier"
+fi
+if grep -Fq 'GIT_TAG 80d94d28f06994cc54aa36773c607b04c912268e' \
+    .github/config/extensions/unity_catalog.cmake; then
+    rm -f .github/patches/extensions/unity_catalog/0001-duckdb-tip-api.patch
+    sed -i '/^[[:space:]]*APPLY_PATCHES[[:space:]]*$/d' \
+        .github/config/extensions/unity_catalog.cmake
+    log_success "Skipping Unity Catalog compatibility patch already superseded by current extension source"
+elif grep -Fq 'GIT_TAG 41520960947facfb1f8063ef6591dd83f3df414b' \
     .github/config/extensions/unity_catalog.cmake; then
     mkdir -p .github/patches/extensions/unity_catalog
     cp "$BUILD_SCRIPT_DIR/patches/unity-catalog-tip-api.patch" \
@@ -832,13 +1449,65 @@ if grep -Fq 'GIT_TAG 41520960947facfb1f8063ef6591dd83f3df414b' \
     ensure_include_after_git_tag .github/config/extensions/unity_catalog.cmake "APPLY_PATCHES"
     log_success "Configured Unity Catalog DuckDB table-function API compatibility patch"
 fi
-if grep -Fq 'GIT_TAG 6c5ae1b105892bb9f95386e783a5b7fc8b9adae3' \
-    .github/config/extensions/vss.cmake; then
-    mkdir -p .github/patches/extensions/vss
-    cp "$BUILD_SCRIPT_DIR/patches/vss-tip-api.patch" \
-       .github/patches/extensions/vss/0002-duckdb-tip-api.patch
-    ensure_include_after_git_tag .github/config/extensions/vss.cmake "APPLY_PATCHES"
-    log_success "Configured VSS DuckDB storage/pragma API compatibility patch"
+if [ -n "$VSS_DIR" ]; then
+    cat > .github/config/extensions/vss.cmake <<EOF
+duckdb_extension_load(vss
+    SOURCE_DIR "$VSS_DIR"
+    LOAD_TESTS
+)
+EOF
+    rm -f .github/patches/extensions/vss/*.patch
+    VSS_SOURCE_SHA=$(git -C "$VSS_DIR" rev-parse HEAD 2>/dev/null || true)
+    if [ "$VSS_SOURCE_SHA" = "3685131eacaf0d467d430be5c4e5e7d1d483437a" ]; then
+        VSS_PREFILTER_PATCH="$BUILD_SCRIPT_DIR/patches/vss-prefilter-exact-fallback.patch"
+        if git -C "$VSS_DIR" apply --reverse --check "$VSS_PREFILTER_PATCH" >/dev/null 2>&1; then
+            log_success "VSS filtered-search fallback already present in source directory"
+        elif git -C "$VSS_DIR" apply --check "$VSS_PREFILTER_PATCH" >/dev/null 2>&1; then
+            mkdir -p .github/patches/extensions/vss
+            cp "$VSS_PREFILTER_PATCH" \
+               .github/patches/extensions/vss/0001-prefilter-exact-fallback.patch
+            sed -i '/SOURCE_DIR/a\    APPLY_PATCHES' .github/config/extensions/vss.cmake
+            log_success "Configured VSS filtered-search underfill fallback"
+        else
+            log_error "VSS filtered-search fallback patch does not apply to $VSS_DIR"
+            exit 1
+        fi
+    fi
+    log_success "Configured VSS from source directory $VSS_DIR"
+else
+    rm -f .github/patches/extensions/vss/0002-prefilter-exact-fallback.patch
+    if grep -Fq 'GIT_TAG 6c5ae1b105892bb9f95386e783a5b7fc8b9adae3' \
+        .github/config/extensions/vss.cmake; then
+        sed -i 's/GIT_TAG 6c5ae1b105892bb9f95386e783a5b7fc8b9adae3/GIT_TAG 3685131eacaf0d467d430be5c4e5e7d1d483437a/' \
+            .github/config/extensions/vss.cmake
+        log_info "Advanced VSS to upstream tip 3685131 for current DuckDB parser/index APIs"
+    fi
+    if grep -Fq 'GIT_TAG 6c5ae1b105892bb9f95386e783a5b7fc8b9adae3' \
+        .github/config/extensions/vss.cmake; then
+        mkdir -p .github/patches/extensions/vss
+        cp "$BUILD_SCRIPT_DIR/patches/vss-tip-api.patch" \
+           .github/patches/extensions/vss/0002-duckdb-tip-api.patch
+        ensure_include_after_git_tag .github/config/extensions/vss.cmake "APPLY_PATCHES"
+        log_success "Configured VSS DuckDB storage/pragma API compatibility patch"
+    elif grep -Fq 'GIT_TAG 3685131eacaf0d467d430be5c4e5e7d1d483437a' \
+        .github/config/extensions/vss.cmake; then
+        mkdir -p .github/patches/extensions/vss
+        # Replace the bundled checkpoint/client-context patches; this tip-specific
+        # patch already carries those changes and the old hunks partially overlap.
+        rm -f .github/patches/extensions/vss/0002-checkpoint-api.patch \
+              .github/patches/extensions/vss/0003-client-context-includes.patch
+        cp "$BUILD_SCRIPT_DIR/patches/vss-tip-checkpoint-api.patch" \
+           .github/patches/extensions/vss/0001-duckdb-tip-checkpoint-api.patch
+        cp "$BUILD_SCRIPT_DIR/patches/vss-prefilter-exact-fallback.patch" \
+           .github/patches/extensions/vss/0002-prefilter-exact-fallback.patch
+        ensure_include_after_git_tag .github/config/extensions/vss.cmake "APPLY_PATCHES"
+        log_success "Configured VSS checkpoint/WAL compatibility and filtered-search fallback"
+    elif grep -Fq 'GIT_TAG ee9df713f36978ba26a91b42d1ed0a468a27e786' \
+        .github/config/extensions/vss.cmake; then
+        rm -f .github/patches/extensions/vss/*.patch
+        sed -i '/^[[:space:]]*APPLY_PATCHES[[:space:]]*$/d' .github/config/extensions/vss.cmake
+        log_success "Skipping VSS compatibility patches integrated at the current upstream tip"
+    fi
 fi
 mkdir -p .github/patches/extensions/postgres_scanner
 cat > .github/patches/extensions/postgres_scanner/static_build.patch << 'PATCH_EOF'
@@ -936,7 +1605,7 @@ mkdir -p .github/patches/extensions/delta
 mkdir -p .github/patches/extensions/mysql_scanner
 mkdir -p .github/patches/extensions/inet
 mkdir -p .github/patches/extensions/avro
-if grep -Fq 'GIT_TAG 61ce2d7245a0b27c479a16cb4b57ae0562b71880' \
+if grep -Eq 'GIT_TAG (61ce2d7245a0b27c479a16cb4b57ae0562b71880|ac0286a4742dd420d3fe5acf47a44ef991336f83)' \
     .github/config/extensions/inet.cmake; then
     cp "$BUILD_SCRIPT_DIR/patches/inet-capi-build.patch" \
        .github/patches/extensions/inet/capi-build.patch
@@ -972,6 +1641,8 @@ vcpkg_cmake_configure(
         -DBUILD_EXAMPLES=OFF
         -DBUILD_TESTS=OFF
         -DBUILD_DOCS=OFF
+        -DCMAKE_C_STANDARD=99
+        -DCMAKE_C_STANDARD_REQUIRED=ON
 )
 vcpkg_cmake_install()
 vcpkg_copy_pdbs()
@@ -983,7 +1654,33 @@ if(VCPKG_LIBRARY_LINKAGE STREQUAL "static" AND NOT VCPKG_TARGET_IS_WINDOWS)
 endif()
 file(INSTALL "${SOURCE_PATH}/lang/c/LICENSE" DESTINATION "${CURRENT_PACKAGES_DIR}/share/${PORT}" RENAME copyright)
 EOF
-if [ -f .github/patches/extensions/avro/0004-logical-type-compat.patch ]; then
+if [ "$WITH_SPATIAL" = true ]; then
+    # GDAL and Jansson both export json_object_get with incompatible signatures.
+    # Use GDAL's vendored JSON-C copy, whose public symbol is namespaced below.
+    GDAL_OVERLAY_PORT="$DUCKDB_DIR/.github/vcpkg_ports/gdal"
+    mkdir -p "$GDAL_OVERLAY_PORT"
+    cp -a "$VCPKG_DIR/ports/gdal/." "$GDAL_OVERLAY_PORT/"
+    cp "$BUILD_SCRIPT_DIR/patches/gdal-vendored-jsonc-symbol-namespace.patch" \
+       "$GDAL_OVERLAY_PORT/duckdb-gdal-jsonc-symbol-namespace.patch"
+    sed -i '/target-is-valid\.patch/a\        duckdb-gdal-jsonc-symbol-namespace.patch' \
+        "$GDAL_OVERLAY_PORT/portfile.cmake"
+    sed -i '/-DGDAL_USE_INTERNAL_LIBS=OFF/a\        -DGDAL_USE_JSONC=OFF\n        -DGDAL_USE_JSONC_INTERNAL=ON' \
+        "$GDAL_OVERLAY_PORT/portfile.cmake"
+    log_success "Prepared GDAL overlay with isolated vendored JSON-C symbols"
+fi
+if grep -Fq 'GIT_TAG 516658d44abf0e0d71895c254e0caf4650744bf6' \
+    .github/config/extensions/avro.cmake; then
+    rm -f .github/patches/extensions/avro/logical_type_compat.patch
+    log_success "Skipping Avro logical-type patch superseded by the current C++ API"
+elif grep -Fq 'GIT_TAG 720dd8e4227d488e5e5191bb5ae3745afb347930' \
+    .github/config/extensions/avro.cmake; then
+    rm -f .github/patches/extensions/avro/logical_type_compat.patch
+    log_success "Skipping Avro logical-type patch; current tip no longer uses the legacy reader accessors"
+elif grep -Fq 'GIT_TAG 4d95356ce9433a14165156dbc6f59dcc91bd4889' \
+    .github/config/extensions/avro.cmake; then
+    rm -f .github/patches/extensions/avro/logical_type_compat.patch
+    log_success "Skipping legacy Avro logical-type shim; current v2 reader uses the new C++ API"
+elif [ -f .github/patches/extensions/avro/0004-logical-type-compat.patch ]; then
     rm -f .github/patches/extensions/avro/logical_type_compat.patch
     log_success "avro logical-type compat already present upstream"
 else
@@ -1097,7 +1794,7 @@ diff --git a/src/avro_reader.cpp b/src/avro_reader.cpp
 
 PATCH_EOF
 fi
-if grep -Fq 'GIT_TAG 36a4d8ac56647e0810529a3c725162b0976ee73f' \
+if grep -Eq 'GIT_TAG (36a4d8ac56647e0810529a3c725162b0976ee73f|516658d44abf0e0d71895c254e0caf4650744bf6|720dd8e4227d488e5e5191bb5ae3745afb347930|4d95356ce9433a14165156dbc6f59dcc91bd4889)' \
     .github/config/extensions/avro.cmake; then
     cp "$BUILD_SCRIPT_DIR/patches/avro-c-standard.patch" \
        .github/patches/extensions/avro/9999-c-standard.patch
@@ -1151,7 +1848,7 @@ if [ "$SKIP_VCPKG" = false ]; then
     
     log_info "Installing AWS SDK (~5 min)..."
     ./vcpkg install --recurse aws-crt-cpp
-    ./vcpkg install --recurse aws-sdk-cpp[core,s3,transfer,config,sts,sso,identity-management,rds,redshift,cloudformation]
+    ./vcpkg install --recurse aws-sdk-cpp[core,s3,s3tables,transfer,config,sts,sso,identity-management,rds,redshift,redshift-serverless,cloudformation]
     
     log_info "Installing Azure SDK (~3 min)..."
     ./vcpkg install azure-storage-blobs-cpp azure-storage-files-datalake-cpp azure-identity-cpp
@@ -1166,9 +1863,25 @@ if [ "$SKIP_VCPKG" = false ]; then
     log_info "Installing libmariadb (for mysql_scanner)..."
     ./vcpkg install libmariadb
 
+    log_info "Installing minizip-ng (for excel)..."
+    ./vcpkg install minizip-ng[zlib]
+
     if [ "$WITH_SPATIAL" = true ]; then
         log_info "Installing spatial dependencies (GDAL/PROJ/GEOS/SQLite)..."
-        ./vcpkg install gdal[geos] proj geos expat sqlite3[rtree] curl openssl zlib
+        GDAL_LIBRARY="$VCPKG_DIR/installed/x64-linux/lib/libgdal.a"
+        if [ ! -f "$GDAL_LIBRARY" ] || ! nm "$GDAL_LIBRARY" 2>/dev/null | grep 'gdal__json_object_get' >/dev/null; then
+            # vcpkg considers an installed package with the same version current,
+            # even when an overlay changes its static-link configuration.
+            ./vcpkg remove --recurse gdal:x64-linux >/dev/null 2>&1 || true
+            ./vcpkg install --recurse --overlay-ports="$DUCKDB_DIR/.github/vcpkg_ports" \
+                gdal[geos] proj geos expat sqlite3[rtree] curl openssl zlib
+        else
+            log_success "GDAL already has isolated JSON-C symbols"
+        fi
+        if [ ! -f "$GDAL_LIBRARY" ] || ! nm "$GDAL_LIBRARY" 2>/dev/null | grep 'gdal__json_object_get' >/dev/null; then
+            log_error "GDAL was installed without the JSON-C symbol namespace fix"
+            exit 1
+        fi
     fi
     log_success "vcpkg dependencies installed"
     cd "$DUCKDB_DIR"
@@ -1176,10 +1889,47 @@ else
     log_warning "Skipping vcpkg dependency installation (--skip-vcpkg)"
 fi
 
+if [ "$WITH_SPATIAL" = true ]; then
+    GDAL_LIBRARY="$VCPKG_DIR/installed/x64-linux/lib/libgdal.a"
+    if [ ! -f "$GDAL_LIBRARY" ] || ! nm "$GDAL_LIBRARY" 2>/dev/null | grep 'gdal__json_object_get' >/dev/null; then
+        log_error "Spatial build requires GDAL with isolated JSON-C symbols; rerun without --skip-vcpkg"
+        exit 1
+    fi
+fi
+
+# The pinned nanoarrow vcpkg port exports flatccrt as a bare library name on
+# Linux, which loses the vcpkg prefix when Azure links its loadable extension.
+NANOARROW_TARGETS="$VCPKG_DIR/installed/x64-linux/share/nanoarrow/nanoarrow-targets.cmake"
+FLATCCRT_LIBRARY="$VCPKG_DIR/installed/x64-linux/lib/libflatccrt.a"
+if [ -f "$NANOARROW_TARGETS" ] && grep -Fq 'LINK_ONLY:flatccrt' "$NANOARROW_TARGETS"; then
+    if [ ! -f "$FLATCCRT_LIBRARY" ]; then
+        log_error "nanoarrow requires flatccrt, but $FLATCCRT_LIBRARY is missing"
+        exit 1
+    fi
+    sed -i 's@LINK_ONLY:flatccrt@LINK_ONLY:${_IMPORT_PREFIX}/lib/libflatccrt.a@g' \
+        "$NANOARROW_TARGETS"
+    log_success "Fixed nanoarrow flatccrt import path for Azure linking"
+fi
+
 # Step 6: Configure build
 log_info "Step 6: Configuring CMake (fetches extensions)..."
 BUILD_DIR="$DUCKDB_DIR/build/release-static"
 mkdir -p "$BUILD_DIR"
+# Vortex generates bindings inside its Cargo Git checkout. Keep that checkout
+# under the build tree (writable and disposable) instead of ~/.cargo, while
+# reusing the existing immutable registry and Git object caches when available.
+CARGO_HOME="$BUILD_DIR/cargo-home"
+mkdir -p "$CARGO_HOME"
+for cargo_cache in registry git/db; do
+    source_cache="$HOME/.cargo/$cargo_cache"
+    target_cache="$CARGO_HOME/$cargo_cache"
+    if [ -d "$source_cache" ] && [ ! -e "$target_cache" ]; then
+        mkdir -p "$(dirname "$target_cache")"
+        ln -s "$source_cache" "$target_cache"
+    fi
+done
+export CARGO_HOME
+log_info "Using build-local Cargo home at $CARGO_HOME"
 cd "$BUILD_DIR"
 sanitize_dirty_fetchcontent_deps
 cd "$DUCKDB_DIR"
@@ -1187,22 +1937,36 @@ cd "$DUCKDB_DIR"
 # Create minimal vcpkg.json to avoid manifest mode issues
 echo '{"name":"duckdb","version":"1.0.0"}' > vcpkg.json
 
-BUILD_EXTENSIONS="autocomplete;icu;tpcds;tpch;fts;json;parquet;sqlite_scanner;postgres_scanner;mysql_scanner;excel;vss;inet;avro;httpfs;aws;azure;iceberg"
+BUILD_EXTENSIONS="autocomplete;icu;tpcds;tpch;fts;json;parquet;sqlite_scanner;postgres_scanner;mysql_scanner;excel;vss;inet;avro;httpfs;aws;azure;iceberg;lance;vortex"
+# ODBC is built as an upstream C-API loadable sidecar, not as a statically
+# linked `${name}_extension` target, so exclude it from the binary autoload count.
+EXPECTED_EXTENSIONS=25
 if [ -z "$DUCKLAKE_DIR" ]; then
     BUILD_EXTENSIONS="${BUILD_EXTENSIONS};ducklake"
+    EXPECTED_EXTENSIONS=$((EXPECTED_EXTENSIONS + 1))
 fi
 BUILD_EXTENSIONS="${BUILD_EXTENSIONS};delta;unity_catalog;odbc_scanner;quack"
-EXPECTED_EXTENSIONS=24
 if [ "$WITH_SPATIAL" = true ]; then
     BUILD_EXTENSIONS="${BUILD_EXTENSIONS};spatial"
     EXPECTED_EXTENSIONS=$((EXPECTED_EXTENSIONS + 1))
 fi
 EXTRA_CMAKE_ARGS=()
-if [ -n "$DUCKDBSP_DIR" ]; then
-    EXTRA_CMAKE_ARGS+=("-DDBSP_USE_PARENT_DUCKDB=ON" "-DDUCKDB_SOURCE_DIR=$DUCKDB_DIR")
-fi
-if [ -n "$OPENIVM_DIR" ] && [ -n "$DUCKLAKE_DIR" ]; then
-    EXTRA_CMAKE_ARGS+=("-DOPENIVM_DUCKLAKE_SOURCE_DIR=$DUCKLAKE_DIR")
+if [ -n "$VORTEX_DIR" ]; then
+    VORTEX_CARGO_LOCK="$VORTEX_DIR/vortex-extension/Cargo.lock"
+    if [ ! -f "$VORTEX_CARGO_LOCK" ]; then
+        log_error "Vortex Cargo.lock not found at $VORTEX_CARGO_LOCK"
+        exit 1
+    fi
+    VORTEX_PACKAGE_VERSION=$(sed -n '/^name = "vortex-duckdb"$/ { n; s/^version = "\([^"]*\)"/\1/p; q; }' \
+        "$VORTEX_CARGO_LOCK")
+    if [ -z "$VORTEX_PACKAGE_VERSION" ]; then
+        log_error "Could not read vortex-duckdb package version from $VORTEX_CARGO_LOCK"
+        exit 1
+    fi
+    EXTRA_CMAKE_ARGS+=("-DVORTEX_VERSION=$VORTEX_PACKAGE_VERSION")
+    log_info "Using Vortex extension version $VORTEX_PACKAGE_VERSION from Cargo.lock"
+else
+    EXTRA_CMAKE_ARGS+=("-UVORTEX_VERSION")
 fi
 # Note: --allow-multiple-definition is required because postgres_scanner
 # shares some common helper functions with other static extensions.
@@ -1216,6 +1980,7 @@ timeout --foreground "$CMAKE_CONFIGURE_TIMEOUT" cmake -S "$DUCKDB_DIR" -B "$BUIL
   -DCMAKE_EXE_LINKER_FLAGS="-Wl,--allow-multiple-definition" \
   -DCMAKE_SHARED_LINKER_FLAGS="-Wl,--allow-multiple-definition" \
   -DBUILD_EXTENSIONS="$BUILD_EXTENSIONS" \
+  -DLINK_CORE_EXTENSIONS=ON \
   -DDUCKDB_EXTENSION_CONFIGS="$DUCKDB_DIR/extension/extension_config_local.cmake" \
   -DENABLE_C_API_TESTS="${ENABLE_C_API_TESTS:-OFF}" \
   "${EXTRA_CMAKE_ARGS[@]}" \
@@ -1277,7 +2042,11 @@ fi
 
 # Step 8: Build
 log_info "Step 8: Building DuckDB (5-10 minutes)..."
-NUM_CORES=$(nproc)
+NUM_CORES=${BUILD_JOBS:-$(nproc)}
+if ! [[ "$NUM_CORES" =~ ^[1-9][0-9]*$ ]]; then
+    log_error "Build job count must be a positive integer: $NUM_CORES"
+    exit 1
+fi
 log_info "Building with $NUM_CORES cores..."
 START_TIME=$(date +%s)
 EXTENSION_STATIC_BUILD=1 make -j"$NUM_CORES"
@@ -1296,6 +2065,17 @@ BINARY_SIZE=$(du -h ./duckdb | cut -f1)
 log_success "Binary created: $BINARY_SIZE"
 
 log_info "Checking extensions..."
+ODBC_EXTENSION_PATH="$BUILD_DIR/extension/odbc_scanner/odbc_scanner.duckdb_extension"
+if [ ! -f "$ODBC_EXTENSION_PATH" ]; then
+    log_error "ODBC loadable extension was not produced at $ODBC_EXTENSION_PATH"
+    exit 1
+fi
+if ! ./duckdb -unsigned -c "LOAD '$ODBC_EXTENSION_PATH'; SELECT count(*) FROM odbc_list_drivers();" >/dev/null 2>&1; then
+    log_error "ODBC loadable extension failed its runtime smoke test"
+    exit 1
+fi
+log_success "ODBC loadable extension runtime smoke test passed"
+
 EXTENSION_COUNT=$(./duckdb -c "SELECT COUNT(*) FROM duckdb_extensions() WHERE loaded=true;" 2>/dev/null | grep -o '[0-9]\+' | tail -1)
 
 if [ "$EXTENSION_COUNT" = "$EXPECTED_EXTENSIONS" ]; then
@@ -1311,8 +2091,8 @@ if [ "$EXTENSION_COUNT" = "$EXPECTED_EXTENSIONS" ]; then
     echo -e "Build time: ${BLUE}$BUILD_TIME seconds${NC}"
     echo ""
     echo "Extensions loaded:"
-    ./duckdb -c "SELECT extension_name FROM duckdb_extensions() WHERE loaded=true ORDER BY extension_name;" 2>/dev/null | \
-        awk '/│/ && !/extension_name/ && !/varchar/ {gsub(/│/,""); gsub(/^ +| +$/,""); if (length($0) > 0) print "  - " $0}'
+    ./duckdb -csv -noheader -c "SELECT extension_name FROM duckdb_extensions() WHERE loaded=true ORDER BY extension_name;" 2>/dev/null | \
+        sed 's/^/  - /'
     echo ""
 else
     log_warning "Expected $EXPECTED_EXTENSIONS extensions, found $EXTENSION_COUNT"

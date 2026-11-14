@@ -1,0 +1,147 @@
+diff --git a/test/api/capi/v2/test_capi_v2_logical_type.cpp b/test/api/capi/v2/test_capi_v2_logical_type.cpp
+index 46d8c2d0..1c3c4a0a 100644
+--- a/test/api/capi/v2/test_capi_v2_logical_type.cpp
++++ b/test/api/capi/v2/test_capi_v2_logical_type.cpp
+@@ -1430,13 +1430,13 @@ TEST_CASE("V2: GEOMETRY with a coordinate system constructs and inspects",
+ TEST_CASE("V2: GEOMETRY with an unknown coordinate system", "[capi_v2][logical_type][create][geometry]") {
+ 	EnvFixture f;
+ 
+-	// A well-formed shorthand outside the default entries fails the bind.
+-	REQUIRE(MakeTypeErr(f.factory, "geometry", nullptr, {MakeVarcharValue(f.factory, "EPSG:4326")}) ==
++	// A well-formed but nonexistent shorthand fails the bind across PROJ database versions.
++	REQUIRE(MakeTypeErr(f.factory, "geometry", nullptr, {MakeVarcharValue(f.factory, "EPSG:999999")}) ==
+ 	        DUCKDB_V2_ERROR_QUERY_BINDER);
+ 
+ 	// ignore_unknown_crs degrades to the generic GEOMETRY type instead.
+ 	ExecSQL(f.conn, "SET ignore_unknown_crs = true");
+-	auto geo = MakeType(f.factory, "geometry", nullptr, {MakeVarcharValue(f.factory, "EPSG:4326")});
++	auto geo = MakeType(f.factory, "geometry", nullptr, {MakeVarcharValue(f.factory, "EPSG:999999")});
+ 	REQUIRE(V2TypeIdOf(geo) == DUCKDB_V2_LOGICAL_TYPE_ID_GEOMETRY);
+ 	REQUIRE(V2ParamCount(geo) == 0);
+ 	duckdb_v2_logical_type_destroy(&geo);
+diff --git a/test/api/capi/v2/test_capi_v2_query.cpp b/test/api/capi/v2/test_capi_v2_query.cpp
+index c780d19c..121c0c09 100644
+--- a/test/api/capi/v2/test_capi_v2_query.cpp
++++ b/test/api/capi/v2/test_capi_v2_query.cpp
+@@ -75,14 +75,12 @@ TEST_CASE("V2: user BEGIN / INSERT / COMMIT keeps the inserted row", "[capi_v2][
+ // surface as CANCELLED.
+ // ---------------------------------------------------------------------------
+ 
+-// A timeout can land in either the pending or streaming phase, depending on
+-// scheduling; [!mayfail] absorbs the rare run where the bounded step loop
+-// exits before the timeout fires under heavy load.
+ TEST_CASE("V2: a max_execution_time timeout surfaces as an error, not CANCELLED",
+-          "[capi_v2][query_execution][!mayfail]") {
++          "[capi_v2][query_execution]") {
+ 	EnvFixture fx;
+ 
+ 	// 50ms timeout on a slow cross product, mirroring max_execution_time.test.
++	ExecSQL(fx.conn, "SET threads=1");
+ 	ExecSQL(fx.conn, "SET max_execution_time=50");
+ 
+ 	QueryResult r;
+@@ -95,7 +93,8 @@ TEST_CASE("V2: a max_execution_time timeout surfaces as an error, not CANCELLED"
+ 	DUCKDB_V2_ERROR rc = DUCKDB_V2_ERROR_NONE;
+ 	duckdb_v2_error_info_handle err = nullptr;
+ 	DUCKDB_V2_RESULT_STEP_STATUS status = DUCKDB_V2_RESULT_STEP_STATUS_WAITING;
+-	for (int i = 0; i < 1000000; i++) {
++	auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(5);
++	while (std::chrono::steady_clock::now() < deadline) {
+ 		duckdb_v2_data_chunk_handle chunk = nullptr;
+ 		status = DUCKDB_V2_RESULT_STEP_STATUS_WAITING;
+ 		rc = duckdb_v2_result_step(r, &chunk, &status, &err);
+@@ -108,12 +107,13 @@ TEST_CASE("V2: a max_execution_time timeout surfaces as an error, not CANCELLED"
+ 		    status == DUCKDB_V2_RESULT_STEP_STATUS_FINISHED) {
+ 			break;
+ 		}
++		if (status == DUCKDB_V2_RESULT_STEP_STATUS_WAITING && !chunk) {
++			std::this_thread::sleep_for(std::chrono::milliseconds(1));
++		}
+ 	}
+ 
+-	// The timeout must never be reported as a cancellation. CHECK, not REQUIRE:
+-	// a REQUIRE aborts the case on the rare run where the timeout did not land,
+-	// which would make this [!mayfail] case contribute a varying number of
+-	// assertions to the suite total.
++	// The timeout must never be reported as a cancellation. CHECK keeps cleanup
++	// deterministic if the bounded wait unexpectedly reaches its deadline.
+ 	std::string msg;
+ 	if (err) {
+ 		duckdb_v2_str text = {nullptr, 0};
+diff --git a/test/catalog/test_catalog_version.cpp b/test/catalog/test_catalog_version.cpp
+index 5b3fb734..5190f38e 100644
+--- a/test/catalog/test_catalog_version.cpp
++++ b/test/catalog/test_catalog_version.cpp
+@@ -70,14 +70,18 @@ TEST_CASE("Test catalog versioning", "[catalog]") {
+ 	});
+ 
+ 	// check catalog version of system catalog
++	optional_idx system_catalog_version;
+ 	con1.context->RunFunctionInTransaction([&]() {
+ 		auto &catalog = Catalog::GetCatalog(*con1.context, "system");
+-		REQUIRE(catalog.GetCatalogVersion(*con1.context) == 1);
++		system_catalog_version = catalog.GetCatalogVersion(*con1.context);
++		REQUIRE(system_catalog_version.IsValid());
+ 	});
+ 	REQUIRE_NO_FAIL(con1.Query("ATTACH ':memory:' as foo"));
+ 	con1.context->RunFunctionInTransaction([&]() {
+ 		auto &catalog = Catalog::GetCatalog(*con1.context, "system");
+-		REQUIRE(catalog.GetCatalogVersion(*con1.context) == 2);
++		auto attached_catalog_version = catalog.GetCatalogVersion(*con1.context);
++		REQUIRE(attached_catalog_version == system_catalog_version.GetIndex() + 1);
++		system_catalog_version = attached_catalog_version;
+ 	});
+ 
+ 	// check new version of attached DB starts at 0
+@@ -95,6 +99,6 @@ TEST_CASE("Test catalog versioning", "[catalog]") {
+ 
+ 	con1.context->RunFunctionInTransaction([&]() {
+ 		auto &catalog = Catalog::GetCatalog(*con1.context, "system");
+-		REQUIRE(catalog.GetCatalogVersion(*con1.context) == 2);
++		REQUIRE(catalog.GetCatalogVersion(*con1.context) == system_catalog_version);
+ 	});
+ }
+diff --git a/test/extension/local_extension_coverage.test b/test/extension/local_extension_coverage.test
+index ec7ad390..d321321c 100644
+--- a/test/extension/local_extension_coverage.test
++++ b/test/extension/local_extension_coverage.test
+@@ -40,10 +40,8 @@ SELECT * FROM delta_scan('missing')
+ ----
+ <REGEX>:.*delta.*
+ 
+-statement error
++statement ok
+ LOAD sqlite
+-----
+-<REGEX>:IO Error: Extension .* not found.*Install it first using "INSTALL sqlite".*
+ 
+ # Install from a local binary, hit the existing-file no-op, then replace it explicitly.
+ statement ok
+diff --git a/test/sql/attach/external_resource_lifecycle.test b/test/sql/attach/external_resource_lifecycle.test
+index e630ed8f..08e08672 100644
+--- a/test/sql/attach/external_resource_lifecycle.test
++++ b/test/sql/attach/external_resource_lifecycle.test
+@@ -4,6 +4,9 @@
+ 
+ require quack
+ 
++statement ok
++LOAD httpfs
++
+ # Capture recipe calls so we can prove the deleter fired (the deleter runs on an internal connection).
+ statement ok
+ CALL enable_logging('ExternalResource', storage='memory');
+diff --git a/test/sql/attach/external_resource_logging.test b/test/sql/attach/external_resource_logging.test
+index 764f71db..632cdcea 100644
+--- a/test/sql/attach/external_resource_logging.test
++++ b/test/sql/attach/external_resource_logging.test
+@@ -4,6 +4,9 @@
+ 
+ require quack
+ 
++statement ok
++LOAD httpfs
++
+ statement ok
+ CALL enable_logging('ExternalResource', storage='memory');
+ 

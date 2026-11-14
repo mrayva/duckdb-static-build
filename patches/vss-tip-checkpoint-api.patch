@@ -1,0 +1,113 @@
+diff --git a/src/hnsw/hnsw_index.cpp b/src/hnsw/hnsw_index.cpp
+index 9519a2f..2ee0b66 100644
+--- a/src/hnsw/hnsw_index.cpp
++++ b/src/hnsw/hnsw_index.cpp
+@@ -33,6 +33,7 @@
+ #include "duckdb/planner/expression_iterator.hpp"
+ #include "duckdb/planner/operator/logical_get.hpp"
+ #include "duckdb/storage/partial_block_manager.hpp"
++#include "duckdb/storage/checkpoint/table_index_writer.hpp"
+ #include "duckdb/storage/storage_info.hpp"
+ #include "duckdb/storage/table/scan_state.hpp"
+ #include "duckdb/storage/table_io_manager.hpp"
+@@ -163,7 +164,7 @@ HNSWIndex::HNSWIndex(const Identifier &name, IndexConstraintType index_constrain
+ 
+ 	// Create a allocator for the linked blocks
+ 	auto &block_manager = table_io_manager.GetIndexBlockManager();
+-	linked_block_allocator = make_uniq<FixedSizeAllocator>(sizeof(LinkedBlock), block_manager);
++	linked_block_allocator = make_unsafe_uniq<FixedSizeAllocator>(sizeof(LinkedBlock), block_manager);
+ 
+ 	// We only support one ARRAY column
+ 	D_ASSERT(logical_types.size() == 1);
+@@ -605,25 +606,21 @@ void HNSWIndex::PersistToDisk() {
+ 	is_dirty = false;
+ }
+ 
+-IndexStorageInfo HNSWIndex::SerializeToDisk(QueryContext context, const case_insensitive_map_t<Value> &options) {
++IndexCheckpointResult HNSWIndex::Checkpoint(PartialBlockManager &partial_block_manager, StorageVersion) {
+ 
+ 	PersistToDisk();
++	linked_block_allocator = linked_block_allocator->Persist(partial_block_manager);
+ 
+ 	IndexStorageInfo info;
+ 	info.name = name;
+ 	info.root = root_block_ptr.Get();
+ 
+-	// Use the partial block manager to serialize allocator data.
+-	auto &block_manager = table_io_manager.GetIndexBlockManager();
+-	PartialBlockManager partial_block_manager(context, block_manager, PartialBlockType::FULL_CHECKPOINT);
+-	linked_block_allocator->SerializeBuffers(partial_block_manager);
+-	partial_block_manager.FlushPartialBlocks();
+ 	info.allocator_infos.push_back(linked_block_allocator->GetInfo());
+ 
+-	return info;
++	return {make_shared_ptr<IndexStorageInfo>(std::move(info)), nullptr};
+ }
+ 
+-IndexStorageInfo HNSWIndex::SerializeToWAL(const case_insensitive_map_t<Value> &options) {
++IndexStorageInfo HNSWIndex::SerializeToWAL(StorageVersion) {
+ 
+ 	PersistToDisk();
+ 
+diff --git a/src/hnsw/hnsw_index_physical_create.cpp b/src/hnsw/hnsw_index_physical_create.cpp
+index ca629b2..e97a723 100644
+--- a/src/hnsw/hnsw_index_physical_create.cpp
++++ b/src/hnsw/hnsw_index_physical_create.cpp
+@@ -7,6 +7,7 @@
+ #include "duckdb/common/exception/transaction_exception.hpp"
+ #include "duckdb/common/types/column/column_data_collection.hpp"
+ #include "duckdb/main/attached_database.hpp"
++#include "duckdb/main/client_context.hpp"
+ #include "duckdb/storage/buffer_manager.hpp"
+ #include "duckdb/storage/data_table.hpp"
+ #include "duckdb/storage/index.hpp"
+diff --git a/src/hnsw/hnsw_index_plan.cpp b/src/hnsw/hnsw_index_plan.cpp
+index 0d4f403..74bd6bf 100644
+--- a/src/hnsw/hnsw_index_plan.cpp
++++ b/src/hnsw/hnsw_index_plan.cpp
+@@ -4,6 +4,7 @@
+ #include "duckdb/execution/operator/filter/physical_filter.hpp"
+ #include "duckdb/parser/parsed_data/create_index_info.hpp"
+ #include "duckdb/main/attached_database.hpp"
++#include "duckdb/main/client_context.hpp"
+ #include "duckdb/planner/expression/bound_reference_expression.hpp"
+ #include "duckdb/planner/expression/bound_operator_expression.hpp"
+ #include "duckdb/planner/operator/logical_create_index.hpp"
+diff --git a/src/hnsw/hnsw_optimize_expr.cpp b/src/hnsw/hnsw_optimize_expr.cpp
+index 5ff53f3..b5e62c0 100644
+--- a/src/hnsw/hnsw_optimize_expr.cpp
++++ b/src/hnsw/hnsw_optimize_expr.cpp
+@@ -82,7 +82,7 @@ public:
+ 
+ 	static void Optimize(OptimizerExtensionInput &input, unique_ptr<LogicalOperator> &plan) {
+ 		ExpressionRewriter rewriter(input.context);
+-		rewriter.rules.push_back(make_uniq<CosineDistanceRule>(rewriter));
++		rewriter.AddRule(make_uniq<CosineDistanceRule>(rewriter));
+ 		rewriter.VisitOperator(*plan);
+ 	}
+ };
+diff --git a/src/include/hnsw/hnsw_index.hpp b/src/include/hnsw/hnsw_index.hpp
+index e8828c3..7fe5456 100644
+--- a/src/include/hnsw/hnsw_index.hpp
++++ b/src/include/hnsw/hnsw_index.hpp
+@@ -81,7 +81,7 @@ public:
+ 	IndexPointer root_block_ptr;
+ 
+ 	//! The allocator used to persist linked blocks
+-	unique_ptr<FixedSizeAllocator> linked_block_allocator;
++	unsafe_unique_ptr<FixedSizeAllocator> linked_block_allocator;
+ 
+ 	unique_ptr<IndexScanState> InitializeMultiScan(ClientContext &context) const;
+ 	idx_t ExecuteMultiScan(IndexScanState &state, float *query_vector, idx_t limit) const;
+@@ -120,9 +120,9 @@ public:
+ 	ErrorData Insert(IndexLock &lock, DataChunk &data, Vector &row_ids) override;
+ 
+ 	//! Serializes HNSW memory to disk and returns the index storage information.
+-	IndexStorageInfo SerializeToDisk(QueryContext context, const case_insensitive_map_t<Value> &options) override;
++	IndexCheckpointResult Checkpoint(PartialBlockManager &partial_block_manager, StorageVersion version) override;
+ 	//! Serializes HNSW memory to the WAL and returns the index storage information.
+-	IndexStorageInfo SerializeToWAL(const case_insensitive_map_t<Value> &options) override;
++	IndexStorageInfo SerializeToWAL(StorageVersion storage_version) override;
+ 
+ 	idx_t GetInMemorySize(IndexLock &state) const override;
+ 

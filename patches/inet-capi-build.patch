@@ -1,14 +1,5 @@
 --- a/CMakeLists.txt
 +++ b/CMakeLists.txt
-@@ -4,7 +4,9 @@
- option(DUCKDB_WASM_EXTENSION "Whether compiling for Wasm target" OFF)
- 
- set(EXTENSION_NAME inet)
--set(DUCKDB_EXTENSION_API_VERSION_UNSTABLE 1)
-+if(NOT COMMAND build_loadable_extension_capi)
-+    set(DUCKDB_EXTENSION_API_VERSION_UNSTABLE 1)
-+endif()
- 
  ###
  # Configuration
 @@ -58,7 +60,8 @@
