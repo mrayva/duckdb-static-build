@@ -420,6 +420,8 @@ cd "$DUCKDB_DIR"
 # not inherited extension state.
 apply_patch_if_needed "$DUCKDB_DIR" "$BUILD_SCRIPT_DIR/patches/remote-optimizer-exec.patch" \
     "remote optimizer exec isolation"
+apply_patch_if_needed "$DUCKDB_DIR" "$BUILD_SCRIPT_DIR/patches/duckdb-quack-test-server-cleanup.patch" \
+    "Quack SQLLogic server lifecycle cleanup"
 
 # Clean build if requested
 if [ "$CLEAN_BUILD" = true ]; then

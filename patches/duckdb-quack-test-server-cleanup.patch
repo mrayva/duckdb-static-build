@@ -1,0 +1,94 @@
+diff --git a/test/sql/attach/attach_to_external_resource.test b/test/sql/attach/attach_to_external_resource.test
+--- a/test/sql/attach/attach_to_external_resource.test
++++ b/test/sql/attach/attach_to_external_resource.test
+@@ -273,4 +273,7 @@ DETACH qtx2;
+ query I
+ SELECT currval('destroy_seq');
+ ----
+ 4
++
++statement ok
++CALL quack_stop('quack:localhost');
+diff --git a/test/sql/attach/external_resource_lifecycle.test b/test/sql/attach/external_resource_lifecycle.test
+--- a/test/sql/attach/external_resource_lifecycle.test
++++ b/test/sql/attach/external_resource_lifecycle.test
+@@ -227,4 +227,7 @@ DETACH in_use;
+ query I
+ SELECT count(*) FROM duckdb_databases() WHERE database_name = 'in_use';
+ ----
+ 0
++
++statement ok
++CALL quack_stop('quack:localhost');
+diff --git a/test/sql/attach/external_resource_logging.test b/test/sql/attach/external_resource_logging.test
+--- a/test/sql/attach/external_resource_logging.test
++++ b/test/sql/attach/external_resource_logging.test
+@@ -173,4 +173,7 @@ SELECT count(*) FROM duckdb_logs_parsed('ExternalResource') WHERE operation = 'destroy';
+ query I
+ SELECT count(*) FROM duckdb_databases() WHERE database_name = 'repl_db';
+ ----
+ 0
++
++statement ok
++CALL quack_stop('quack:localhost');
+diff --git a/test/sql/catalog/comment_on_column_remote_catalog.test b/test/sql/catalog/comment_on_column_remote_catalog.test
+--- a/test/sql/catalog/comment_on_column_remote_catalog.test
++++ b/test/sql/catalog/comment_on_column_remote_catalog.test
+@@ -45,4 +45,10 @@ qualified local column comment
+ statement error
+ COMMENT ON COLUMN missing_tbl.i IS 'no such table';
+ ----
+ <REGEX>:Catalog Error:.*missing_tbl.*
++
++statement ok
++DETACH qk;
++
++statement ok
++CALL quack_stop('quack:localhost');
+diff --git a/test/sql/connect/concurrent_connect_detach.test b/test/sql/connect/concurrent_connect_detach.test
+--- a/test/sql/connect/concurrent_connect_detach.test
++++ b/test/sql/connect/concurrent_connect_detach.test
+@@ -48,1 +48,7 @@
+ endloop
++
++statement ok
++DETACH qk;
++
++statement ok
++CALL quack_stop({server_uri});
+diff --git a/test/sql/connect/connect_passthrough_quack.test b/test/sql/connect/connect_passthrough_quack.test
+--- a/test/sql/connect/connect_passthrough_quack.test
++++ b/test/sql/connect/connect_passthrough_quack.test
+@@ -73,1 +73,7 @@
+ 1
++
++statement ok
++DETACH qk;
++
++statement ok
++CALL quack_stop({server_uri});
+diff --git a/test/sql/connect/connect_quack.test b/test/sql/connect/connect_quack.test
+--- a/test/sql/connect/connect_quack.test
++++ b/test/sql/connect/connect_quack.test
+@@ -205,1 +205,7 @@
+ <REGEX>:.*no active CONNECT.*
++
++statement ok
++DETACH qk;
++
++statement ok
++CALL quack_stop({server_uri});
+diff --git a/test/sql/prepared/prepared_time_zone_remote_catalog.test b/test/sql/prepared/prepared_time_zone_remote_catalog.test
+--- a/test/sql/prepared/prepared_time_zone_remote_catalog.test
++++ b/test/sql/prepared/prepared_time_zone_remote_catalog.test
+@@ -60,4 +60,10 @@ EXECUTE folded_argument;
+ query I
+ EXECUTE folded_cast;
+ ----
+ 2026-01-01 01:00:00+01
++
++statement ok
++DETACH qk;
++
++statement ok
++CALL quack_stop('quack:localhost');
